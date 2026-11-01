@@ -84,6 +84,42 @@ Wait for the proxy's local confirmation before assuming a preference was saved. 
 
 To uninstall, inspect the installed file, then remove only the copy you installed and restart Claude Code. Removing the file does not clear an existing proxy preference. Use `off` first to suppress acceleration, or allow the session preference to expire; restarting the proxy clears all in-memory session preferences and should be a deliberate operational action.
 
+## Codex quota status line
+
+The optional [`codex-status.sh` helper](../../../../../integrations/claude-code/codex-status.sh)
+shows remaining 5-hour and 7-day account quota and reset times from the proxy's
+local `/usage` endpoint. It requires Bash, curl, jq, awk, and GNU `date`
+(Linux/WSL; macOS needs GNU `date` on `PATH`). It is not a PowerShell script.
+
+Follow the [installation instructions](../../../../../README.md#codex-quota-in-the-claude-code-status-line)
+to copy it into your Claude Code profile. Then merge this top-level setting
+into `~/.claude/settings.json`, preserving any other settings:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/codex-status.sh",
+    "refreshInterval": 10
+  }
+}
+```
+
+For a custom `CLAUDE_CONFIG_DIR`, use its `settings.json` and the actual installed
+script path in `command`. An existing status-line command must be deliberately
+replaced or combined, not duplicated. `CODEX_USAGE_URL` overrides the default
+`http://127.0.0.1:18765/usage` when set in the client environment or command.
+The ten-second interval reads the latest stored snapshot and updates countdowns;
+it does not make a Codex generation or refresh quota upstream. See the
+[integration guide](../../../../../integrations/claude-code/README.md#codex-quota-status-line)
+for troubleshooting, updates, and removal.
+
+For native Windows, use [`codex-status.ps1`](../../../../../integrations/claude-code/codex-status.ps1)
+with Windows PowerShell instead; Bash and jq are not required. Follow the
+[Windows setup](../../../../windows.md#optional-codex-quota-status-line) for
+installation and the Windows-specific `statusLine` command. The `.sh` command
+above is for Linux/WSL.
+
 ## Proxy settings are separate
 
 `CCP_*`, `PORT`, and `config.json` configure the **claude-code-proxy server process**. They control the listener, provider endpoints, transport, credentials, and diagnostics. They do not belong in Claude Code's client environment unless the same shell also starts the proxy.

@@ -246,6 +246,87 @@ configuration from the quick start instead of changing your global settings.
 Server options such as `CCP_CODEX_SERVICE_TIER` belong to the proxy process,
 not this client configuration.
 
+## Codex quota in the Claude Code status line
+
+The optional [codex-status.sh](integrations/claude-code/codex-status.sh) and
+[Windows codex-status.ps1](integrations/claude-code/codex-status.ps1) helpers
+show remaining Codex quota for the 5-hour and 7-day windows, with reset times.
+They read the running proxy's local `/usage` endpoint, not your credentials, and
+do not make Codex inference requests. These are account limits, not per-session
+token usage.
+
+### Linux / WSL
+
+The `.sh` helper requires **Bash, curl, jq, awk, and GNU `date`**. Use it on Linux or inside
+WSL. macOS needs GNU `date` on the client process's `PATH`; the system BSD
+`date` is not compatible. This is not a native PowerShell script.
+
+From this repository's root, install it without replacing an existing copy:
+
+```sh
+claude_config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+if [ -e "$claude_config/codex-status.sh" ] || [ -L "$claude_config/codex-status.sh" ]; then
+  printf 'Already exists; inspect before replacing: %s\n' "$claude_config/codex-status.sh"
+else
+  mkdir -p "$claude_config" &&
+    cp -n integrations/claude-code/codex-status.sh "$claude_config/codex-status.sh" &&
+    chmod +x "$claude_config/codex-status.sh"
+fi
+```
+
+Then **merge** this top-level field into `~/.claude/settings.json`, alongside
+`env` if you configured it above. Preserve other settings; if you already have a
+status line, choose which command to use:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/codex-status.sh",
+    "refreshInterval": 10
+  }
+}
+```
+
+For a custom `CLAUDE_CONFIG_DIR`, edit that directory's `settings.json` and
+replace `command` with the actual installed script path (quote it if it contains
+spaces). `refreshInterval: 10` runs the helper every ten seconds in addition to
+Claude Code's event-driven updates; it does not fetch fresh quota from Codex.
+
+With the proxy running, check the default installation:
+
+```sh
+~/.claude/codex-status.sh </dev/null
+```
+
+`quota waiting` means no usable quota snapshot is available yet; a Codex request
+may populate it. `quota unavailable` means the helper could not reach `/usage`.
+For a non-default proxy address, set `CODEX_USAGE_URL` in the client environment
+or status-line command. See the [integration guide](integrations/claude-code/README.md#codex-quota-status-line)
+for details and removal.
+
+### Native Windows
+
+Use [codex-status.ps1](integrations/claude-code/codex-status.ps1) with Windows
+PowerShell 5.1; it needs no Bash, curl, jq, or GNU tools.
+Follow the [installation steps](docs/windows.md#optional-codex-quota-status-line),
+then merge this setting into Claude Code's settings, replacing the example path
+with your installed file's absolute path (use forward slashes):
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "powershell.exe -NoProfile -NonInteractive -File 'C:/Users/YOUR_NAME/.claude/codex-status.ps1'",
+    "refreshInterval": 10
+  }
+}
+```
+
+For `CLAUDE_CONFIG_DIR`, point `-File` to the script in that profile instead.
+The script respects your PowerShell execution policy. Native Windows execution
+has not been verified from the Linux development environment.
+
 ## Long conversations, `/compact`, and resume
 
 Use Claude Code's normal `/compact`, optionally with a focus:

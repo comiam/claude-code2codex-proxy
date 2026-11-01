@@ -265,6 +265,77 @@ Omit the variable for standard service by default. To remove it from the
 current server terminal before restarting, use
 `Remove-Item Env:CCP_CODEX_SERVICE_TIER -ErrorAction SilentlyContinue`.
 
+### Optional Codex quota status line
+
+[`codex-status.ps1`](../integrations/claude-code/codex-status.ps1) shows remaining
+Codex account quota for the 5-hour and 7-day windows, countdowns, and local reset
+times. It uses Windows PowerShell 5.1 and .NET on Windows 10/11, without Bash,
+curl, jq, or extra modules. It reads the local proxy's `/usage` endpoint and
+does not make Codex inference requests.
+
+From the repository root in PowerShell, install it without replacing an
+existing copy:
+
+```powershell
+$claudeConfig = if ($env:CLAUDE_CONFIG_DIR) {
+    $env:CLAUDE_CONFIG_DIR
+} else {
+    Join-Path $env:USERPROFILE '.claude'
+}
+$statusFile = Join-Path $claudeConfig 'codex-status.ps1'
+if (Get-Item -LiteralPath $statusFile -Force -ErrorAction SilentlyContinue) {
+    Write-Host "Already exists; inspect before replacing: $statusFile"
+} else {
+    New-Item -ItemType Directory -Path $claudeConfig -Force | Out-Null
+    Copy-Item -LiteralPath '.\integrations\claude-code\codex-status.ps1' -Destination $statusFile -ErrorAction Stop
+}
+$statusFile.Replace('\', '/')
+```
+
+The last line prints the installed path with forward slashes. Use that path in
+`-File` below, replacing `C:/Users/YOUR_NAME/.claude/codex-status.ps1`. Keep the
+single quotes around the path, including when it contains spaces.
+
+Merge this **top-level** field into the profile's `settings.json`, alongside
+`env`, preserving other settings and any status-line command you want to keep:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "powershell.exe -NoProfile -NonInteractive -File 'C:/Users/YOUR_NAME/.claude/codex-status.ps1'",
+    "refreshInterval": 10
+  }
+}
+```
+
+The default settings file is `%USERPROFILE%\.claude\settings.json`; with
+`CLAUDE_CONFIG_DIR`, use that directory's `settings.json` and script path.
+The quoted forward-slash path works with Git Bash or PowerShell as Claude Code's
+command shell. The script respects the existing PowerShell execution policy.
+If local scripts are blocked, follow your system's approved script policy or
+use WSL; no policy bypass is included.
+
+Check the installed helper in PowerShell:
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -File $statusFile
+```
+
+For a different proxy address, set `CODEX_USAGE_URL` before launching Claude Code
+or add it to the client's existing `env` settings. The default is
+`http://127.0.0.1:18765/usage`; requests bypass HTTP proxies and have a one-second
+timeout. The ten-second refresh interval reads the last quota snapshot, not
+fresh quota from Codex. `quota waiting` means no usable snapshot is available;
+`quota unavailable` means `/usage` could not be read. Expired windows show
+`awaiting refresh`.
+
+Cargo installation does not update this helper. Compare an installed copy
+before replacing it. To disable it, remove the added `statusLine` field or
+restore your previous command. Native Windows execution has not been verified
+from Linux. For Claude Code inside WSL, use the
+[Linux helper](../README.md#codex-quota-in-the-claude-code-status-line) instead.
+
 ## 8. Update the fork
 
 Check which installation you are using:
