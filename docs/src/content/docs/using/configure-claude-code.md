@@ -32,14 +32,7 @@ The proxy always makes streaming upstream requests. It can still accumulate a no
 
 A trailing `[1m]` tells Claude Code to use its larger local context policy. The proxy strips the suffix before upstream routing. It does not enlarge the provider's context window.
 
-OpenAI's [GPT-5.6 subscription update](https://x.com/thsottiaux/status/2076495156757577895)
-sets the ChatGPT context limit to 272K tokens. Set
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.6-sol[1m]` so Claude Code
-compacts before the upstream limit.
-
-Grok 4.5 and Grok 4.6 are 500,000 tokens. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` and omit `[1m]`.
-
-For a provider and model with a different real context limit, choose a safe value or omit the override. `DISABLE_AUTO_COMPACT=1` disables automatic compaction while preserving manual `/compact`, but the session can then hit the upstream limit.
+For example, `CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` is a conservative starting point for some Codex models. Choose a safe value for the actual model and account limit; `[1m]` does not grant a one-million-token context. `DISABLE_AUTO_COMPACT=1` disables automatic compaction while preserving manual `/compact`, but the session can then hit the upstream limit.
 
 ## Persistent Claude Code settings
 
@@ -59,10 +52,40 @@ If every Claude Code session should use the proxy, put client variables in `~/.c
 }
 ```
 
-Use process-level variables or a wrapper when you also launch Claude Code directly against Anthropic. See [Switching models and backends](/using/switching-models-and-backends/).
+Use process-level variables or a wrapper when you also launch Claude Code directly against Anthropic. See [Switching models and backends](switching-models-and-backends.md).
+
+## Install the proxy-speed command
+
+The repository includes an explicitly user-invoked command at `integrations/claude-code/skills/proxy-speed/SKILL.md`. It adds `/proxy-speed off|fast|ultrafast`; no hook, shell helper, or `settings.json` change is required. Use it with a proxy version that implements session speed controls and a session routed to Codex.
+
+For a new user-scoped installation, run this from the repository root. An existing command is left untouched so you can inspect and compare it before replacement:
+
+```sh
+skill_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/proxy-speed"
+if [ -e "$skill_dir/SKILL.md" ]; then
+  printf 'Already exists; inspect before replacing: %s\n' "$skill_dir/SKILL.md"
+else
+  mkdir -p "$skill_dir"
+  cp -n integrations/claude-code/skills/proxy-speed/SKILL.md "$skill_dir/SKILL.md"
+fi
+```
+
+Alternatively, put the same file at `.claude/skills/proxy-speed/SKILL.md` in the project where you use Claude Code. Install in one scope rather than creating competing copies. Restart the client after installation. If project discovery needs an explicit directory, launch with `claude --add-dir /absolute/path/to/project`.
+
+```text
+/proxy-speed fast
+/proxy-speed ultrafast
+/proxy-speed off
+```
+
+Wait for the proxy's local confirmation before assuming a preference was saved. If Claude Code reports that the command is unavailable, it did not run: an unexpanded `/proxy-speed fast` is ordinary text, not a fallback control protocol. The isolated compatibility tests verify Claude Code 2.1.316 on Linux in both normal and `--bare` mode with a temporary project and `--add-dir`. The normal-client test uses `gpt-6.1-sol`, including its Responses Lite tier. Other client versions and platforms are not guaranteed by these tests.
+
+`fast` and `ultrafast` are sent literally to the API on ordinary Codex generation requests; the command does not change the model or effort and does not validate API tier support locally. See [per-session speed behavior](models-and-routing.md#per-session-proxy-speed) for precedence, agent inheritance, lifecycle, errors, and special-path limitations.
+
+To uninstall, inspect the installed file, then remove only the copy you installed and restart Claude Code. Removing the file does not clear an existing proxy preference. Use `off` first to suppress acceleration, or allow the session preference to expire; restarting the proxy clears all in-memory session preferences and should be a deliberate operational action.
 
 ## Proxy settings are separate
 
 `CCP_*`, `PORT`, and `config.json` configure the **claude-code-proxy server process**. They control the listener, provider endpoints, transport, credentials, and diagnostics. They do not belong in Claude Code's client environment unless the same shell also starts the proxy.
 
-See [Configuration](/reference/configuration/) for the canonical server setting table.
+See [Configuration](../reference/configuration.md) for the canonical server setting table.

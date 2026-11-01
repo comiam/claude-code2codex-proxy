@@ -177,7 +177,13 @@ fn traffic_capture_helpers() {
     for _ in 0..(MAX_SSE_CAPTURE_BYTES / 100 + 2) {
         stream_capture.upstream_event(Some("response.completed"), &event);
     }
+    assert!(claude_code_proxy::logging::flush_diagnostics(
+        std::time::Duration::from_secs(2)
+    ));
     stream_capture.finish(&capture, json!({"kind":"test"}));
+    assert!(claude_code_proxy::logging::flush_diagnostics(
+        std::time::Duration::from_secs(2)
+    ));
     let transcript = std::fs::read_to_string(
         std::fs::read_dir(capture.root())
             .unwrap()

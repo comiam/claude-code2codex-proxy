@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use claude_code_proxy::providers::codex::websocket::{
@@ -27,13 +28,10 @@ const PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-id";
 
 type ProbeLog = Arc<Mutex<Vec<(usize, usize, Vec<u8>)>>>;
 
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().await
 }
 
 struct EnvGuard {
@@ -123,6 +121,7 @@ fn write_codex_auth(config_dir: &Path) {
 #[derive(Debug, Clone)]
 struct CapturedRequest {
     socket_ordinal: usize,
+    wire_bytes: usize,
     headers: HeaderMap,
     body: Value,
 }
@@ -196,6 +195,10 @@ impl CapturedRequest {
 }
 
 enum MockOutcome {
+    Frames {
+        frames: Vec<Message>,
+        acknowledged: oneshot::Sender<()>,
+    },
     Completion {
         response_id: String,
         text: String,
@@ -273,6 +276,21 @@ impl PendingRequest {
         self.captured
     }
 
+    async fn respond_frames(self, frames: Vec<Message>) -> CapturedRequest {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        self.outcome
+            .send(MockOutcome::Frames {
+                frames,
+                acknowledged,
+            })
+            .unwrap_or_else(|_| panic!("peer closed"));
+        tokio::time::timeout(REQUEST_TIMEOUT, acknowledgement)
+            .await
+            .unwrap()
+            .unwrap();
+        self.captured
+    }
+
     async fn respond_rate_limited(self) -> CapturedRequest {
         let (acknowledged, acknowledgement) = oneshot::channel();
         self.outcome
@@ -310,6 +328,7 @@ struct InstrumentedUpstream {
     requests: mpsc::UnboundedReceiver<PendingRequest>,
     captures: Arc<Mutex<Vec<CapturedRequest>>>,
     probes: ProbeLog,
+    connections: Arc<AtomicUsize>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -324,12 +343,15 @@ impl InstrumentedUpstream {
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task_captures = captures.clone();
         let task_probes = probes.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let task_connections = connections.clone();
         let task = tokio::spawn(async move {
             run_upstream(
                 listener,
                 requests_tx,
                 task_captures,
                 task_probes,
+                task_connections,
                 shutdown_rx,
             )
             .await;
@@ -339,6 +361,7 @@ impl InstrumentedUpstream {
             requests,
             captures,
             probes,
+            connections,
             shutdown: Some(shutdown),
             task,
         }
@@ -379,51 +402,10 @@ impl InstrumentedUpstream {
             .expect("mock upstream shutdown timed out")
             .expect("mock upstream task failed");
 
-        let captures = self
-            .captures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut requests_per_socket = HashMap::new();
-        let mut expected_probe_sites = captures
-            .iter()
-            .filter_map(|capture| {
-                let prior_requests = requests_per_socket
-                    .entry(capture.socket_ordinal)
-                    .or_insert(0usize);
-                let site =
-                    (*prior_requests > 0).then_some((capture.socket_ordinal, *prior_requests));
-                *prior_requests += 1;
-                site
-            })
-            .collect::<Vec<_>>();
-        drop(captures);
-
-        let probes = self
-            .probes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut actual_probe_sites = probes
-            .iter()
-            .map(|(socket_ordinal, prior_requests, _)| (*socket_ordinal, *prior_requests))
-            .collect::<Vec<_>>();
-        expected_probe_sites.sort_unstable();
-        actual_probe_sites.sort_unstable();
-        assert_eq!(
-            actual_probe_sites, expected_probe_sites,
-            "each successful pooled reuse must have one probe at its exact socket-local request boundary: {probes:?}"
-        );
-        let unique = probes
-            .iter()
-            .map(|(_, _, payload)| payload.clone())
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            unique.len(),
-            probes.len(),
-            "pooled validation probes must use unique payloads: {probes:?}"
-        );
+        let probes = self.probes.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
-            probes.iter().all(|(_, _, payload)| payload.len() == 8),
-            "pooled validation probes must preserve their eight-byte nonce: {probes:?}"
+            probes.iter().all(|(_, _, payload)| payload.is_empty()),
+            "reuse must not send a per-checkout nonce probe: {probes:?}"
         );
     }
 }
@@ -433,10 +415,10 @@ async fn run_upstream(
     requests: mpsc::UnboundedSender<PendingRequest>,
     captures: Arc<Mutex<Vec<CapturedRequest>>>,
     probes: ProbeLog,
+    connections: Arc<AtomicUsize>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut sockets = JoinSet::new();
-    let mut next_socket_ordinal = 1usize;
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
@@ -444,8 +426,7 @@ async fn run_upstream(
                 let Ok((stream, _)) = accepted else {
                     break;
                 };
-                let socket_ordinal = next_socket_ordinal;
-                next_socket_ordinal += 1;
+                let socket_ordinal = connections.fetch_add(1, Ordering::Relaxed) + 1;
                 sockets.spawn(handle_socket(
                     stream,
                     socket_ordinal,
@@ -518,6 +499,7 @@ async fn handle_socket(
                 assert!(body.get("stream").is_none(), "websocket payload: {body}");
                 let captured = CapturedRequest {
                     socket_ordinal,
+                    wire_bytes: text.len(),
                     headers: headers.clone(),
                     body,
                 };
@@ -535,6 +517,20 @@ async fn handle_socket(
                     Ok(Err(_)) | Err(_) => return,
                 };
                 match outcome {
+                    MockOutcome::Frames {
+                        frames,
+                        acknowledged,
+                    } => {
+                        for frame in frames {
+                            let close = matches!(frame, Message::Close(_));
+                            if websocket.send(frame).await.is_err() || close {
+                                let _ = acknowledged.send(());
+                                return;
+                            }
+                        }
+                        let _ = acknowledged.send(());
+                    }
+
                     MockOutcome::Completion {
                         response_id,
                         text,
@@ -746,10 +742,29 @@ struct TestHarness {
 
 impl TestHarness {
     async fn start() -> Self {
+        Self::start_with_reuse(None).await
+    }
+
+    async fn start_with_reuse(reuse: Option<bool>) -> Self {
+        Self::start_with_transport_policy(reuse, reuse.is_none()).await
+    }
+
+    async fn start_with_transport_policy(reuse: Option<bool>, previous: bool) -> Self {
         let upstream = InstrumentedUpstream::spawn().await;
         let config_dir = TempDir::new().unwrap();
         write_codex_auth(config_dir.path());
-        let environment = configure_environment(config_dir.path(), &upstream.base_url);
+        let mut environment = configure_environment(config_dir.path(), &upstream.base_url);
+        environment.push(EnvGuard::unset("CCP_CODEX_WEBSOCKET_REUSE"));
+        if let Some(reuse) = reuse {
+            environment.push(EnvGuard::set(
+                "CCP_CODEX_WEBSOCKET_REUSE",
+                if reuse { "1" } else { "0" },
+            ));
+        }
+        environment.push(EnvGuard::set(
+            "CCP_CODEX_PREVIOUS_RESPONSE_ID",
+            if previous { "1" } else { "0" },
+        ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = listener.local_addr().unwrap();
@@ -945,6 +960,105 @@ fn assert_delta_input(
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_budget_eviction_sends_complete_history_on_the_healthy_socket() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    let case = unique("owner-budget");
+    let headers = IdentityHeaders::main(&tagged(&case, "session"));
+    let prompt = tagged(&case, "first");
+    let oversized_reply = "x".repeat(8 * 1024 * 1024);
+    let first = harness
+        .round_trip(
+            messages_body(false, vec![message("user", &prompt)]),
+            headers.clone(),
+            &prompt,
+            &tagged(&case, "resp-1"),
+            &oversized_reply,
+        )
+        .await;
+    let next = tagged(&case, "next");
+    let second = harness
+        .round_trip(
+            messages_body(
+                true,
+                vec![
+                    message("user", &prompt),
+                    message("assistant", &oversized_reply),
+                    message("user", &next),
+                ],
+            ),
+            headers,
+            &next,
+            &tagged(&case, "resp-2"),
+            "done",
+        )
+        .await;
+    assert_full_input(
+        &second,
+        &[
+            ("user", &prompt),
+            ("assistant", &oversized_reply),
+            ("user", &next),
+        ],
+    );
+    assert_eq!(
+        second.socket_ordinal, first.socket_ordinal,
+        "optional history eviction must preserve compatible transport"
+    );
+    assert_eq!(harness.upstream.snapshot().len(), 2);
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn total_budget_eviction_sends_complete_history_on_the_healthy_socket() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    let case = unique("total-budget");
+    let reply = "x".repeat(7 * 1024 * 1024);
+    let mut oldest = None;
+    for index in 0..19 {
+        let prompt = tagged(&case, &format!("prompt-{index}"));
+        let headers = IdentityHeaders::main(&tagged(&case, &format!("session-{index}")));
+        let capture = harness
+            .round_trip(
+                messages_body(false, vec![message("user", &prompt)]),
+                headers.clone(),
+                &prompt,
+                &tagged(&case, &format!("resp-{index}")),
+                &reply,
+            )
+            .await;
+        if index == 0 {
+            oldest = Some((headers, prompt, capture.socket_ordinal));
+        }
+    }
+    let (headers, prompt, socket) = oldest.unwrap();
+    let next = tagged(&case, "next");
+    let capture = harness
+        .round_trip(
+            messages_body(
+                false,
+                vec![
+                    message("user", &prompt),
+                    message("assistant", &reply),
+                    message("user", &next),
+                ],
+            ),
+            headers,
+            &next,
+            &tagged(&case, "resp-next"),
+            "done",
+        )
+        .await;
+    assert_full_input(
+        &capture,
+        &[("user", &prompt), ("assistant", &reply), ("user", &next)],
+    );
+    assert_eq!(capture.socket_ordinal, socket);
+    harness.shutdown().await;
+}
+
 fn pending_pair(
     first: PendingRequest,
     second: PendingRequest,
@@ -970,10 +1084,9 @@ fn pending_pair(
     }
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn main_child_and_nested_child_interleave_independent_continuations() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("lineage");
     let session = tagged(&case, "session");
@@ -1088,10 +1201,9 @@ async fn main_child_and_nested_child_interleave_independent_continuations() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compatible_prefix_sibling_cannot_steal_owner_continuation() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("prefix-attack");
     let session = tagged(&case, "session");
@@ -1158,10 +1270,9 @@ async fn compatible_prefix_sibling_cannot_steal_owner_continuation() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn divergent_siblings_retain_their_own_response_and_socket() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("divergent-siblings");
     let session = tagged(&case, "session");
@@ -1238,10 +1349,9 @@ async fn divergent_siblings_retain_their_own_response_and_socket() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_agent_id_in_different_sessions_is_independent() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("same-agent-different-sessions");
     let agent = tagged(&case, "shared-agent");
@@ -1321,10 +1431,9 @@ async fn same_agent_id_in_different_sessions_is_independent() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_identity_sandwich_is_stateless_and_preserves_main() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("malformed-sandwich");
     let session = tagged(&case, "session");
@@ -1436,10 +1545,9 @@ async fn malformed_identity_sandwich_is_stateless_and_preserves_main() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_review_with_agent_headers_is_stateless() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("auto-review");
     let session = tagged(&case, "session");
@@ -1510,10 +1618,9 @@ async fn auto_review_with_agent_headers_is_stateless() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn missing_and_dead_origin_retry_full_context_once_and_republish_for_both_modes() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("origin-recovery");
 
@@ -1624,10 +1731,9 @@ async fn missing_and_dead_origin_retry_full_context_once_and_republish_for_both_
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rate_limited_live_retry_republishes_successful_continuation() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("rate-limit-retry");
     let session = tagged(&case, "session");
@@ -1686,10 +1792,9 @@ async fn rate_limited_live_retry_republishes_successful_continuation() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consecutive_rate_limit_handoffs_are_attempt_local() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("consecutive-rate-limit-retry");
     let session = tagged(&case, "session");
@@ -1750,10 +1855,9 @@ async fn consecutive_rate_limit_handoffs_are_attempt_local() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_owner_stale_completion_cannot_overwrite_newer_turn() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("stale-completion");
     let session = tagged(&case, "session");
@@ -1868,10 +1972,9 @@ async fn same_owner_stale_completion_cannot_overwrite_newer_turn() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_owner_completion_order_is_independent() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("cross-owner-order");
     let session = tagged(&case, "session");
@@ -2022,10 +2125,9 @@ async fn cross_owner_completion_order_is_independent() {
     harness.shutdown().await;
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_turn_with_noncanonical_arguments_continues_with_delta() {
-    let _environment_lock = env_lock();
+    let _environment_lock = env_lock().await;
     let mut harness = TestHarness::start().await;
     let case = unique("tool-turn");
     let session = tagged(&case, "session");
@@ -2114,4 +2216,880 @@ async fn tool_turn_with_noncanonical_arguments_continues_with_delta() {
     assert_eq!(delta[0]["call_id"], call_id.as_str());
     assert_eq!(harness.upstream.snapshot().len(), 2);
     harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_failure_after_semantic_output_never_resends() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    let failures = [
+        ("failed", Message::Text(json!({"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"synthetic late failure"}}}).to_string())),
+        ("incomplete", Message::Text(json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"unknown"}}}).to_string())),
+        ("eof", Message::Close(None)),
+        ("malformed", Message::Text("{malformed".to_string())),
+        ("orphan", Message::Text(json!({"type":"response.output_item.done","output_index":99,"item":{"type":"function_call","call_id":"call_orphan","name":"Read","arguments":"{}"}}).to_string())),
+    ];
+    for (label, failure) in failures {
+        for partial_tool in [false, true] {
+            if partial_tool && !matches!(label, "failed" | "eof") {
+                continue;
+            }
+            let session = unique(label);
+            let identity = IdentityHeaders::agent(&session, "agent", None);
+            let marker = unique("lifecycle-input");
+            let before = harness.upstream.snapshot().len();
+            let request = harness.start_request(
+                messages_body(true, vec![message("user", &marker)]),
+                identity.clone(),
+            );
+            let pending = harness.pending(&marker, &identity).await;
+            let (added, delta) = if partial_tool {
+                (
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"f_partial","call_id":"call_partial","name":"Bash"}}),
+                    json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"echo"}),
+                )
+            } else {
+                (
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"committed text"}),
+                )
+            };
+            let frames = vec![
+            Message::Text(added.to_string()),
+            Message::Text(delta.to_string()),
+            failure.clone(),
+            Message::Text(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_up"}}).to_string()),
+            Message::Text(json!({"type":"response.completed","response":{"id":"resp_lifecycle","status":"completed"}}).to_string()),
+        ];
+            pending.respond_frames(frames).await;
+            let response = tokio::time::timeout(REQUEST_TIMEOUT, request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                response.status,
+                StatusCode::OK,
+                "{label}: {}",
+                response.body
+            );
+            if partial_tool {
+                assert!(
+                    response.body.contains("call_partial"),
+                    "{label}: {}",
+                    response.body
+                );
+                assert!(
+                    response
+                        .body
+                        .contains(r#""partial_json":"{\"command\":\"echo"#),
+                    "{label}: {}",
+                    response.body
+                );
+            } else {
+                assert!(response.body.contains("committed text"), "{label}");
+            }
+            assert_eq!(
+                response.body.matches("event: error").count(),
+                1,
+                "{label}: {}",
+                response.body
+            );
+            assert_eq!(
+                harness.upstream.snapshot().len(),
+                before + 1,
+                "{label}: no new response.create after commit"
+            );
+            assert!(
+                response.body.contains(r#""type":"api_error""#),
+                "{label}: {}",
+                response.body
+            );
+            assert!(
+                !response.body.contains("event: message_stop"),
+                "{label}: {}",
+                response.body
+            );
+            #[allow(deprecated)]
+            let recorded =
+                claude_code_proxy::providers::codex::continuation::has_continuation_for_tests(
+                    &session,
+                );
+            assert!(!recorded, "{label}: partial output cannot publish a parent");
+            assert!(
+                !response.body.contains("call_orphan"),
+                "orphan must not become invented downstream tool"
+            );
+        }
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flat_transient_failure_before_semantic_output_retries_once() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    let session = unique("flat-transient");
+    let identity = IdentityHeaders::agent(&session, "agent", None);
+    let marker = unique("before-commit");
+    let request = harness.start_request(
+        messages_body(true, vec![message("user", &marker)]),
+        identity.clone(),
+    );
+    harness.pending(&marker, &identity).await.respond_frames(vec![Message::Text(json!({
+        "type":"error","code":"server_error","message":"synthetic pre-output failure","retry_after_seconds":0
+    }).to_string())]).await;
+    let replacement = harness.pending(&marker, &identity).await;
+    assert_full_input(&replacement.captured, &[("user", &marker)]);
+    resolve_request(replacement, request, "resp_retry", "recovered text", false).await;
+    assert_eq!(
+        harness.upstream.snapshot().len(),
+        2,
+        "one permitted replay before semantic commit"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eof_after_tool_item_without_response_terminal_is_error() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    for (label, tail, want_success) in [
+        ("eof", Message::Close(None), false),
+        ("malformed", Message::Text("{malformed".to_string()), false),
+    ] {
+        let session = unique(label);
+        let identity = IdentityHeaders::agent(&session, "agent", None);
+        let marker = unique("closed-tool-input");
+        let before = harness.upstream.snapshot().len();
+        let request = harness.start_request(
+            messages_body(true, vec![message("user", &marker)]),
+            identity.clone(),
+        );
+        let capture = harness.pending(&marker,&identity).await.respond_frames(vec![
+            Message::Text(json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":""}}).to_string()),
+            Message::Text(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"}}).to_string()), tail,
+        ]).await;
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{label}: {}",
+            response.body
+        );
+        assert_eq!(
+            response.body.matches("event: error").count(),
+            usize::from(!want_success),
+            "{label}: {}",
+            response.body
+        );
+        assert_eq!(
+            response.body.contains("\"stop_reason\":\"tool_use\""),
+            want_success,
+            "{label}: {}",
+            response.body
+        );
+        assert_eq!(
+            harness.upstream.snapshot().len(),
+            before + 1,
+            "no replay after tool semantic commit"
+        );
+        let next_marker = unique("after-eof");
+        let next = harness
+            .round_trip(
+                messages_body(
+                    true,
+                    vec![
+                        message("user", &marker),
+                        message("assistant", "prior tool"),
+                        message("user", &next_marker),
+                    ],
+                ),
+                identity,
+                &next_marker,
+                "resp_after_eof",
+                "next text",
+            )
+            .await;
+        assert_full_input(
+            &next,
+            &[
+                ("user", &marker),
+                ("assistant", "prior tool"),
+                ("user", &next_marker),
+            ],
+        );
+        assert!(next.previous_response_id().is_none());
+        assert_ne!(
+            next.socket_ordinal, capture.socket_ordinal,
+            "untrusted EOF socket cannot become a continuation origin"
+        );
+    }
+    harness.shutdown().await;
+}
+
+async fn assert_buffered_error_contract(
+    event: Value,
+    want_status: u16,
+    want_type: &str,
+    want_creates: usize,
+) {
+    let mut harness = TestHarness::start().await;
+    let session = unique("buffered-error-contract");
+    let identity = IdentityHeaders::agent(&session, "agent", None);
+    let marker = unique("buffered-input");
+    let mut request = harness.start_request(
+        messages_body(false, vec![message("user", &marker)]),
+        identity.clone(),
+    );
+    let response = loop {
+        tokio::select! {
+            response = &mut request => break response.unwrap(),
+            pending = harness.upstream.requests.recv() => {
+                let pending = pending.expect("peer alive");
+                assert_eq!(pending.captured.marker(),marker);
+                pending.captured.assert_protocol_headers(Some(&session));
+                pending.respond_frames(vec![Message::Text(event.to_string())]).await;
+            }
+        }
+    };
+    assert_eq!(
+        harness.upstream.snapshot().len(),
+        want_creates,
+        "no ineligible buffered WS resend: {}",
+        response.body
+    );
+    assert_eq!(response.status.as_u16(), want_status, "{}", response.body);
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(value["error"]["type"], want_type);
+    assert_eq!(value["error"]["message"], "synthetic rejection");
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_compact_resumes_on_same_socket_with_fresh_short_input() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    let compact_text = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools. Your task is to create a detailed summary of the conversation so far. Focus on the remaining work.";
+    let mut owner_sockets = HashSet::new();
+    for stream in [false, true] {
+        let session = unique("text-compact");
+        for identity in [
+            IdentityHeaders::main(&session),
+            IdentityHeaders::agent(&session, "agent", None),
+        ] {
+            let before = harness.upstream.snapshot().len();
+            let initial_id = unique("resp_old");
+            let resume_id = unique("resp_resume");
+            // Keep effort compatible so compact can use the existing parent and delta.
+            let body = |history| {
+                let mut body = messages_body(stream, history);
+                body["output_config"] = json!({"effort": "low"});
+                body
+            };
+            let initial = harness
+                .round_trip(
+                    body(vec![message("user", "old history")]),
+                    identity.clone(),
+                    "old history",
+                    &initial_id,
+                    "old reply",
+                )
+                .await;
+            assert_full_input(&initial, &[("user", "old history")]);
+            assert!(
+                owner_sockets.insert(initial.socket_ordinal),
+                "different owners must not share sockets"
+            );
+            let compact = harness
+                .round_trip(
+                    body(vec![
+                        message("user", "old history"),
+                        message("assistant", "old reply"),
+                        message("user", compact_text),
+                    ]),
+                    identity.clone(),
+                    compact_text,
+                    "resp_compact",
+                    "<summary>remaining work</summary>",
+                )
+                .await;
+            assert_delta_input(&compact, &initial_id, initial.socket_ordinal, compact_text);
+            let summary = "<summary>remaining work</summary>";
+            let mut short_history = vec![message("user", summary), message("user", "resume")];
+            let resume = harness
+                .round_trip(
+                    body(short_history.clone()),
+                    identity.clone(),
+                    "resume",
+                    &resume_id,
+                    "resumed reply",
+                )
+                .await;
+            assert_eq!(resume.socket_ordinal, initial.socket_ordinal);
+            assert_full_input(&resume, &[("user", summary), ("user", "resume")]);
+            short_history.extend([
+                message("assistant", "resumed reply"),
+                message("user", "next"),
+            ]);
+            let next = harness
+                .round_trip(
+                    body(short_history),
+                    identity,
+                    "next",
+                    "resp_next",
+                    "next reply",
+                )
+                .await;
+            assert_delta_input(&next, &resume_id, initial.socket_ordinal, "next");
+            assert_eq!(
+                harness.upstream.snapshot().len() - before,
+                4,
+                "compact must generate exactly once"
+            );
+        }
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn next_turn_after_message_stop_has_parent_and_origin() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    let identity = IdentityHeaders::main(&unique("terminal-publication"));
+    let mut history = vec![message("user", "first")];
+    let first = harness
+        .round_trip(
+            messages_body(true, history.clone()),
+            identity.clone(),
+            "first",
+            "resp_first",
+            "reply",
+        )
+        .await;
+    history.extend([message("assistant", "reply"), message("user", "next")]);
+    let next = harness
+        .round_trip(
+            messages_body(true, history),
+            identity,
+            "next",
+            "resp_next",
+            "next reply",
+        )
+        .await;
+    assert_eq!(next.socket_ordinal, first.socket_ordinal);
+    assert_eq!(next.previous_response_id(), Some("resp_first"));
+    assert_eq!(next.body["input"], json!([upstream_item("user", "next")]));
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffered_ws_combined_error_evidence_preserves_family_and_retry_budget() {
+    let _environment_lock = env_lock().await;
+    for (code, family, status, want_status, want_type, want_creates) in [
+        (
+            "new_native_code",
+            "overloaded_error",
+            None,
+            529,
+            "overloaded_error",
+            4,
+        ),
+        ("new_native_code", "server_error", None, 503, "api_error", 4),
+        (
+            "new_native_code",
+            "authentication_error",
+            Some(500),
+            500,
+            "api_error",
+            1,
+        ),
+        (
+            "invalid_prompt",
+            "server_error",
+            None,
+            400,
+            "invalid_request_error",
+            1,
+        ),
+    ] {
+        assert_buffered_error_contract(
+            json!({"type":"error","status":status,"error":{
+                "code":code,"type":family,"message":"synthetic rejection","retry_after_seconds":0
+            }}),
+            want_status,
+            want_type,
+            want_creates,
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffered_ws_permanent_code_only_error_is_not_resent() {
+    let _environment_lock = env_lock().await;
+    for event in [
+        json!({"type":"error","code":"invalid_prompt","message":"synthetic rejection","retry_after_seconds":0}),
+        json!({"type":"error","error":{"code":"invalid_prompt","message":"synthetic rejection","retry_after_seconds":0}}),
+    ] {
+        assert_buffered_error_contract(event, 400, "invalid_request_error", 1).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffered_ws_unknown_code_only_error_is_not_resent() {
+    let _environment_lock = env_lock().await;
+    assert_buffered_error_contract(json!({"type":"error","code":"unknown_native_code","message":"synthetic rejection","retry_after_seconds":0}),500,"api_error",1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffered_ws_classified_status_and_retry_budget_are_preserved() {
+    let _environment_lock = env_lock().await;
+    assert_buffered_error_contract(json!({"type":"error","code":"slow_down","message":"synthetic rejection","retry_after_seconds":0}),529,"overloaded_error",4).await;
+    assert_buffered_error_contract(json!({"type":"error","status":400,"error":{"code":"context_length_exceeded","message":"synthetic rejection"}}),413,"request_too_large",1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unresolved_output_prevents_closed_tool_eof_success() {
+    let _environment_lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    for unresolved in [
+        json!({"type":"web_search_call","id":"ws_open"}),
+        json!({"type":"web_search_call","id":"ws_mismatch"}),
+        json!({"type":"summary_only","id":"rs_summary"}),
+        json!({"type":"search_progress_only","id":"ws_progress"}),
+        json!({"type":"reasoning","id":"rs_open","encrypted_content":"provisional"}),
+        json!({"type":"message","id":"msg_open"}),
+        json!({"type":"unknown_supported_later","id":"other_open"}),
+    ] {
+        let session = unique("unresolved-output");
+        let identity = IdentityHeaders::agent(&session, "agent", None);
+        let marker = unique("unresolved-input");
+        let before = harness.upstream.snapshot().len();
+        let request = harness.start_request(
+            messages_body(true, vec![message("user", &marker)]),
+            identity.clone(),
+        );
+        let mismatch = unresolved["id"] == "ws_mismatch";
+        let mut frames = vec![
+            Message::Text(json!({"type":"response.output_item.added","output_index":0,"item":unresolved}).to_string()),
+            Message::Text(json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"Read"}}).to_string()),
+            Message::Text(json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"}}).to_string()),
+            Message::Close(None),
+        ];
+        if frames[0].to_text().unwrap().contains("summary_only") {
+            frames[0] = Message::Text(json!({"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_summary","summary_index":0,"part":{"type":"summary_text","text":""}}).to_string());
+        } else if frames[0]
+            .to_text()
+            .unwrap()
+            .contains("search_progress_only")
+        {
+            frames[0] = Message::Text(json!({"type":"response.web_search_call.in_progress","output_index":0,"item_id":"ws_progress"}).to_string());
+        }
+        if mismatch {
+            frames.insert(1,Message::Text(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"other_type"}}).to_string()));
+        }
+        let captured = harness
+            .pending(&marker, &identity)
+            .await
+            .respond_frames(frames)
+            .await;
+        let response = tokio::time::timeout(REQUEST_TIMEOUT, request)
+            .await
+            .unwrap()
+            .unwrap();
+        if mismatch {
+            // Search progress has no fabricated semantic start. This identity
+            // conflict precedes the Read start, so headers are not committed.
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_GATEWAY,
+                "{}",
+                response.body
+            );
+            let error: Value = serde_json::from_str(&response.body).unwrap();
+            assert_eq!(error["error"]["type"], "api_error");
+            assert_eq!(error["error"]["message"], "Conflicting Codex item identity");
+        } else {
+            assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+            assert_eq!(
+                response.body.matches("event: error").count(),
+                1,
+                "{}",
+                response.body
+            );
+        }
+        assert!(!response.body.contains("event: message_stop"));
+        assert!(
+            !response.body.contains("\"stop_reason\":\"tool_use\""),
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            harness.upstream.snapshot().len(),
+            before + 1,
+            "no postcommit replay"
+        );
+        let next_marker = unique("unresolved-next");
+        let next = harness
+            .round_trip(
+                messages_body(
+                    true,
+                    vec![
+                        message("user", &marker),
+                        message("assistant", "prior output"),
+                        message("user", &next_marker),
+                    ],
+                ),
+                identity,
+                &next_marker,
+                "resp_next",
+                "next text",
+            )
+            .await;
+        assert_full_input(
+            &next,
+            &[
+                ("user", &marker),
+                ("assistant", "prior output"),
+                ("user", &next_marker),
+            ],
+        );
+        assert_ne!(captured.socket_ordinal, next.socket_ordinal);
+        assert!(next.previous_response_id().is_none());
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_search_without_native_parent_reuses_healthy_socket_with_full_context() {
+    let _lock = env_lock().await;
+    let mut harness = TestHarness::start().await;
+    let session = unique("search-full-context");
+    let owner = IdentityHeaders::main(&session);
+    let answer = "Found [Fixture source](https://example.test/source)";
+    let body = |history| {
+        let mut body = messages_body(true, history);
+        body["tools"] = json!([{"type":"web_search_20250305","name":"web_search"}]);
+        body
+    };
+    let request = harness.start_request(body(vec![message("user", "search first")]), owner.clone());
+    let first = harness
+        .pending("search first", &owner)
+        .await
+        .respond_frames(
+            [
+                json!({"type":"response.created","response":{"id":"resp_search"}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_search","status":"in_progress"}}),
+                json!({"type":"response.web_search_call.searching","output_index":0,"item_id":"ws_search"}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_search","status":"completed","action":{"type":"search","query":"fixture"}}}),
+                json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_search"}}),
+                json!({"type":"response.output_text.delta","output_index":1,"delta":answer}),
+                json!({"type":"response.output_text.annotation.added","output_index":1,"annotation":{"type":"url_citation","title":"Fixture source","url":"https://example.test/source"}}),
+                json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_search","content":[{"type":"output_text","text":answer}]}}),
+                json!({"type":"response.completed","response":{"id":"resp_search","status":"completed"}}),
+            ]
+            .into_iter()
+            .map(|event| Message::Text(event.to_string()))
+            .collect(),
+        )
+        .await;
+    let response = tokio::time::timeout(REQUEST_TIMEOUT, request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    assert_eq!(response.body.matches("event: message_start").count(), 1);
+    assert_eq!(response.body.matches("event: message_stop").count(), 1);
+    assert!(response.body.contains(answer), "{}", response.body);
+    assert!(!response.body.contains("event: error"), "{}", response.body);
+    let native = claude_code_proxy::anthropic::sse::parse_sse_events(response.body.as_bytes())
+        .into_iter()
+        .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
+        .filter(|event| {
+            event["type"] == "content_block_start"
+                && matches!(
+                    event["content_block"]["type"].as_str(),
+                    Some("server_tool_use" | "web_search_tool_result")
+                )
+        })
+        .map(|event| event["content_block"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        native,
+        vec![
+            json!({"type":"server_tool_use","id":"srvtoolu_ws_search","name":"web_search","input":{"type":"search","query":"fixture"}}),
+            json!({"type":"web_search_tool_result","tool_use_id":"srvtoolu_ws_search","content":[{"type":"web_search_result","title":"Fixture source","url":"https://example.test/source"}]}),
+        ]
+    );
+    #[allow(deprecated)]
+    let recorded =
+        claude_code_proxy::providers::codex::continuation::has_continuation_for_tests(&session);
+    assert!(
+        !recorded,
+        "search without canonical replay cannot publish a parent"
+    );
+
+    let next = harness
+        .round_trip(
+            body(vec![
+                message("user", "search first"),
+                message("assistant", answer),
+                message("user", "follow up"),
+            ]),
+            owner,
+            "follow up",
+            "resp_after_search",
+            "follow-up answer",
+        )
+        .await;
+    assert_full_input(
+        &next,
+        &[
+            ("user", "search first"),
+            ("assistant", answer),
+            ("user", "follow up"),
+        ],
+    );
+    assert_eq!(next.socket_ordinal, first.socket_ordinal);
+    assert_eq!(
+        harness.upstream.snapshot().len(),
+        2,
+        "one generation per turn"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_continuation_opt_out_still_reuses_socket() {
+    let _lock = env_lock().await;
+    let mut harness = TestHarness::start_with_transport_policy(None, false).await;
+    let session = unique("reuse-only");
+    let owner = IdentityHeaders::main(&session);
+    let mut socket = None;
+    for turn in 0..3 {
+        let marker = format!("independent-{turn}");
+        let mut body = messages_body(
+            turn % 2 == 0,
+            vec![message("user", "full-history"), message("user", &marker)],
+        );
+        body["system"] = json!(format!("prompt changes {turn}"));
+        let captured = harness
+            .round_trip(
+                body,
+                owner.clone(),
+                &marker,
+                &format!("response-{turn}"),
+                "ok",
+            )
+            .await;
+        assert_full_input(
+            &captured,
+            &[
+                ("developer", &format!("prompt changes {turn}")),
+                ("user", "full-history"),
+                ("user", &marker),
+            ],
+        );
+        assert_eq!(
+            *socket.get_or_insert(captured.socket_ordinal),
+            captured.socket_ordinal,
+            "independent turns must retain their healthy compatible socket"
+        );
+        #[allow(deprecated)]
+        let recorded =
+            claude_code_proxy::providers::codex::continuation::has_continuation_for_tests(&session);
+        assert!(!recorded, "reuse-only must never retain transcript state");
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reuse_model_change_requires_new_socket_and_full_input() {
+    let _lock = env_lock().await;
+    let mut harness = TestHarness::start_with_reuse(Some(true)).await;
+    let owner = IdentityHeaders::main(&unique("model-reuse"));
+    let first = harness
+        .round_trip(
+            messages_body(true, vec![message("user", "first")]),
+            owner.clone(),
+            "first",
+            "r-first",
+            "ok",
+        )
+        .await;
+    let mut body = messages_body(true, vec![message("user", "second")]);
+    body["model"] = json!("gpt-6-sol");
+    let second = harness
+        .round_trip(body, owner, "second", "r-second", "ok")
+        .await;
+    assert_ne!(
+        first.socket_ordinal, second.socket_ordinal,
+        "model compatibility is conservative"
+    );
+    assert_full_input(&second, &[("user", "second")]);
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_reuse_false_forbids_previous_id_and_transcript_retention() {
+    let _lock = env_lock().await;
+    let mut harness = TestHarness::start_with_reuse(Some(false)).await;
+    let _previous = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+    let owner = IdentityHeaders::main(&unique("no-reuse"));
+    let first = harness
+        .round_trip(
+            messages_body(true, vec![message("user", "first")]),
+            owner.clone(),
+            "first",
+            "r1",
+            "ok",
+        )
+        .await;
+    let second = harness
+        .round_trip(
+            messages_body(
+                true,
+                vec![
+                    message("user", "first"),
+                    message("assistant", "ok"),
+                    message("user", "next"),
+                ],
+            ),
+            owner,
+            "next",
+            "r2",
+            "ok",
+        )
+        .await;
+    assert_ne!(first.socket_ordinal, second.socket_ordinal);
+    assert_full_input(
+        &second,
+        &[("user", "first"), ("assistant", "ok"), ("user", "next")],
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reuse_only_overlap_has_exclusive_leases_and_latest_turn_wins() {
+    let _lock = env_lock().await;
+    let mut harness = TestHarness::start_with_reuse(Some(true)).await;
+    let owner = IdentityHeaders::main(&unique("reuse-overlap"));
+    let older = harness.start_request(
+        messages_body(true, vec![message("user", "older")]),
+        owner.clone(),
+    );
+    let old_pending = harness.pending("older", &owner).await;
+    let newer = harness.start_request(
+        messages_body(true, vec![message("user", "newer")]),
+        owner.clone(),
+    );
+    let new_pending = harness.pending("newer", &owner).await;
+    assert_ne!(
+        old_pending.captured.socket_ordinal,
+        new_pending.captured.socket_ordinal
+    );
+    let current = resolve_request(new_pending, newer, "new", "new answer", false).await;
+    resolve_request(old_pending, older, "old", "old answer", false).await;
+    let next = harness
+        .round_trip(
+            messages_body(true, vec![message("user", "third")]),
+            owner,
+            "third",
+            "third-response",
+            "ok",
+        )
+        .await;
+    assert_eq!(next.socket_ordinal, current.socket_ordinal);
+    assert_full_input(&next, &[("user", "third")]);
+    harness.shutdown().await;
+}
+
+async fn twenty_tool_turns(previous: Option<bool>) -> Vec<usize> {
+    let mut harness =
+        TestHarness::start_with_transport_policy(None, previous.unwrap_or(true)).await;
+    let _default_previous = previous
+        .is_none()
+        .then(|| EnvGuard::unset("CCP_CODEX_PREVIOUS_RESPONSE_ID"));
+    let identity = IdentityHeaders::main(&unique("twenty-tool-turns"));
+    let mut history = vec![message("user", &"x".repeat(4 * 1024 * 1024))];
+    let mut socket = None;
+    let mut sizes = Vec::new();
+    for turn in 0..20 {
+        let mut body = messages_body(true, history.clone());
+        body["model"] = json!("gpt-6.1-sol");
+        body["tools"] = json!([{"name":"Edit","description":"Synthetic local tool","input_schema":{"type":"object","properties":{"step":{"type":"integer"}},"required":["step"]}}]);
+        let request = harness.start_request(body, identity.clone());
+        let pending = harness
+            .upstream
+            .next_any_request(identity.upstream_session.as_deref())
+            .await;
+        let capture = &pending.captured;
+        sizes.push(capture.wire_bytes);
+        if turn == 0 || previous == Some(false) {
+            assert!(capture.previous_response_id().is_none());
+            if let Some(socket) = socket {
+                assert_eq!(capture.socket_ordinal, socket);
+            }
+            socket = Some(capture.socket_ordinal);
+            assert!(capture.wire_bytes > 4 * 1024 * 1024);
+        } else {
+            assert_eq!(
+                capture.previous_response_id(),
+                Some(format!("response-{}", turn - 1).as_str())
+            );
+            assert_eq!(capture.socket_ordinal, socket.unwrap());
+            assert!(
+                capture.wire_bytes < 64 * 1024,
+                "warm request repeated initial history"
+            );
+            let input = capture.body["input"].as_array().unwrap();
+            assert_eq!(input.len(), 1);
+            assert_eq!(input[0]["type"], "function_call_output");
+            assert_eq!(input[0]["call_id"], format!("call-{}", turn - 1));
+            assert_eq!(input[0]["output"], format!("result-{}", turn - 1));
+        }
+        // The peer keeps metadata only between turns; do not retain 20 copies of the seed.
+        harness.upstream.captures.lock().unwrap().clear();
+        let call_id = format!("call-{turn}");
+        let args = json!({"step":turn});
+        pending
+            .respond_with_function_call(
+                &format!("response-{turn}"),
+                FunctionCallReply {
+                    call_id: call_id.clone(),
+                    name: "Edit".into(),
+                    arguments: args.to_string(),
+                },
+            )
+            .await;
+        let response = request.await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("event: message_stop"));
+        assert!(!response.body.contains("event: error"));
+        history.push(json!({"role":"assistant","content":[{"type":"tool_use","id":call_id,"name":"Edit","input":args}]}));
+        history.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":call_id,"content":format!("result-{turn}")}]}));
+    }
+    assert_eq!(
+        harness.upstream.connections.load(Ordering::Relaxed),
+        1,
+        "the peer must accept exactly one connection across all20 turns"
+    );
+    println!(
+        "20 tool turns ({previous:?}), 1 socket; exact wire bytes: {sizes:?}; total={}",
+        sizes.iter().sum::<usize>()
+    );
+    drop(_default_previous);
+    harness.shutdown().await;
+    sizes
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stateful_twenty_tool_turns_use_only_new_items_on_wire() {
+    let _lock = env_lock().await;
+    let full = twenty_tool_turns(Some(false)).await;
+    let delta = twenty_tool_turns(None).await;
+    assert!(delta.iter().sum::<usize>() < full.iter().sum::<usize>() / 10);
 }

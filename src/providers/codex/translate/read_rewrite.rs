@@ -6,6 +6,7 @@ use serde_json::Value;
 
 const MAX_REWRITE_NOTES: usize = 4_096;
 const READ_OFFSET_REWRITE_THRESHOLD: i64 = 1_000_000;
+pub(super) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadOffsetRewrite {
@@ -27,14 +28,21 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
         return args.to_string();
     }
 
-    let parsed: Value = match serde_json::from_str(args) {
-        Ok(v) => v,
-        Err(_) => return args.to_string(),
-    };
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => return args.to_string(),
-    };
+    completed_read_args(args, call_id).unwrap_or_else(|_| args.to_string())
+}
+
+/// Stream consumers call this only at item completion. Whitespace in an
+/// unfinished delta is neither completion nor permission to invent a brace.
+/// Parsing once here keeps long whitespace runs linear in the argument size.
+pub(super) fn completed_read_args(args: &str, call_id: Option<&str>) -> Result<String, String> {
+    if args.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+        return Err("Buffered Read tool arguments exceeded safe limits".to_string());
+    }
+    let parsed: Value = serde_json::from_str(args)
+        .map_err(|_| "Completed Read tool arguments contain invalid JSON".to_string())?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "Completed Read tool arguments must be a JSON object".to_string())?;
 
     let mut sanitized = obj.clone();
     let mut changed = false;
@@ -68,9 +76,9 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
     }
 
     if changed {
-        serde_json::to_string(&sanitized).unwrap_or_else(|_| args.to_string())
+        Ok(serde_json::to_string(&sanitized).unwrap_or_else(|_| args.to_string()))
     } else {
-        args.to_string()
+        Ok(args.to_string())
     }
 }
 

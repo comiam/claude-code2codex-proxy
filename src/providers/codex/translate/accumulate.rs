@@ -3,11 +3,11 @@ use serde_json::Value;
 use crate::traffic::TrafficCapture;
 
 use super::IncompleteResponsePolicy;
+use super::event::TranslationEvent as ReducerEvent;
 use super::reducer::{
-    AnthropicUsage, ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
-    reduce_upstream_bytes_with_policy,
+    AnthropicUsage, UpstreamStreamError, map_codex_usage_to_anthropic,
+    translate_upstream_bytes_with_policy,
 };
-use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
 pub fn accumulate_response(
     upstream: &[u8],
@@ -60,23 +60,18 @@ fn accumulate_response_with_policy_and_traffic(
     incomplete_response_policy: IncompleteResponsePolicy,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Value, anyhow::Error> {
-    let events = match reduce_upstream_bytes_with_policy(upstream, incomplete_response_policy) {
-        Ok(events) => events,
+    let events = match translate_upstream_bytes_with_policy(upstream, incomplete_response_policy) {
+        Ok((events, _)) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);
-            return Err(anyhow::anyhow!(
-                "upstream error: {} ({:?})",
-                err.message,
-                err.kind
-            ));
+            return Err(err.into());
         }
     };
 
     let mut blocks: Vec<AccumulatedBlock> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut usage: Option<AnthropicUsage> = None;
-    let mut web_search_events: Vec<ReducerEvent> = Vec::new();
-    let mut deferred_text_parts: Vec<String> = Vec::new();
+    let mut indexed_content: Vec<(usize, Value)> = Vec::new();
 
     enum BlockKind {
         Thinking {
@@ -100,9 +95,6 @@ fn accumulate_response_with_policy_and_traffic(
 
     for event in &events {
         match event {
-            ReducerEvent::WebSearch { .. } => {
-                web_search_events.push(event.clone());
-            }
             ReducerEvent::ThinkingStart { index } => {
                 blocks.push(AccumulatedBlock {
                     index: *index,
@@ -140,7 +132,6 @@ fn accumulate_response_with_policy_and_traffic(
                 {
                     t.push_str(text);
                 }
-                deferred_text_parts.push(text.clone());
             }
             ReducerEvent::ToolStart { index, id, name } => {
                 blocks.push(AccumulatedBlock {
@@ -162,6 +153,11 @@ fn accumulate_response_with_policy_and_traffic(
                     args.push_str(partial_json);
                 }
             }
+            ReducerEvent::SearchComplete { index, card } => {
+                for (offset, block) in card.blocks().into_iter().enumerate() {
+                    indexed_content.push((index + offset, block));
+                }
+            }
             ReducerEvent::Finish {
                 stop_reason: sr,
                 usage: u,
@@ -173,52 +169,6 @@ fn accumulate_response_with_policy_and_traffic(
                 usage = Some(map_codex_usage_to_anthropic(u, ws));
             }
             _ => {}
-        }
-    }
-
-    let text_from_deferred: String = deferred_text_parts.join("");
-
-    let mut indexed_content: Vec<(usize, Value)> = Vec::new();
-
-    if !web_search_events.is_empty() {
-        let compat_blocks = build_web_search_compat_blocks(&web_search_events, &text_from_deferred);
-        for block in &compat_blocks {
-            match &block.content {
-                WebSearchCompatContent::ServerToolUse { id, name, input } => {
-                    indexed_content.push((
-                        block.index,
-                        serde_json::json!({
-                            "type": "server_tool_use",
-                            "id": id,
-                            "name": name,
-                            "input": input,
-                        }),
-                    ));
-                }
-                WebSearchCompatContent::WebSearchToolResult {
-                    tool_use_id,
-                    content: results,
-                } => {
-                    let result_content: Vec<Value> = results
-                        .iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "type": "web_search_result",
-                                "title": r.title,
-                                "url": r.url,
-                            })
-                        })
-                        .collect();
-                    indexed_content.push((
-                        block.index,
-                        serde_json::json!({
-                            "type": "web_search_tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": result_content,
-                        }),
-                    ));
-                }
-            }
         }
     }
 
@@ -291,7 +241,6 @@ fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamS
         "060-codex-reducer-error",
         &serde_json::json!({
             "kind": format!("{:?}", err.kind),
-            "message": err.message,
             "retryAfterSeconds": err.retry_after_seconds,
             "diagnostics": err.diagnostics,
         }),
@@ -314,6 +263,19 @@ mod tests {
             "data: {}\n\n",
             serde_json::to_string(&serde_json::Value::Object(obj)).unwrap()
         )
+    }
+
+    #[test]
+    fn buffered_error_preserves_typed_status_until_mapping() {
+        let upstream = sse_event(
+            "error",
+            json!({"status":422,"code":"invalid_request_error","message":"synthetic invalid input"}),
+        );
+        let error = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-6.1-sol").unwrap_err();
+        assert!(
+            error.downcast_ref::<UpstreamStreamError>().is_some(),
+            "typed failure must survive anyhow wrapping"
+        );
     }
 
     #[test]
@@ -447,13 +409,16 @@ mod tests {
         );
         let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
         let content = response["content"].as_array().unwrap();
-        assert!(content.len() >= 3);
-        // First should be server_tool_use
-        assert_eq!(content[0]["type"], "server_tool_use");
-        // Second should be web_search_tool_result
-        assert_eq!(content[1]["type"], "web_search_tool_result");
-        // Third should be text
-        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "See [Result](https://result.com)");
+        assert_eq!(content[1]["type"], "server_tool_use");
+        assert_eq!(content[2]["type"], "web_search_tool_result");
+        assert_eq!(
+            content[2]["content"],
+            serde_json::json!([]),
+            "plain prose URLs are not invented result hits"
+        );
     }
 
     #[test]
@@ -599,7 +564,7 @@ mod tests {
                 "response.output_item.done",
                 json!({
                     "output_index":0,
-                    "item":{"type":"reasoning","id":"rs_1"}
+                    "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
                 })
             ),
             sse_event(

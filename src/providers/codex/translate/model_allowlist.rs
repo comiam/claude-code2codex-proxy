@@ -29,6 +29,7 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("haiku", "gpt-6-luna"),
     ("claude-haiku-4-5", "gpt-6-luna"),
     ("claude-haiku-4-5-20251001", "gpt-6-luna"),
+    ("claude-haiku-5-5", "gpt-6-luna"),
     ("sonnet", "gpt-5.6-terra"),
     ("claude-sonnet-4-6", "gpt-5.6-terra"),
     ("claude-sonnet-5", "gpt-5.6-terra"),
@@ -508,6 +509,25 @@ mod tests {
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
         assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
+    }
+
+    #[test]
+    fn gpt_6_1_terra_matches_public_catalog_metadata() {
+        let model = "gpt-6.1-terra";
+        assert!(assert_allowed_model(model).is_ok());
+        assert!(is_valid_model_for_codex(model));
+        assert!(uses_responses_lite(model));
+        assert_eq!(tier_model_variants(model), ["gpt-6.1-terra-fast"]);
+        for (requested, tier) in [
+            (model, None),
+            ("gpt-6.1-terra-fast", Some(ServiceTier::Priority)),
+        ] {
+            assert!(is_valid_model_for_codex(requested));
+            let resolved = resolve_with_model_override(requested, None);
+            assert_eq!(resolved.model, model);
+            assert_eq!(resolved.service_tier, tier);
+        }
+        assert!(!is_valid_model_for_codex("gpt-6.1-terra-ultrafast"));
     }
 
     #[test]

@@ -19,7 +19,7 @@ Windows falls back to `%USERPROFILE%/AppData/Roaming` and `%USERPROFILE%/AppData
 
 ## Configuration
 
-`config.json` lives directly under the configuration root. See [Configuration](/reference/configuration/) for its schema and precedence.
+`config.json` lives directly under the configuration root. See [Configuration](configuration.md) for its schema and precedence.
 
 ## Provider credentials
 
@@ -49,7 +49,7 @@ Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-
 
 `proxy.log` lives under the state root. It uses JSON Lines and rotates at 20 MiB. Known credential keys, including authorization, access tokens, refresh tokens, ID tokens, and account headers, are redacted before writing.
 
-A Homebrew service also writes `service.log` under the state root.
+A service manager may write separate output logs depending on its configuration.
 
 ## Failed responses
 
@@ -70,8 +70,6 @@ Set `CCP_TRAFFIC_LOG=1` to create captures under `traffic/` in the state root. R
 
 Event filenames use monotonic sequence numbers so lexical order preserves emission order.
 
-<div class="security-callout">
-<strong>Traffic captures preserve content.</strong> Header and token redaction does not remove prompts, source code, tool definitions, tool inputs, tool results, images, or provider output. Treat the entire directory as sensitive user data.
-</div>
+**Traffic captures preserve content.** Header and token redaction does not remove prompts, source code, tool definitions, tool inputs, tool results, images, or provider output. Treat the entire directory as sensitive user data.
 
 Enable capture only for a focused reproduction, keep the directory local, and delete it after the investigation.

@@ -348,6 +348,7 @@ dependencies = [
  "hex",
  "hostname",
  "http",
+ "http-body",
  "http-body-util",
  "hyper-util",
  "jiff",

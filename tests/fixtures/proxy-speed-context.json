@@ -1,0 +1,109 @@
+{
+  "client_version": "2.1.310",
+  "cases": [
+    {
+      "case": "normal",
+      "headers": {
+        "x-claude-code-session-id": "11111111-1111-4111-8111-111111111111"
+      },
+      "request": {
+        "model": "claude-sonnet-4-6",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\n# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /tmp/ccp-speed-context-fixture/normal/project\n - Is a git repository: true\n - Platform: linux\n - Shell: unknown\n - OS Version: Linux 7.0.0-38-generic\n - Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nYou are powered by the model named Sonnet 4.6. The exact model ID is claude-sonnet-4-6. Assistant knowledge cutoff is August 2025.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of /tmp/ccp-speed-context-fixture/normal/profile/rules/local-test.md (user's private global instructions for all projects):\n\nFor this isolated test, keep responses concise. Do not invoke tools.\n\nContents of /tmp/ccp-speed-context-fixture/normal/project/CLAUDE.md (project instructions, checked into the codebase):\n\nThis is a local-only proxy command compatibility test project.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# gitStatus\nThis is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.\n\nCurrent branch: master\n\nMain branch (you will usually use this for PRs): main\n\nStatus:\n?? .claude/\n?? CLAUDE.md\n\nRecent commits:\n\n\nClaude Code attached this context automatically; it isn't part of the user's message. It describes the user's own account and workspace, so they don't need it reported back.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-25.\n</system-reminder>\n"
+              },
+              {
+                "type": "text",
+                "text": "<command-message>proxy-speed</command-message>\n<command-name>/proxy-speed</command-name>\n<command-args>ultrafast</command-args>\n"
+              },
+              {
+                "type": "text",
+                "text": "Base directory for this skill: /tmp/ccp-speed-context-fixture/normal/project/.claude/skills/proxy-speed\n\n<ccp-proxy-speed version=\"1\" session=\"11111111-1111-4111-8111-111111111111\" mode=\"ultrafast\"/>\n",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "max_tokens": 32000
+      },
+      "context_blocks": 5
+    },
+    {
+      "case": "normal_dynamic",
+      "headers": {
+        "x-claude-code-session-id": "11111111-1111-4111-8111-111111111111"
+      },
+      "request": {
+        "model": "claude-sonnet-4-6",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\n# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /tmp/ccp-speed-context-fixture/normal_dynamic/project\n - Is a git repository: true\n - Platform: linux\n - Shell: unknown\n - OS Version: Linux 7.0.0-38-generic\n - Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nYou are powered by the model named Sonnet 4.6. The exact model ID is claude-sonnet-4-6. Assistant knowledge cutoff is August 2025.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of /tmp/ccp-speed-context-fixture/normal_dynamic/profile/rules/local-test.md (user's private global instructions for all projects):\n\nFor this isolated test, keep responses concise. Do not invoke tools.\n\nContents of /tmp/ccp-speed-context-fixture/normal_dynamic/project/CLAUDE.md (project instructions, checked into the codebase):\n\nThis is a local-only proxy command compatibility test project.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# gitStatus\nThis is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.\n\nCurrent branch: master\n\nMain branch (you will usually use this for PRs): main\n\nStatus:\n?? .claude/\n?? CLAUDE.md\n\nRecent commits:\n\n\nClaude Code attached this context automatically; it isn't part of the user's message. It describes the user's own account and workspace, so they don't need it reported back.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\n# auto memory\nMemory directory: `/tmp/ccp-speed-context-fixture/normal_dynamic/profile/projects/-tmp-ccp-speed-nonbare-1hjhmh1r-normal-dynamic-project/memory/`\n\nThis is ambient context — do not narrate it to the user unless they ask or it is directly relevant to their request.\n</system-reminder>"
+              },
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-25.\n</system-reminder>\n"
+              },
+              {
+                "type": "text",
+                "text": "<command-message>proxy-speed</command-message>\n<command-name>/proxy-speed</command-name>\n<command-args>ultrafast</command-args>\n"
+              },
+              {
+                "type": "text",
+                "text": "Base directory for this skill: /tmp/ccp-speed-context-fixture/normal_dynamic/project/.claude/skills/proxy-speed\n\n<ccp-proxy-speed version=\"1\" session=\"11111111-1111-4111-8111-111111111111\" mode=\"ultrafast\"/>\n",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          }
+        ],
+        "stream": true,
+        "max_tokens": 32000
+      },
+      "context_blocks": 6
+    }
+  ]
+}

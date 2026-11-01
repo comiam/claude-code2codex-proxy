@@ -93,8 +93,12 @@ async fn call_messages(model: &str) -> Response {
 }
 
 async fn call_messages_body(body: Value) -> Response {
+    call_messages_body_with_registry(Arc::new(Registry::with_default_alias()), body).await
+}
+
+async fn call_messages_body_with_registry(registry: Arc<Registry>, body: Value) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
-    app(Arc::new(Registry::with_default_alias()))
+    app(registry)
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -141,6 +145,10 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
 }
 
 fn traffic_files(state_dir: &Path) -> Vec<PathBuf> {
+    // Captures are asynchronous; finish accepted writes before inspecting files.
+    assert!(claude_code_proxy::logging::flush_diagnostics(
+        Duration::from_secs(2)
+    ));
     collect_files(
         &state_dir
             .join("claude-code-proxy")
@@ -296,7 +304,7 @@ async fn spawn_retrying_truncated_http_upstream(
 }
 
 #[allow(clippy::await_holding_lock)]
-async fn assert_codex_http_retries_structural_body_error(first_body: Vec<u8>) {
+async fn assert_codex_http_structural_body_error(first_body: Vec<u8>, tool_committed: bool) {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
@@ -335,11 +343,26 @@ async fn assert_codex_http_retries_structural_body_error(first_body: Vec<u8>) {
     .expect("retried stream must finish")
     .unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "stream body: {text}");
-    assert!(text.contains("retry succeeded"), "stream body: {text}");
-    assert!(!text.contains("event: error"), "stream body: {text}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        if tool_committed { 1 } else { 2 },
+        "stream body: {text}"
+    );
+    if tool_committed {
+        assert!(text.contains("call_structural"), "stream body: {text}");
+        assert!(
+            text.contains(r#""type":"api_error""#),
+            "stream body: {text}"
+        );
+        assert_eq!(text.matches("event: error").count(), 1);
+        assert!(!text.contains("retry succeeded"), "stream body: {text}");
+        assert!(!text.contains("event: message_stop"), "stream body: {text}");
+    } else {
+        assert!(text.contains("retry succeeded"), "stream body: {text}");
+        assert!(!text.contains("event: error"), "stream body: {text}");
+        assert_eq!(text.matches("event: message_stop").count(), 1);
+    }
     assert_eq!(text.matches("event: message_start").count(), 1);
-    assert_eq!(text.matches("event: message_stop").count(), 1);
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -531,6 +554,7 @@ async fn spawn_websocket_error_upstream(message: &'static str) -> String {
                 "status": 400,
                 "error": {
                     "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
                     "param": "input",
                     "message": message
                 }
@@ -979,6 +1003,15 @@ async fn smoke_codex_model_routes_to_real_provider() {
             .unwrap()
             .contains("Not authenticated")
     );
+}
+
+#[test]
+fn smoke_codex_model_is_registered() {
+    let _guard = env_lock();
+    // Routing must not send inference using credentials from the developer's profile.
+    let registry = Registry::with_default_alias();
+    let provider = registry.provider_for_model("gpt-5.5", None).unwrap();
+    assert_eq!(provider.name(), "codex");
 }
 
 #[test]
@@ -1609,9 +1642,8 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
+async fn smoke_codex_compact_text_fast_fails_usage_limit() {
     let _guard = env_lock();
-    clear_all_compactions_for_tests();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
 
@@ -1620,10 +1652,7 @@ async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
         let attempts = attempts.clone();
         move |body: Value| {
             attempts.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(
-                body["input"].as_array().unwrap().last().unwrap()["type"],
-                "compaction_trigger"
-            );
+            assert!(!body.to_string().contains("compaction_trigger"));
             codex_usage_limit_sse("usage_limit_reached")
         }
     })
@@ -1652,184 +1681,80 @@ async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
 
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_usage_limit_response(response).await;
-    clear_all_compactions_for_tests();
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_server_compaction_replays_native_history() {
+async fn smoke_codex_compact_text_uses_one_generation() {
     let _guard = env_lock();
     let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "0");
     clear_all_compactions_for_tests();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
-
     let captured = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_http_upstream({
         let captured = captured.clone();
         move |body: Value| {
-            let is_compaction = body["input"].as_array().is_some_and(|input| {
-                input.last().and_then(|item| item["type"].as_str())
-                    == Some("compaction_trigger")
-            });
-            let request_number = {
-                let mut requests = captured.lock().unwrap();
-                requests.push(body);
-                requests.len()
-            };
-            if is_compaction {
-                concat!(
-                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque-history\"}}\n\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\",\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}\n\n"
-                )
-                .as_bytes()
-                .to_vec()
-            } else {
-                let text = if request_number == 2 {
-                    "portable summary with enough detail to anchor the compacted conversation"
-                } else {
-                    "compacted ok"
-                };
-                format!(
-                    "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_up\"}}}}\n\n\
-                     data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"{text}\"}}\n\n\
-                     data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\"}}}}\n\n\
-                     data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_{request_number}\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":2}}}}}}\n\n"
-                )
-                .into_bytes()
-            }
-        }
-    })
-    .await;
-
-    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
-    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
-    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
-    let compact_response = call_messages_body(json!({
-        "model": "gpt-5.6-sol",
-        "max_tokens": 64,
-        "system": "You are Claude Code.",
-        "messages": [
-            {"role":"user","content":"old conversation"},
-            {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{}}]},
-            {"role":"user","content":[
-                {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
-                {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
-            ]}
-        ]
-    }))
-    .await;
-    assert_eq!(compact_response.status(), StatusCode::OK);
-
-    let response = call_messages_body(json!({
-        "model": "gpt-5.6-sol",
-        "max_tokens": 64,
-        "system": "current instructions",
-        "messages": [
-            {"role":"user","content":"<summary>portable summary with enough detail to anchor the compacted conversation</summary>"},
-            {"role":"user","content":"continue"}
-        ]
-    }))
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let value: Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(value["content"][0]["text"], "compacted ok");
-
-    let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    assert_eq!(requests[0]["model"], "gpt-5.6-sol");
-    assert!(requests[0].get("client_metadata").is_some());
-    assert_eq!(
-        requests[0]["input"].as_array().unwrap().last().unwrap()["type"],
-        "compaction_trigger"
-    );
-    assert!(
-        !requests[0]
-            .to_string()
-            .contains("Your task is to create a detailed summary")
-    );
-    assert!(
-        requests[1]
-            .to_string()
-            .contains("Your task is to create a detailed summary")
-    );
-    assert!(!requests[1].to_string().contains("opaque-history"));
-    let replay = requests[2]["input"].as_array().unwrap();
-    assert!(requests[2].get("client_metadata").is_some());
-    assert!(requests[2].to_string().contains("current instructions"));
-    let compaction = replay
-        .iter()
-        .find(|item| item["type"] == "compaction")
-        .unwrap();
-    assert_eq!(compaction["encrypted_content"], "opaque-history");
-    assert!(replay.iter().any(|item| item["role"] == "user"));
-    clear_all_compactions_for_tests();
-}
-
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-async fn smoke_codex_http_compaction_failure_preserves_portable_summary() {
-    let _guard = env_lock();
-    clear_all_compactions_for_tests();
-    let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
-
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let upstream = spawn_http_upstream({
-        let captured = captured.clone();
-        move |body: Value| {
-            let is_compaction = body["input"].as_array().is_some_and(|input| {
-                input.last().and_then(|item| item["type"].as_str())
-                    == Some("compaction_trigger")
-            });
             captured.lock().unwrap().push(body);
-            if is_compaction {
-                b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n".to_vec()
-            } else {
-                concat!(
-                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
-                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"portable fallback\"}\n\n",
-                    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
-                )
-                .as_bytes()
-                .to_vec()
-            }
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"<summary>portable summary</summary>\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+            ).as_bytes().to_vec()
         }
-    })
-    .await;
-
+    }).await;
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
-    let response = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "system": "You are a helpful AI assistant tasked with summarizing conversations.",
-        "messages": [{"role":"user","content":"old conversation"}]
-    }))
-    .await;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let value: Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(value["content"][0]["text"], "portable fallback");
-
-    let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].to_string().contains("old conversation"));
-    assert!(!requests[1].to_string().contains("opaque-history"));
+    for stream in [false, true] {
+        for legacy in ["0", "1"] {
+            captured.lock().unwrap().clear();
+            let _legacy = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", legacy);
+            let response = call_messages_body(json!({
+                "model": "gpt-5.6-sol", "max_tokens": 64, "stream": stream,
+                "system": "You are Claude Code.",
+                "tools": [{"name":"Read","input_schema":{"type":"object"}}, {"type":"web_search_20250305","name":"web_search"}],
+                "tool_choice": {"type":"tool","name":"web_search"},
+                "messages": [
+                    {"role":"user","content":"old conversation"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{}}]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"tool-1","content":"historical result"},
+                        {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests. Focus on the migration."}
+                    ]}
+                ]
+            })).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if stream {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(text.contains("<summary>portable summary</summary>"));
+                assert!(text.contains("event: message_stop"));
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    value["content"][0]["text"],
+                    "<summary>portable summary</summary>"
+                );
+            }
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1, "stream={stream}, legacy={legacy}");
+            let sent = &requests[0];
+            assert_eq!(sent["model"], "gpt-5.6-sol");
+            assert!(
+                sent.get("client_metadata").is_some(),
+                "compact stays on Lite"
+            );
+            assert!(sent.get("tools").is_none());
+            assert!(!sent.to_string().contains("additional_tools"));
+            assert!(!sent.to_string().contains("compaction_trigger"));
+            assert!(sent.to_string().contains("historical result"));
+            assert!(sent.to_string().contains("Focus on the migration."));
+        }
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2116,27 +2041,29 @@ async fn smoke_codex_http_retries_presemantic_eof() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_retries_body_error_after_structural_message() {
-    assert_codex_http_retries_structural_body_error(
+    assert_codex_http_structural_body_error(
         concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_structural\"}}\n\n",
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_structural\"}}\n\n"
         )
         .as_bytes()
         .to_vec(),
+        false,
     )
     .await;
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_body_error_after_structural_tool() {
-    assert_codex_http_retries_structural_body_error(
+async fn smoke_codex_http_body_error_after_committed_tool_never_resends() {
+    assert_codex_http_structural_body_error(
         concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_structural\"}}\n\n",
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_structural\",\"name\":\"Read\"}}\n\n"
         )
         .as_bytes()
         .to_vec(),
+        true,
     )
     .await;
 }
@@ -2439,6 +2366,69 @@ async fn smoke_codex_http_does_not_retry_overload_after_semantic_output() {
     assert!(text.contains("partial output"), "stream body: {text}");
     assert!(
         text.contains("overloaded after output"),
+        "stream body: {text}"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_malformed_after_semantic_output_emits_one_error() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
+                    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_partial\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial output\"}\n\n",
+                    "data: {malformed\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                )
+                .as_bytes()
+                .to_vec()
+            } else {
+                panic!("semantic output must close the full-request retry window");
+            }
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("failed semantic stream must terminate")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "stream body: {text}");
+    assert!(text.contains("partial output"), "stream body: {text}");
+    assert_eq!(
+        text.matches("event: error").count(),
+        1,
+        "stream body: {text}"
+    );
+    assert!(text.contains("invalid JSON"), "stream body: {text}");
+    assert!(
+        !text.contains("\"stop_reason\":\"end_turn\""),
         "stream body: {text}"
     );
 }
@@ -2957,28 +2947,37 @@ async fn smoke_codex_websocket_stream_uses_previous_response_id() {
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
     let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
 
-    let first = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [{"role":"user","content":"one"}]
-    }))
+    // One running server retains its client compatibility scope across turns.
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let first = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"one"}]
+        }),
+    )
     .await;
     assert_eq!(first.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
         .await
         .unwrap();
 
-    let second = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [
-            {"role":"user","content":"one"},
-            {"role":"assistant","content":"first"},
-            {"role":"user","content":"two"}
-        ]
-    }))
+    let second = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [
+                {"role":"user","content":"one"},
+                {"role":"assistant","content":"first"},
+                {"role":"user","content":"two"}
+            ]
+        }),
+    )
     .await;
     assert_eq!(second.status(), StatusCode::OK);
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
@@ -3023,28 +3022,37 @@ async fn smoke_codex_websocket_stream_retries_missing_previous_response_id() {
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
     let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
 
-    let first = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [{"role":"user","content":"one"}]
-    }))
+    // One running server retains its client compatibility scope across turns.
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let first = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"one"}]
+        }),
+    )
     .await;
     assert_eq!(first.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
         .await
         .unwrap();
 
-    let second = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [
-            {"role":"user","content":"one"},
-            {"role":"assistant","content":"first"},
-            {"role":"user","content":"two"}
-        ]
-    }))
+    let second = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [
+                {"role":"user","content":"one"},
+                {"role":"assistant","content":"first"},
+                {"role":"user","content":"two"}
+            ]
+        }),
+    )
     .await;
     assert_eq!(second.status(), StatusCode::OK);
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
@@ -3072,7 +3080,7 @@ async fn smoke_codex_websocket_stream_retries_missing_previous_response_id() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
-async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
+async fn smoke_codex_websocket_close_after_committed_tool_never_resends() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     write_auth(config.path(), "codex");
@@ -3087,62 +3095,79 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
     let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
 
-    let first = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [{"role":"user","content":"one"}]
-    }))
+    // One running server retains its client compatibility scope across turns.
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let first = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"one"}]
+        }),
+    )
     .await;
     assert_eq!(first.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
         .await
         .unwrap();
 
-    let second = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [
-            {"role":"user","content":"one"},
-            {"role":"assistant","content":"first"},
-            {"role":"user","content":"two"}
-        ]
-    }))
+    let second = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [
+                {"role":"user","content":"one"},
+                {"role":"assistant","content":"first"},
+                {"role":"user","content":"two"}
+            ]
+        }),
+    )
     .await;
     assert_eq!(second.status(), StatusCode::OK);
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(
-        String::from_utf8_lossy(&second_body).contains("retry"),
-        "second response body: {}",
-        String::from_utf8_lossy(&second_body)
-    );
     let second_text = String::from_utf8_lossy(&second_body);
     assert!(
-        !second_text.contains("call_aborted"),
+        second_text.contains("call_aborted"),
         "stream body: {second_text}"
     );
     assert!(
-        !second_text.contains(r#""name":"Read""#),
+        second_text.contains(r#""name":"Read""#),
         "stream body: {second_text}"
     );
     assert!(
-        !second_text.contains("event: error"),
+        second_text.contains(r#""type":"api_error""#),
         "stream body: {second_text}"
     );
+    assert_eq!(second_text.matches("event: error").count(), 1);
+    assert_eq!(second_text.matches("event: message_start").count(), 1);
     assert_eq!(second_text.matches("event: content_block_start").count(), 1);
+    assert!(
+        !second_text.contains("event: message_stop"),
+        "stream body: {second_text}"
+    );
+    assert!(!second_text.contains("retry"), "stream body: {second_text}");
 
     let guard = captured.lock().unwrap();
-    assert_eq!(guard.len(), 3, "expected full-context retry request");
+    assert_eq!(
+        guard.len(),
+        2,
+        "visible tool start forbids full-context retry"
+    );
     assert!(guard[0].get("previous_response_id").is_none());
     assert_eq!(guard[1]["previous_response_id"], "resp_1");
-    assert!(guard[2].get("previous_response_id").is_none());
-    assert_eq!(
-        guard[2]["input"].as_array().map(Vec::len),
-        Some(3),
-        "retry request should send the full input"
+    #[allow(deprecated)]
+    let parent = claude_code_proxy::providers::codex::continuation::has_continuation_for_tests(
+        "smoke-session",
+    );
+    assert!(
+        !parent,
+        "failed tool turn cannot retain a successful parent"
     );
 
     clear_all_continuations_for_tests();
@@ -3169,28 +3194,37 @@ async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
     let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
 
-    let first = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [{"role":"user","content":"one"}]
-    }))
+    // One running server retains its client compatibility scope across turns.
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let first = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"one"}]
+        }),
+    )
     .await;
     assert_eq!(first.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
         .await
         .unwrap();
 
-    let second = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [
-            {"role":"user","content":"one"},
-            {"role":"assistant","content":"first"},
-            {"role":"user","content":"two"}
-        ]
-    }))
+    let second = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [
+                {"role":"user","content":"one"},
+                {"role":"assistant","content":"first"},
+                {"role":"user","content":"two"}
+            ]
+        }),
+    )
     .await;
     assert_eq!(second.status(), StatusCode::OK);
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
@@ -3300,23 +3334,32 @@ async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn()
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
     let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
 
-    let first = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "messages": [{"role":"user","content":"one"}]
-    }))
+    // One running server retains its client compatibility scope across turns.
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let first = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [{"role":"user","content":"one"}]
+        }),
+    )
     .await;
     assert_eq!(first.status(), StatusCode::OK);
 
-    let second = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "messages": [
-            {"role":"user","content":"one"},
-            {"role":"assistant","content":"first"},
-            {"role":"user","content":"two"}
-        ]
-    }))
+    let second = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [
+                {"role":"user","content":"one"},
+                {"role":"assistant","content":"first"},
+                {"role":"user","content":"two"}
+            ]
+        }),
+    )
     .await;
     let second_status = second.status();
     let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
@@ -3331,17 +3374,20 @@ async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn()
     let value: Value = serde_json::from_slice(&second_body).unwrap();
     assert_eq!(value["content"][0]["text"], "second");
 
-    let third = call_messages_body(json!({
-        "model": "gpt-5.5",
-        "max_tokens": 64,
-        "messages": [
-            {"role":"user","content":"one"},
-            {"role":"assistant","content":"first"},
-            {"role":"user","content":"two"},
-            {"role":"assistant","content":"second"},
-            {"role":"user","content":"three"}
-        ]
-    }))
+    let third = call_messages_body_with_registry(
+        registry.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "messages": [
+                {"role":"user","content":"one"},
+                {"role":"assistant","content":"first"},
+                {"role":"user","content":"two"},
+                {"role":"assistant","content":"second"},
+                {"role":"user","content":"three"}
+            ]
+        }),
+    )
     .await;
     let third_status = third.status();
     let third_body = axum::body::to_bytes(third.into_body(), usize::MAX)
@@ -3413,11 +3459,132 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
             .unwrap()
             .contains("redacted")
     );
-    traffic_file(&files, "022-upstream-websocket-metadata.json");
+    if files.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("022-upstream-websocket-metadata.json"))
+    }) {
+        let websocket = traffic_json(&files, "022-upstream-websocket-metadata.json");
+        assert_eq!(websocket["transport"], "websocket");
+    } else {
+        let completion = traffic_json(&files, "capture-completion.json");
+        assert_eq!(completion["complete"], false);
+        assert!(completion["dropped"].as_u64().unwrap() > 0);
+        assert_eq!(completion["failed"], 0);
+    }
     assert_eq!(
         traffic_json(&files, "030-upstream-response-headers.json")["status"],
         200
     );
     traffic_file(&files, "032-upstream-response-body.sse");
     traffic_file(&files, "040-upstream-event.json");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_non_success_errors_use_typed_normalization() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+    for stream in [false, true] {
+        for (status, error, want_status, want_type, want_message) in [
+            (
+                400,
+                json!({"error":{"code":"context_length_exceeded","type":"invalid_request_error","message":"input exceeds context window"}}),
+                413,
+                "request_too_large",
+                "input exceeds context window",
+            ),
+            (
+                400,
+                json!({"error":{"type":"invalid_request_error","message":"input exceeds context window"}}),
+                400,
+                "invalid_request_error",
+                "input exceeds context window",
+            ),
+            (
+                403,
+                json!({"error":{"type":"permission_error","message":"synthetic permission rejection"},"encrypted_content":"must-not-leak"}),
+                403,
+                "permission_error",
+                "synthetic permission rejection",
+            ),
+            (
+                403,
+                json!({"detail":"specific synthetic detail","error":{"type":"permission_error","message":"generic synthetic message"}}),
+                403,
+                "permission_error",
+                "specific synthetic detail",
+            ),
+            (
+                500,
+                json!({"error":{"code":"invalid_prompt","message":"synthetic permanent rejection"}}),
+                500,
+                "api_error",
+                "synthetic permanent rejection",
+            ),
+            (
+                500,
+                json!({"error":{"code":"unknown_native_code","message":"synthetic unknown rejection"}}),
+                500,
+                "api_error",
+                "synthetic unknown rejection",
+            ),
+            (
+                429,
+                json!({"error":{"type":"rate_limit_error","message":"synthetic rate rejection"},"encrypted_content":"must-not-leak"}),
+                429,
+                "rate_limit_error",
+                "synthetic rate rejection",
+            ),
+        ] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let counted = attempts.clone();
+            let retry_after = if status == 429 { "120" } else { "0" };
+            let app = axum::Router::new().fallback(move || {
+                let counted = counted.clone();
+                let error = error.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .header("retry-after", retry_after)
+                        .body(Body::from(error.to_string()))
+                        .unwrap()
+                }
+            });
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+            let _base_env = EnvGuard::set("CCP_CODEX_BASE_URL", format!("http://{addr}"));
+            let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+            let response =
+                call_messages_body(json!({"model":"gpt-5.5","max_tokens":64,"stream":stream,
+                "messages":[{"role":"user","content":"synthetic input"}]}))
+                .await;
+            let status = response.status().as_u16();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let expected_attempts = if want_message == "synthetic unknown rejection" {
+                4
+            } else {
+                1
+            };
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                expected_attempts,
+                "known permanent/no-budget errors cannot resend; real unknown-cause5xx retains existing retry budget"
+            );
+            assert_eq!(status, want_status, "stream={stream}: {value}");
+            assert_eq!(value["error"]["type"], want_type);
+            assert_eq!(value["error"]["message"], want_message);
+            assert!(!value.to_string().contains("must-not-leak"));
+        }
+    }
 }

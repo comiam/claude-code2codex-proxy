@@ -10,6 +10,9 @@ pub struct DirResolverEnv {
 
 impl Default for DirResolverEnv {
     fn default() -> Self {
+        if let Some(resolver) = crate::config::captured_dir_resolver() {
+            return resolver;
+        }
         Self {
             platform: std::env::consts::OS.into(),
             env: std::env::vars().collect(),

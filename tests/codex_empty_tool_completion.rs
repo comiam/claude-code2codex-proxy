@@ -13,6 +13,9 @@ struct Script {
     attempts: usize,
     fail: bool,
     contradictory_status: bool,
+    statusless_at: Option<usize>,
+    interrupted_middle: bool,
+    recover_after: usize,
 }
 
 fn next_events(script: &Mutex<Script>) -> Vec<Value> {
@@ -25,16 +28,28 @@ fn next_events(script: &Mutex<Script>) -> Vec<Value> {
             }}}),
         ];
     }
+    if script.interrupted_middle && script.attempts == 2 {
+        return vec![json!({"type":"response.incomplete","response":{
+            "status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}
+        }})];
+    }
     let mut events = vec![];
-    if script.attempts >= 3 {
+    if script.attempts >= script.recover_after {
         events.push(json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_recovered"}}));
         events.push(json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"recovered"}));
         events.push(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_recovered"}}));
     }
-    events.push(json!({"type":"response.completed","response":{
+    let mut terminal = json!({"type":"response.completed","response":{
         "id":format!("resp_{}", script.attempts),"status":if script.contradictory_status && script.attempts < 3 { "in_progress" } else { "completed" },"output":[],
         "usage":{"input_tokens":1,"output_tokens":0}
-    }}));
+    }});
+    if script.statusless_at == Some(script.attempts) {
+        terminal["response"]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+    }
+    events.push(terminal);
     events
 }
 
@@ -48,13 +63,13 @@ impl Drop for Child {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_process_empty_tool_completion_preserves_negative_cases() {
-    for transport in ["http", "websocket"] {
+    for transport in ["http", "websocket", "auto", "auto-http"] {
         let script = Arc::new(Mutex::new(Script::default()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = listener.local_addr().unwrap();
         let state = script.clone();
         let upstream_task = tokio::spawn(async move {
-            if transport == "http" {
+            if matches!(transport, "http" | "auto-http") {
                 let app = Router::new().fallback(post(move || {
                     let state = state.clone();
                     async move {
@@ -120,7 +135,14 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
             .args(["serve", "--port", &port.to_string(), "--no-monitor"])
             .env("CCP_CONFIG_DIR", dir.path())
             .env("XDG_STATE_HOME", dir.path().join("state"))
-            .env("CCP_CODEX_TRANSPORT", transport)
+            .env(
+                "CCP_CODEX_TRANSPORT",
+                if transport == "auto-http" {
+                    "auto"
+                } else {
+                    transport
+                },
+            )
             .env("CCP_CODEX_BASE_URL", format!("http://{upstream}"))
             .env("CCP_CODEX_PREVIOUS_RESPONSE_ID", "0")
             .env("CCP_CODEX_SERVER_COMPACTION", "0")
@@ -156,11 +178,25 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
                 "error",
                 "failed",
                 "non_completed",
+                "statusless_first",
+                "statusless_middle",
+                "interrupted_middle",
             ] {
                 *script.lock().unwrap() = Script {
                     attempts: 0,
                     fail: case == "failed",
                     contradictory_status: case == "non_completed",
+                    statusless_at: match case {
+                        "statusless_first" => Some(1),
+                        "statusless_middle" => Some(2),
+                        _ => None,
+                    },
+                    interrupted_middle: case == "interrupted_middle",
+                    recover_after: if matches!(case, "statusless_middle" | "interrupted_middle") {
+                        4
+                    } else {
+                        3
+                    },
                 };
                 let mut results =
                     vec![json!({"type":"tool_result","tool_use_id":"a","content":"sent"})];
@@ -207,7 +243,14 @@ async fn real_process_empty_tool_completion_preserves_negative_cases() {
                 } else {
                     assert!(status.is_success(), "{context}");
                     let eligible = matches!(case, "success" | "whitespace");
-                    assert_eq!(attempts, if eligible { 2 } else { 3 }, "{context}");
+                    let expected_attempts = if eligible {
+                        2
+                    } else if matches!(case, "statusless_middle" | "interrupted_middle") {
+                        4
+                    } else {
+                        3
+                    };
+                    assert_eq!(attempts, expected_attempts, "{context}");
                     assert_eq!(body.contains("recovered"), !eligible, "{context}");
                     if stream {
                         assert!(body.contains("event: message_stop"), "{context}");

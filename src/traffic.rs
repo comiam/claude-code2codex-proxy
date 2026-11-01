@@ -1,23 +1,22 @@
 use serde_json::{Map, Value};
-use std::fs::{self, File, create_dir_all};
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, atomic::Ordering};
 
 use crate::config::AliasProvider;
 use crate::logging::REDACT_KEYS;
+use crate::logging::writer::{self, CaptureProgress, Record};
 use crate::paths;
 use crate::providers::codex::translate::reasoning_signature::is_proxy_reasoning_signature;
 
 #[derive(Debug)]
 pub struct TrafficCapture {
     root: PathBuf,
-    artifact_counter: Mutex<usize>,
-    event_counter: Mutex<usize>,
+    sequence: Mutex<u64>,
+    progress: Arc<CaptureProgress>,
 }
 
-pub const MAX_SSE_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_STREAM_CAPTURE_EVENT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SSE_CAPTURE_BYTES: usize = 1024 * 1024;
+pub const MAX_STREAM_CAPTURE_EVENT_BYTES: usize = 1024 * 1024;
 pub const MAX_STREAM_CAPTURE_EVENTS: usize = 1_024;
 pub const MAX_STREAM_CAPTURE_FRAME_BYTES: usize = 64 * 1024;
 
@@ -31,6 +30,9 @@ pub struct TrafficCaptureOptions {
 }
 
 pub fn traffic_capture_enabled() -> bool {
+    if let Some(enabled) = crate::config::captured_traffic_log() {
+        return enabled;
+    }
     traffic_capture_enabled_for_env(&std::env::vars().collect())
 }
 
@@ -61,8 +63,8 @@ pub fn create_traffic_capture(opts: TrafficCaptureOptions) -> Option<TrafficCapt
 
     Some(TrafficCapture {
         root: state_root,
-        artifact_counter: Mutex::new(0),
-        event_counter: Mutex::new(0),
+        sequence: Mutex::new(0),
+        progress: Arc::new(CaptureProgress::default()),
     })
 }
 
@@ -72,71 +74,106 @@ impl TrafficCapture {
     }
 
     pub fn write_json(&self, name: &str, value: &Value) {
-        let value = redact_traffic(value);
-        let payload = serde_json::to_string_pretty(&value)
-            .unwrap_or_else(|_| "{}".to_string())
-            .into_bytes();
-        let path = self.next_artifact_path(name, true);
-        let _ = write_bytes(path, &payload);
+        self.json_record(name, value, false);
     }
 
     pub fn write_text(&self, name: &str, text: &str) {
-        let file = if name.ends_with(".txt") {
-            name.to_string()
+        let name = if name.ends_with(".txt") {
+            name.to_owned()
         } else {
             format!("{name}.txt")
         };
-        let path = self.next_artifact_path(&file, false);
-        let _ = write_bytes(path, text.as_bytes());
+        self.write_bytes(&name, text.as_bytes());
     }
 
     pub fn write_bytes(&self, name: &str, value: &[u8]) {
-        let path = self.next_artifact_path(name, false);
-        let _ = write_bytes(path, value);
+        if value.len() > writer::MAX_RECORD_BYTES - 4096 {
+            self.omit();
+            return;
+        }
+        // Raw capture is never a trusted escape hatch. JSON and SSE data must
+        // cross the same recursive redaction boundary as structured captures.
+        if let Ok(value) = serde_json::from_slice::<Value>(value) {
+            self.json_record(name, &value, false);
+            return;
+        }
+        if let Some(payload) = redacted_sse(value) {
+            self.enqueue(name, payload, false, false);
+        } else {
+            self.omit();
+        }
     }
 
     pub fn write_json_event(&self, name: &str, value: &Value) {
-        let value = redact_traffic(value);
-        let payload = serde_json::to_string_pretty(&value)
-            .unwrap_or_else(|_| "{}".to_string())
-            .into_bytes();
-        let path = self.next_event_path(name, true);
-        let _ = write_bytes(path, &payload);
+        self.json_record(name, value, true);
     }
 
     pub fn stream_capture(&self) -> StreamTrafficCapture {
         StreamTrafficCapture::default()
     }
 
-    fn next_artifact_path(&self, name: &str, ensure_ext_json: bool) -> PathBuf {
-        let mut counter: MutexGuard<'_, usize> = self
-            .artifact_counter
-            .lock()
-            .unwrap_or_else(|_| self.artifact_counter.lock().unwrap());
-        *counter += 1;
-        let file = if ensure_ext_json && !name.ends_with(".json") {
-            format!("{name}.json")
-        } else {
-            name.to_string()
-        };
-        self.root
-            .join(format!("{:03}-{}", *counter, sanitize_path_part(&file)))
+    pub(crate) fn omit(&self) {
+        writer::global().omit(Some(&self.progress));
     }
 
-    fn next_event_path(&self, name: &str, ensure_ext_json: bool) -> PathBuf {
-        let mut counter: MutexGuard<'_, usize> = self
-            .event_counter
-            .lock()
-            .unwrap_or_else(|_| self.event_counter.lock().unwrap());
-        *counter += 1;
-        let file = if ensure_ext_json && !name.ends_with(".json") {
-            format!("{name}.json")
-        } else {
-            name.to_string()
+    fn json_record(&self, name: &str, value: &Value, event: bool) {
+        if crate::bounded_json_size(value, writer::MAX_RECORD_BYTES - 4096)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            self.omit();
+            return;
+        }
+        let Some(payload) = writer::bounded_json(&redact_traffic(value), true) else {
+            self.omit();
+            return;
         };
-        self.root
-            .join("events")
-            .join(format!("{:06}-{}", *counter, sanitize_path_part(&file)))
+        let file = if name.ends_with(".json") {
+            name.to_owned()
+        } else {
+            format!("{name}.json")
+        };
+        self.enqueue(&file, payload, event, false);
+    }
+
+    fn enqueue(&self, name: &str, payload: Vec<u8>, event: bool, completion: bool) {
+        // This lock covers ordinal assignment + try-enqueue only. It never
+        // waits for the writer; concurrent producers drop on contention.
+        let Ok(mut ordinal) = self.sequence.try_lock() else {
+            self.omit();
+            return;
+        };
+        *ordinal += 1;
+        let dir = if event {
+            self.root.join("events")
+        } else {
+            self.root.clone()
+        };
+        let path = dir.join(format!("{:06}-{}", *ordinal, sanitize_path_part(name)));
+        writer::global().enqueue(Record::capture(
+            path,
+            payload,
+            self.progress.clone(),
+            completion,
+        ));
+    }
+}
+
+impl Drop for TrafficCapture {
+    fn drop(&mut self) {
+        let marker = serde_json::json!({
+            "kind":"diagnostic_capture_completion", "complete":false,
+            "accepted_records":self.progress.accepted.load(Ordering::Relaxed),
+            "dropped":self.progress.dropped.load(Ordering::Relaxed),
+            "failed":self.progress.failed.load(Ordering::Relaxed),
+        });
+        self.enqueue(
+            "capture-completion.json",
+            writer::bounded_json(&marker, false).unwrap(),
+            false,
+            true,
+        );
     }
 }
 
@@ -144,37 +181,34 @@ impl TrafficCapture {
 pub(crate) fn test_capture(root: PathBuf) -> TrafficCapture {
     TrafficCapture {
         root,
-        artifact_counter: Mutex::new(0),
-        event_counter: Mutex::new(0),
+        sequence: Mutex::new(0),
+        progress: Arc::new(CaptureProgress::default()),
     }
 }
 
-fn write_bytes(path: PathBuf, value: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
-        if let Ok(meta) = fs::metadata(parent) {
-            set_mode(parent, 0o700);
-            if meta.is_dir() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perm = meta.permissions();
-                    perm.set_mode(0o700);
-                    let _ = fs::set_permissions(parent, perm);
-                }
-            }
+fn redacted_sse(raw: &[u8]) -> Option<Vec<u8>> {
+    std::str::from_utf8(raw).ok()?;
+    let events = crate::anthropic::sse::parse_sse_events(raw);
+    if events.is_empty() {
+        return None;
+    }
+    let mut output = Vec::new();
+    for event in events {
+        let data = if event.data == "[DONE]" {
+            event.data
+        } else {
+            let value: Value = serde_json::from_str(&event.data).ok()?;
+            String::from_utf8(writer::bounded_json(&redact_traffic(&value), false)?).ok()?
+        };
+        output.extend_from_slice(&crate::anthropic::sse::encode_sse_event(
+            event.event.as_deref(),
+            &data,
+        ));
+        if output.len() > writer::MAX_RECORD_BYTES - 4096 {
+            return None;
         }
     }
-    let mut out = File::create(&path)?;
-    out.write_all(value)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = out.metadata()?.permissions();
-        perm.set_mode(0o600);
-        let _ = fs::set_permissions(&path, perm);
-    }
-    Ok(())
+    Some(output)
 }
 
 pub struct StreamTrafficCapture {
@@ -211,6 +245,14 @@ impl Default for StreamTrafficCapture {
 
 impl StreamTrafficCapture {
     pub fn upstream_event(&mut self, event: Option<&str>, value: &Value) {
+        if crate::bounded_json_size(value, MAX_STREAM_CAPTURE_FRAME_BYTES)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            self.upstream_frames_truncated = self.upstream_frames_truncated.saturating_add(1);
+            return;
+        }
         let value = redact_traffic(value);
         let frame = serde_json::to_vec(&value).unwrap_or_default();
         let event = event.unwrap_or("message");
@@ -239,6 +281,14 @@ impl StreamTrafficCapture {
     }
 
     pub fn downstream_event(&mut self, event: &str, data: Value) {
+        if crate::bounded_json_size(&data, MAX_STREAM_CAPTURE_EVENT_BYTES)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            self.downstream_events_truncated = self.downstream_events_truncated.saturating_add(1);
+            return;
+        }
         self.push_event(
             false,
             serde_json::json!({"event":event,"data":redact_traffic(&data)}),
@@ -275,16 +325,34 @@ impl StreamTrafficCapture {
     }
 
     pub fn finish_named(self, traffic: &TrafficCapture, completion: Value, summary_name: &str) {
+        if self.upstream_sse_truncated > 0
+            || self.upstream_events_truncated > 0
+            || self.downstream_events_truncated > 0
+            || self.malformed_truncated > 0
+            || self.upstream_frames_truncated > 0
+        {
+            // The detailed summary carries exact truncation counts. One omitted
+            // aggregate also makes the final diagnostic marker incomplete.
+            traffic.omit();
+        }
         let upstream_event_count = self.upstream_events.len();
         let downstream_event_count = self.downstream_events.len();
-        if !self.upstream_sse.is_empty() {
-            traffic.write_bytes("032-upstream-response-body.sse", &self.upstream_sse);
+        let upstream_sse_bytes = self.upstream_sse.len();
+        if upstream_sse_bytes > 0 {
+            // This private builder already redacted every event. Do not parse
+            // and redact its bounded safe mirror a second time.
+            traffic.enqueue(
+                "032-upstream-response-body.sse",
+                self.upstream_sse,
+                false,
+                false,
+            );
         }
         traffic.write_json(
             "033-upstream-response-capture",
             &serde_json::json!({
                 "truncated": self.upstream_sse_truncated > 0 || self.upstream_frames_truncated > 0 || self.upstream_events_truncated > 0,
-                "captured_bytes": self.upstream_sse.len(),
+                "captured_bytes": upstream_sse_bytes,
                 "truncated_frames": self.upstream_sse_truncated,
                 "oversized_frames": self.upstream_frames_truncated,
                 "captured_events": self.upstream_events.len(),
@@ -305,7 +373,7 @@ impl StreamTrafficCapture {
             &serde_json::json!({
                 "completion": completion,
                 "upstream_sse": {
-                    "captured_bytes": self.upstream_sse.len(),
+                    "captured_bytes": upstream_sse_bytes,
                     "truncated_frames": self.upstream_sse_truncated,
                     "oversized_frames": self.upstream_frames_truncated,
                 },
@@ -327,6 +395,7 @@ impl StreamTrafficCapture {
 pub fn sanitize_path_part(input: &str) -> String {
     let cleaned: String = input
         .chars()
+        .take(160)
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
                 ch
@@ -406,7 +475,13 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                             | "sub"
                     )
                 {
-                    out.insert(key.clone(), redact_traffic_value(value));
+                    // Credential keys hide the entire value, including a
+                    // structured value whose leaves have no sensitive key.
+                    let redacted = match value {
+                        Value::String(_) => redact_traffic_value(value),
+                        _ => Value::String("[redacted]".to_string()),
+                    };
+                    out.insert(key.clone(), redacted);
                 } else {
                     out.insert(key.clone(), redact_traffic_with_depth(value, depth + 1));
                 }
@@ -460,18 +535,6 @@ fn redact_traffic_value(value: &Value) -> Value {
     }
 }
 
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
-    }
-}
-
 #[allow(dead_code)]
 fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
     None
@@ -480,6 +543,81 @@ fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_completion_marks_omitted_raw_and_oversized_records_incomplete() {
+        let writer = writer::pause_for_fixture();
+        let temp = tempfile::tempdir().unwrap();
+        let capture = test_capture(temp.path().to_path_buf());
+        capture.write_text("malformed", "not-json access_token=do-not-copy");
+        capture.write_json(
+            "oversized",
+            &serde_json::json!({"text":"x".repeat(writer::MAX_RECORD_BYTES)}),
+        );
+        assert_eq!(capture.progress.dropped.load(Ordering::Relaxed), 2);
+        drop(capture);
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
+        let files: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let marker: Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(marker["kind"], "diagnostic_capture_completion");
+        assert_eq!(marker["complete"], false);
+        assert_eq!(marker["dropped"], 2);
+    }
+
+    #[test]
+    fn accepted_capture_records_keep_ordinals_and_completion_order() {
+        let writer = writer::pause_for_fixture();
+        let temp = tempfile::tempdir().unwrap();
+        let capture = test_capture(temp.path().to_path_buf());
+        capture.write_json("request", &serde_json::json!({"safe":1}));
+        capture.write_json_event("event", &serde_json::json!({"safe":2}));
+        assert_eq!(capture.progress.accepted.load(Ordering::Relaxed), 2);
+        drop(capture);
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
+        assert!(temp.path().join("000001-request.json").exists());
+        assert!(temp.path().join("events/000002-event.json").exists());
+        let marker: Value = serde_json::from_slice(
+            &std::fs::read(temp.path().join("000003-capture-completion.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["complete"], true);
+        assert_eq!(marker["accepted_records"], 2);
+    }
+
+    #[test]
+    fn raw_capture_cannot_bypass_structured_redaction() {
+        let writer = writer::pause_for_fixture();
+        let temp = tempfile::tempdir().unwrap();
+        let capture = test_capture(temp.path().to_path_buf());
+        capture.write_bytes("response.sse", b"data: {\"access_token\":\"private-fixture\",\"encrypted_content\":\"opaque-fixture\"}\n\n");
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
+        let path = std::fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !text.contains("private-fixture"),
+            "raw SSE bypassed redaction"
+        );
+        assert!(!text.contains("opaque-fixture"));
+        assert!(text.contains("redacted"));
+    }
 
     #[test]
     fn redact_traffic_strips_input_image_data_urls() {
@@ -658,6 +796,7 @@ mod tests {
 
     #[test]
     fn traffic_capture_redacts_proxy_signatures_at_json_boundary() {
+        let writer = writer::pause_for_fixture();
         // Exercise write_json_event (050 downstream) and write_json (010
         // incoming request) end to end, where redaction is actually applied.
         let temp = tempfile::TempDir::new().unwrap();
@@ -689,6 +828,10 @@ mod tests {
             }),
         );
 
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
         let mut captured = String::new();
         for dir in [capture.root().to_path_buf(), capture.root().join("events")] {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -832,11 +975,15 @@ mod tests {
         let redacted = redact_traffic(&serde_json::json!({
             "headers": {
                 "proxy-authorization": "Basic dXNlcjpwYXNz",
+                "authorization": ["Bearer structured-secret"],
+                "access": {"value": "nested-secret"},
                 "x-safe": "kept"
             }
         }));
 
         assert_eq!(redacted["headers"]["x-safe"], "kept");
+        assert_eq!(redacted["headers"]["authorization"], "[redacted]");
+        assert_eq!(redacted["headers"]["access"], "[redacted]");
         assert_eq!(
             redacted["headers"]["proxy-authorization"],
             "[redacted len=18]"

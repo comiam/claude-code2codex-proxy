@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # claude-code-proxy installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/comiam/claude-code2codex-proxy/main/scripts/install.sh | bash
 #
 # Environment variables:
 #   CLAUDE_CODE_PROXY_VERSION      - Pin a specific version (e.g., v0.1.0)
@@ -15,7 +15,7 @@
 set -e
 
 BIN_NAME="claude-code-proxy"
-REPO="raine/claude-code-proxy"
+REPO="comiam/claude-code2codex-proxy"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

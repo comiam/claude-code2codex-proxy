@@ -89,6 +89,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let _diagnostics = logging::start_diagnostics();
+
     let commands = cli.command.unwrap_or(Commands::Serve {
         port: None,
         no_monitor: false,
@@ -100,6 +102,15 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Serve { port, no_monitor } => {
+            if config::codex_server_compaction() {
+                logging::create_logger("config").warn(
+                    "codex_server_compaction_deprecated",
+                    Some(serde_json::Map::from_iter([(
+                        "message".to_string(),
+                        serde_json::json!("codex.serverCompaction / CCP_CODEX_SERVER_COMPACTION is deprecated and ignored for Claude Messages; compact uses one text generation"),
+                    )])),
+                );
+            }
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();

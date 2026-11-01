@@ -3,6 +3,8 @@ title: Cursor Agent
 description: Configure Cursor authentication, dynamic models, plan and ask modes, effort variants, images, session continuation, tool bridging, and protobuf discovery.
 ---
 
+> This fork supports compatibility only with Codex. Cursor Agent is available without guarantees and at your own risk.
+
 Cursor uses Cursor Agent's HTTP/2 full-duplex Connect protocol at `https://api2.cursor.sh/agent.v1.AgentService/Run`.
 
 ## Account and authentication
@@ -74,4 +76,4 @@ Metadata can also choose a mode per request:
 
 `CCP_CURSOR_BASE_URL`, `CCP_CURSOR_CLIENT_VERSION`, and `CCP_CURSOR_AGENT_BUNDLE` override protocol details. If authentication expires, Cursor requests return 401 and require another login. If startup or requests report protobuf discovery errors, run `cursor-agent --version` to confirm it is installed and set the bundle path explicitly.
 
-See [Compatibility and limitations](/reference/compatibility-and-limitations/) for the supported tool boundary.
+See [Compatibility and limitations](../reference/compatibility-and-limitations.md) for the supported tool boundary.

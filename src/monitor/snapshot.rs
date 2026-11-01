@@ -1,8 +1,8 @@
 //! Immutable dashboard read models. Process-local clocks and mutable accounting
 //! stay in the monitor store; viewers receive elapsed durations and computed rates.
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionSummary,
-    Throughput,
+    ActiveRequest, CompletedRequest, DeliveryTiming, EndpointKind, MonitorState, RequestStatus,
+    SessionSummary, Throughput, UsageObservation, UsageProvenance,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -69,6 +69,8 @@ impl SnapshotUpdate {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSnapshot {
+    #[serde(default)]
+    pub diagnostics: crate::logging::DiagnosticsSnapshot,
     pub started_at: SystemTime,
     #[serde(default = "default_snapshot_at")]
     pub snapshot_at: SystemTime,
@@ -81,6 +83,7 @@ pub struct MonitorSnapshot {
 impl From<MonitorState> for MonitorSnapshot {
     fn from(state: MonitorState) -> Self {
         Self {
+            diagnostics: crate::logging::diagnostics_snapshot(),
             started_at: state.started_at,
             snapshot_at: SystemTime::now(),
             uptime: state.uptime,
@@ -112,6 +115,12 @@ pub struct ActiveSnapshot {
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
+    #[serde(default)]
+    pub usage: UsageObservation,
+    #[serde(default)]
+    pub delivery: DeliveryTiming,
+    #[serde(default)]
+    pub output_token_basis: Option<String>,
     elapsed: Duration,
     throughput: Throughput,
 }
@@ -128,6 +137,11 @@ impl ActiveSnapshot {
 impl From<ActiveRequest> for ActiveSnapshot {
     fn from(value: ActiveRequest) -> Self {
         let throughput = value.rate();
+        let output_token_basis = value
+            .usage
+            .output_tokens
+            .filter(|v| v.provenance == UsageProvenance::Provider)
+            .map(|_| "provider-total".to_string());
         let elapsed = value.elapsed();
         Self {
             request_id: value.request_id,
@@ -149,6 +163,9 @@ impl From<ActiveRequest> for ActiveSnapshot {
             output_tokens: value.output_tokens,
             error: value.error,
             traffic_capture_path: value.traffic_capture_path,
+            usage: value.usage,
+            delivery: value.delivery,
+            output_token_basis,
             elapsed,
             throughput,
         }
@@ -175,6 +192,12 @@ pub struct CompletedSnapshot {
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
+    #[serde(default)]
+    pub usage: UsageObservation,
+    #[serde(default)]
+    pub delivery: DeliveryTiming,
+    #[serde(default)]
+    pub output_token_basis: Option<String>,
     pub finished_at: SystemTime,
     pub http_status: Option<u16>,
     pub latency: Duration,
@@ -190,6 +213,11 @@ impl CompletedSnapshot {
 impl From<CompletedRequest> for CompletedSnapshot {
     fn from(value: CompletedRequest) -> Self {
         let throughput = value.rate();
+        let output_token_basis = value
+            .usage
+            .output_tokens
+            .filter(|v| v.provenance == UsageProvenance::Provider)
+            .map(|_| "provider-total".to_string());
         Self {
             request_id: value.request_id,
             session_id: value.session_id,
@@ -210,6 +238,9 @@ impl From<CompletedRequest> for CompletedSnapshot {
             output_tokens: value.output_tokens,
             error: value.error,
             traffic_capture_path: value.traffic_capture_path,
+            usage: value.usage,
+            delivery: value.delivery,
+            output_token_basis,
             finished_at: value.finished_at,
             http_status: value.http_status,
             latency: value.latency,
@@ -229,6 +260,8 @@ pub struct SessionSnapshot {
     pub effort: Option<String>,
     pub last_seen: SystemTime,
     pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub output_token_samples: Vec<(SystemTime, u64)>,
     pub generation_duration: Duration,
@@ -256,6 +289,7 @@ impl From<SessionSummary> for SessionSnapshot {
             effort: value.effort,
             last_seen: value.last_seen,
             input_tokens: value.input_tokens,
+            cached_input_tokens: value.cached_input_tokens,
             output_tokens: value.output_tokens,
             output_token_samples: value.output_token_samples,
             generation_duration: value.generation_duration,
@@ -324,5 +358,50 @@ mod tests {
             .insert("future_field".into(), serde_json::json!(true));
         let decoded: MonitorSnapshot = serde_json::from_value(newer).unwrap();
         assert_eq!(decoded.snapshot_at, snapshot.snapshot_at);
+    }
+
+    #[test]
+    fn request_snapshots_accept_missing_provenance_and_delivery_fields() {
+        let monitor = MonitorHandle::default();
+        monitor.request_started("active", None, None, EndpointKind::Messages);
+        monitor.request_started("done", None, None, EndpointKind::Messages);
+        monitor.request_completed("done", 200, Some(10), Some(20));
+        let mut legacy = serde_json::to_value(MonitorSnapshot::from(monitor.snapshot())).unwrap();
+        for list in ["active", "recent"] {
+            for item in legacy[list].as_array_mut().unwrap() {
+                for field in ["usage", "delivery", "output_token_basis"] {
+                    item.as_object_mut().unwrap().remove(field);
+                }
+            }
+        }
+        let snapshot: MonitorSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(snapshot.active[0].usage, UsageObservation::default());
+        assert_eq!(snapshot.recent[0].delivery, DeliveryTiming::default());
+        assert_eq!(snapshot.recent[0].output_tokens, Some(20));
+    }
+
+    #[test]
+    fn snapshots_accept_missing_cached_breakdown_without_inventing_zero() {
+        let monitor = MonitorHandle::default();
+        monitor.request_started("active", None, None, EndpointKind::Messages);
+        let mut legacy = serde_json::to_value(MonitorSnapshot::from(monitor.snapshot())).unwrap();
+        legacy["active"][0]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cached_input_tokens");
+        legacy["sessions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cached_input_tokens");
+        let snapshot: MonitorSnapshot = serde_json::from_value(legacy).unwrap();
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(
+            value["active"][0]["usage"].get("cached_input_tokens"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            value["sessions"][0].get("cached_input_tokens"),
+            Some(&serde_json::Value::Null)
+        );
     }
 }

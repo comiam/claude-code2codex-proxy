@@ -3,7 +3,7 @@ title: Compatibility and limitations
 description: Canonical security, account, protocol, model, context, multimodal, reasoning, tool, session, rate-limit, and deployment boundaries.
 ---
 
-claude-code-proxy targets Claude Code's practical Anthropic API usage rather than complete protocol equivalence.
+claude-code-proxy targets Claude Code's practical Anthropic API usage rather than complete protocol equivalence. This fork supports compatibility only with Codex; other provider implementations are available without guarantees and at your own risk.
 
 ## Accounts and provider policy
 
@@ -54,7 +54,7 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Encrypted reasoning and compaction items remain provider continuation data and are not exposed as raw chain of thought.
 - Hosted web search supports mapped domain filters, but the Anthropic `max_uses` value is not enforced because Codex exposes no equivalent limit.
 - Strict JSON schema output is translated. Other Anthropic-only output settings can be omitted.
-- `previous_response_id` and server compaction state are in memory and require stable session routing.
+- `previous_response_id` continuation is in memory and requires stable session routing; Claude Code compaction produces a portable text summary.
 - Automatic transport fallback occurs only before an upstream request is sent, which avoids replaying possible side effects.
 
 ## Kimi
@@ -90,4 +90,4 @@ claude-code-proxy targets Claude Code's practical Anthropic API usage rather tha
 - Image generation and edit routes never create traffic captures or persist prompts, uploads, data URLs, generated base64, or upstream error bodies.
 - Verbose logging and traffic capture should be scoped to a focused local investigation.
 
-For provider-specific behavior, use the [provider pages](/providers/choosing-a-provider/). For released changes, see the [Changelog](/reference/changelog/).
+For provider-specific behavior, use the [provider pages](../providers/choosing-a-provider.md). For changes, see the [Changelog](changelog.md).

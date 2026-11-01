@@ -5,9 +5,7 @@ description: Local routes for health checks, Anthropic Messages, token counts, m
 
 The server exposes the Anthropic and OpenAI routes supported by the proxy. Each route uses the configured provider credential for the selected model.
 
-<div class="security-callout">
-<strong>No client authentication.</strong> The listener accepts requests without validating `Authorization` or `x-api-key`. Loopback is the default. Protect every non-loopback listener with a firewall or authenticating reverse proxy.
-</div>
+**No client authentication.** The listener accepts requests without validating `Authorization` or `x-api-key`. Loopback is the default. Protect every non-loopback listener with a firewall or authenticating reverse proxy.
 
 ## `GET /healthz`
 
@@ -47,6 +45,8 @@ Accepts the same basic Anthropic request shape and returns:
 
 Codex tokenizes text locally with `o200k_base` and adds estimates for images, encrypted reasoning, and protocol framing. Kimi, Grok, and OpenCode Go use local text heuristics, while Cursor estimates the rendered prompt from its character length. Counts support Claude Code compaction behavior and are estimates rather than provider billing values.
 
+Codex count preparation runs outside the async request workers, with at most two executing jobs and four admitted waiters. Excess count requests receive HTTP 503 with `overloaded_error` and a message identifying local token-counting CPU capacity. This does not indicate upstream quota exhaustion and makes no upstream call. Cancelling an executing request keeps its capacity occupied until the local job finishes; cancelling a waiter frees its admission. The job limit bounds counting concurrency, not decoded request bytes or total process memory. Live streams use a cheap local estimate and replace it with provider usage when reported.
+
 ## `GET /v1/models`
 
 Returns Anthropic-shaped model discovery:
@@ -68,7 +68,7 @@ Returns Anthropic-shaped model discovery:
 
 An optional `limit` query truncates `data` and sets `has_more`. The route does not expose a pagination cursor.
 
-Claude Code gateway discovery filters IDs according to its own model rules. See [Models and routing](/using/models-and-routing/).
+Claude Code gateway discovery filters IDs according to its own model rules. See [Models and routing](../using/models-and-routing.md).
 
 ## `POST /v1/chat/completions`
 
@@ -151,7 +151,7 @@ Responses include the accepted tool settings. Grok search appears as a `web_sear
 
 ### Parallel tool calls
 
-The shared Kimi, Grok, and Cursor ingress accepts boolean `parallel_tool_calls` on both OpenAI routes. `false` preserves serial tool execution through translation, while `true` selects the existing parallel default. Omitting the field leaves the provider default unchanged. Non-boolean values return an `invalid_request_error` with `parallel_tool_calls` in `error.param`.
+The shared Kimi, Grok, and Cursor ingress accepts boolean `parallel_tool_calls` on both OpenAI routes. `false` preserves serial tool execution through translation, while `true` selects parallel tool execution. Omitting the field uses the provider default. Non-boolean values return an `invalid_request_error` with `parallel_tool_calls` in `error.param`.
 
 The setting applies without changing the requested `tool_choice` mode. This includes omitted or `auto` choices, `none`, `required`, and named functions. Internally, an explicit OpenAI setting determines the equivalent Anthropic `tool_choice.disable_parallel_tool_use` value. Anthropic Messages requests can set `disable_parallel_tool_use` directly. Kimi and Grok receive the corresponding upstream `parallel_tool_calls` value, and Cursor's bridged tool loop remains serial between client tool results.
 

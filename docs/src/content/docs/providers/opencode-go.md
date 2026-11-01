@@ -3,6 +3,8 @@ title: OpenCode Go
 description: Configure an OpenCode Go API key, model routing, streaming, tools, and provider overrides.
 ---
 
+> This fork supports compatibility only with Codex. OpenCode Go is available without guarantees and at your own risk.
+
 OpenCode Go uses the API at `https://opencode.ai/zen/go/v1`. Its catalog spans
 OpenAI-compatible chat completions, Anthropic-compatible messages, and OpenAI
 Responses; the proxy selects the wire protocol for each registered model. Each

@@ -439,8 +439,57 @@ fn validate_sampling_value(param: &'static str, value: &Value) -> Result<(), Cha
 mod tests {
     use super::*;
 
+    // Other config tests mutate process environment; keep translation fixtures
+    // independent of their temporary model and effort overrides.
+    fn isolated_settings() -> (
+        tempfile::TempDir,
+        std::sync::Arc<config::CodexRequestSettings>,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = std::collections::HashMap::from([(
+            "CCP_CONFIG_DIR".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        )]);
+        (dir, config::CodexRequestSettings::for_env(env))
+    }
+
+    fn translate_request(body: Value) -> Result<TranslatedRequest, ChatError> {
+        let (_dir, settings) = isolated_settings();
+        settings.sync_scope(|| super::translate_request(body))
+    }
+
+    fn translate_request_with_override(
+        body: Value,
+        effort_override: Option<&str>,
+    ) -> Result<TranslatedRequest, ChatError> {
+        let (_dir, settings) = isolated_settings();
+        settings.sync_scope(|| super::translate_request_with_override(body, effort_override))
+    }
+
     fn base() -> Value {
         json!({"model":"gpt-5.6-sol","messages":[{"role":"system","content":"rules"},{"role":"user","content":[{"type":"text","text":"hello"}]}]})
+    }
+
+    #[test]
+    fn translation_fixture_ignores_ambient_request_overrides() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = config::CodexRequestSettings::for_env(std::collections::HashMap::from([
+            (
+                "CCP_CONFIG_DIR".to_string(),
+                dir.path().to_string_lossy().into_owned(),
+            ),
+            ("CCP_CODEX_MODEL".to_string(), "gpt-6-sol".to_string()),
+            ("CCP_CODEX_EFFORT".to_string(), "low".to_string()),
+        ]));
+        settings.sync_scope(|| {
+            let mut body = base();
+            body["model"] = json!("gpt-5.4");
+            body["temperature"] = json!(0.2);
+            let translated = translate_request(body).unwrap();
+            assert_eq!(translated.upstream["model"], "gpt-5.4");
+            assert_eq!(translated.upstream["reasoning"]["effort"], "medium");
+            assert_eq!(translated.upstream["temperature"], 0.2);
+        });
     }
 
     #[test]

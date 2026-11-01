@@ -1,0 +1,121 @@
+{
+  "cases": [
+    {
+      "headers": {
+        "x-claude-code-session-id": "11111111-1111-4111-8111-111111111111"
+      },
+      "mode": "off",
+      "request": {
+        "max_tokens": 32000,
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "<command-message>proxy-speed</command-message>\n<command-name>/proxy-speed</command-name>\n<command-args>off</command-args>\n",
+                "type": "text"
+              },
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "Base directory for this skill: /tmp/ccp-proxy-speed-fixture/project/.claude/skills/proxy-speed\n\n<ccp-proxy-speed version=\"1\" session=\"11111111-1111-4111-8111-111111111111\" mode=\"off\"/>\n",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "claude-sonnet-4-6",
+        "stream": true
+      }
+    },
+    {
+      "headers": {
+        "x-claude-code-session-id": "11111111-1111-4111-8111-111111111111"
+      },
+      "mode": "fast",
+      "request": {
+        "max_tokens": 32000,
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "<command-message>proxy-speed</command-message>\n<command-name>/proxy-speed</command-name>\n<command-args>fast</command-args>\n",
+                "type": "text"
+              },
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "Base directory for this skill: /tmp/ccp-proxy-speed-fixture/project/.claude/skills/proxy-speed\n\n<ccp-proxy-speed version=\"1\" session=\"11111111-1111-4111-8111-111111111111\" mode=\"fast\"/>\n",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "claude-sonnet-4-6",
+        "stream": true
+      }
+    },
+    {
+      "headers": {
+        "x-claude-code-session-id": "11111111-1111-4111-8111-111111111111"
+      },
+      "mode": "ultrafast",
+      "request": {
+        "max_tokens": 32000,
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "<command-message>proxy-speed</command-message>\n<command-name>/proxy-speed</command-name>\n<command-args>ultrafast</command-args>\n",
+                "type": "text"
+              },
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "Base directory for this skill: /tmp/ccp-proxy-speed-fixture/project/.claude/skills/proxy-speed\n\n<ccp-proxy-speed version=\"1\" session=\"11111111-1111-4111-8111-111111111111\" mode=\"ultrafast\"/>\n",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ],
+        "model": "claude-sonnet-4-6",
+        "stream": true
+      }
+    }
+  ],
+  "client_version": "2.1.310 (Claude Code)",
+  "empty_arguments": {
+    "headers": {
+      "x-claude-code-session-id": "11111111-1111-4111-8111-111111111111"
+    },
+    "mode": "",
+    "request": {
+      "max_tokens": 32000,
+      "messages": [
+        {
+          "content": [
+            {
+              "text": "<command-message>proxy-speed</command-message>\n<command-name>/proxy-speed</command-name>\n",
+              "type": "text"
+            },
+            {
+              "cache_control": {
+                "type": "ephemeral"
+              },
+              "text": "Base directory for this skill: /tmp/ccp-proxy-speed-fixture/project/.claude/skills/proxy-speed\n\n<ccp-proxy-speed version=\"1\" session=\"11111111-1111-4111-8111-111111111111\" mode=\"\"/>\n",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "model": "claude-sonnet-4-6",
+      "stream": true
+    }
+  }
+}

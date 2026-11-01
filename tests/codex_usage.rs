@@ -107,3 +107,101 @@ fn explicit_zero_reasoning_is_not_missing_usage() {
         assert!(usage.get("codex_rate_limits").is_none());
     }
 }
+
+#[path = "support/proxy_speed.rs"]
+mod runtime_support;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_and_auto_preserve_quota_in_streaming_and_buffered_messages() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    for transport in ["websocket", "auto"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let mut peers = tokio::task::JoinSet::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                peers.spawn(async move {
+                    let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                    while let Some(Ok(message)) = socket.next().await {
+                        match message {
+                            Message::Text(_) => {
+                                let mut events = runtime_support::completion("quota-response", "answer")
+                                    .lines()
+                                    .filter_map(|line| line.strip_prefix("data: "))
+                                    .map(|data| serde_json::from_str::<Value>(data).unwrap())
+                                    .collect::<Vec<_>>();
+                                events.last_mut().unwrap()["response"]["usage"] = json!({
+                                    "input_tokens":9,"output_tokens":4,
+                                    "output_tokens_details":{"reasoning_tokens":3}
+                                });
+                                events.insert(0, json!({"type":"codex.rate_limits","plan_type":"plus","rate_limits":{"primary":{"used_percent":42}}}));
+                                events.insert(1, json!({"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":"bad"}}}));
+                                for event in events {
+                                    if socket.send(Message::Text(event.to_string())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Message::Ping(payload) => {
+                                if socket.send(Message::Pong(payload)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Message::Close(_) => return,
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        let proxy = runtime_support::Proxy::start(
+            &format!("http://{address}/responses"),
+            None,
+            transport,
+            false,
+        )
+        .await;
+        proxy.write_synthetic_auth();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap();
+        for stream in [false, true] {
+            let response = client
+                .post(format!("{}/v1/messages", proxy.base))
+                .json(&json!({
+                    "model":"gpt-5.5","max_tokens":64,"stream":stream,
+                    "messages":[{"role":"user","content":"ping"}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.bytes().await.unwrap();
+            assert!(
+                status.is_success(),
+                "{transport} stream={stream}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let usage = if stream {
+                terminal_usage(&body)
+            } else {
+                serde_json::from_slice::<Value>(&body).unwrap()["usage"].clone()
+            };
+            assert_eq!(
+                usage["codex_rate_limits"]["primary"]["used_percent"].as_f64(),
+                Some(42.0),
+                "{transport} stream={stream}: {usage}"
+            );
+            assert_eq!(usage["codex_rate_limits"]["plan_type"], "plus");
+            assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 3);
+            assert_eq!(usage["output_tokens"], 4);
+        }
+        drop(proxy);
+        upstream.abort();
+    }
+}

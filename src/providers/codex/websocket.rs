@@ -1,3 +1,4 @@
+use super::StreamSenderExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,8 +11,11 @@ use http::HeaderMap;
 use hyper_util::client::proxy::matcher::Matcher as ProxyMatcher;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+mod connection;
+use connection::ConnectionHandle;
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{
@@ -22,7 +26,7 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::logging::create_logger;
+use crate::logging::{Logger, create_logger};
 use crate::provider::RequestContext;
 use crate::request_identity::ConversationIdentity;
 use crate::retry::sleep as retry_sleep;
@@ -39,6 +43,7 @@ use super::continuation::ContinuationReservation;
 
 pub const WEBSOCKET_PROTOCOL_HEADER: &str = "responses_websockets=2026-02-06";
 pub const WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
+pub(super) const WEBSOCKET_AMBIGUOUS_WRITE_DETAIL: &str = "websocket_ambiguous_write";
 pub const WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL: &str = "websocket_response_start_timeout";
 pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal";
@@ -47,10 +52,6 @@ pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
     "websocket_continuation_socket_missing";
 pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy_tunnel_rejected";
 
-const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
-const MAX_POOL_ENTRIES: usize = 10_000;
-const POOL_CONNECT_CLEANUP_THRESHOLD: usize = 50;
-const POOL_CONNECT_CLEANUP_TARGET: usize = 40;
 const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
 const WEBSOCKET_CONNECT_START_SPACING: Duration = Duration::from_secs(1);
 const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN: Duration = Duration::from_secs(3);
@@ -62,42 +63,155 @@ pub type CodexWebSocketEventReceiver =
 
 pub(crate) struct CodexWebSocketEventStream {
     receiver: CodexWebSocketEventReceiver,
+    cleanup: Option<StreamCleanup>,
+    delivery_aborted: Arc<AtomicBool>,
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
+    intervening_failure: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
+    diagnostic_attempt_id: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
 pub(crate) struct CodexWebSocketSocketIdPublisher {
+    delivery_aborted: Arc<AtomicBool>,
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
+    intervening_failure: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
+    diagnostic_attempt_id: Arc<AtomicU64>,
+}
+
+pub(super) struct EventSender {
+    sender: mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl std::ops::Deref for EventSender {
+    type Target = mpsc::Sender<Result<serde_json::Value, CodexError>>;
+    fn deref(&self) -> &Self::Target {
+        &self.sender
+    }
+}
+
+impl EventSender {
+    pub(super) async fn send_bounded(
+        &self,
+        item: Result<serde_json::Value, CodexError>,
+    ) -> Result<(), ()> {
+        let result = self.sender.send_bounded(item).await;
+        if result.is_err() {
+            self.aborted.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+/// Owns only this attempt's publication; stale drop cannot invalidate a later turn.
+#[derive(Clone)]
+pub(super) struct StreamCleanup {
+    reservation: ContinuationReservation,
+    socket_id: Arc<AtomicU64>,
+    handoff: Arc<AtomicBool>,
+    delivery_aborted: Arc<AtomicBool>,
+    abort_turn: bool,
+    accepted: bool,
+}
+
+impl StreamCleanup {
+    pub(super) fn accept(&mut self) {
+        self.accepted = true;
+    }
+}
+
+impl Drop for StreamCleanup {
+    fn drop(&mut self) {
+        if self.accepted {
+            return;
+        }
+        // Paired with publisher.store(ID) -> load(aborted): SeqCst prevents
+        // both sides observing initial values on separate atomics.
+        self.delivery_aborted.store(true, Ordering::SeqCst);
+        let id = self.socket_id.load(Ordering::SeqCst);
+        invalidate_codex_websocket_pool_socket(&self.reservation, (id != 0).then_some(id));
+        if self.abort_turn && !self.handoff.load(Ordering::Acquire) {
+            super::continuation::abort_continuation_for_owner(&self.reservation);
+        }
+    }
 }
 
 impl CodexWebSocketEventStream {
     pub(crate) fn pending(
         receiver: CodexWebSocketEventReceiver,
     ) -> (Self, CodexWebSocketSocketIdPublisher) {
+        let delivery_aborted = Arc::new(AtomicBool::new(false));
         let socket_id = Arc::new(AtomicU64::new(0));
         let full_context_retry = Arc::new(AtomicBool::new(false));
+        let intervening_failure = Arc::new(AtomicBool::new(false));
         let provider_retry_handoff = Arc::new(AtomicBool::new(false));
+        let diagnostic_attempt_id = Arc::new(AtomicU64::new(0));
         (
             Self {
                 receiver,
+                cleanup: None,
+                delivery_aborted: delivery_aborted.clone(),
                 socket_id: socket_id.clone(),
                 full_context_retry: full_context_retry.clone(),
+                intervening_failure: intervening_failure.clone(),
                 provider_retry_handoff: provider_retry_handoff.clone(),
+                diagnostic_attempt_id: diagnostic_attempt_id.clone(),
             },
             CodexWebSocketSocketIdPublisher {
+                delivery_aborted,
                 socket_id,
                 full_context_retry,
+                intervening_failure,
                 provider_retry_handoff,
+                diagnostic_attempt_id,
             },
         )
     }
 
+    pub(super) fn track_attempt(
+        mut self,
+        reservation: Option<&ContinuationReservation>,
+        abort_turn: bool,
+    ) -> Self {
+        self.cleanup = reservation.cloned().map(|reservation| StreamCleanup {
+            reservation,
+            socket_id: self.socket_id.clone(),
+            handoff: self.provider_retry_handoff.clone(),
+            delivery_aborted: self.delivery_aborted.clone(),
+            abort_turn,
+            accepted: false,
+        });
+        self
+    }
+
+    pub(super) fn delivery_guard(&self) -> Option<StreamCleanup> {
+        self.cleanup.clone()
+    }
+
+    pub(super) fn accept_terminal(&mut self) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.accept();
+        }
+    }
+
+    pub(super) fn delivery_aborted(&self) -> bool {
+        self.delivery_aborted.load(Ordering::Acquire)
+    }
+
+    pub(super) fn abort_signal(&self) -> Arc<AtomicBool> {
+        self.delivery_aborted.clone()
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<Result<serde_json::Value, CodexError>> {
-        self.receiver.recv().await
+        if self.delivery_aborted() {
+            return None;
+        }
+        let item = self.receiver.recv().await;
+        if self.delivery_aborted() { None } else { item }
     }
 
     pub(crate) fn socket_id(&self) -> Option<u64> {
@@ -107,15 +221,35 @@ impl CodexWebSocketEventStream {
         }
     }
 
+    pub(super) fn diagnostic_attempt_id(&self) -> Option<u64> {
+        match self.diagnostic_attempt_id.load(Ordering::Acquire) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    pub(super) fn diagnostic_attempt_handle(&self) -> Arc<AtomicU64> {
+        self.diagnostic_attempt_id.clone()
+    }
+
     pub(crate) fn used_full_context_retry(&self) -> bool {
         self.full_context_retry.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn had_intervening_failure(&self) -> bool {
+        self.intervening_failure.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_intervening_failure(&self) {
+        self.intervening_failure.store(true, Ordering::Release);
     }
 
     pub(crate) fn mark_provider_retry_handoff(&self) {
         self.provider_retry_handoff.store(true, Ordering::Release);
     }
 
-    pub(crate) fn into_receiver(self) -> CodexWebSocketEventReceiver {
+    pub(crate) fn into_receiver(mut self) -> CodexWebSocketEventReceiver {
+        self.accept_terminal();
         self.receiver
     }
 
@@ -128,13 +262,35 @@ impl CodexWebSocketEventStream {
 }
 
 impl CodexWebSocketSocketIdPublisher {
+    pub(super) fn publish_diagnostic_attempt(&self, id: Option<u64>) {
+        self.diagnostic_attempt_id
+            .store(id.unwrap_or(0), Ordering::Release);
+    }
+    pub(super) fn sender(
+        &self,
+        sender: mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    ) -> EventSender {
+        EventSender {
+            sender,
+            aborted: self.delivery_aborted.clone(),
+        }
+    }
+    pub(super) fn abort_delivery(&self) {
+        self.delivery_aborted.store(true, Ordering::Release);
+    }
+
     pub(super) fn publish(&self, socket_id: Option<u64>) {
         self.socket_id
-            .store(socket_id.unwrap_or(0), Ordering::Release);
+            .store(socket_id.unwrap_or(0), Ordering::SeqCst);
     }
 
     pub(super) fn mark_full_context_retry(&self) {
         self.full_context_retry.store(true, Ordering::Release);
+        self.mark_intervening_failure();
+    }
+
+    pub(super) fn mark_intervening_failure(&self) {
+        self.intervening_failure.store(true, Ordering::Release);
     }
 
     pub(super) fn is_provider_retry_handoff(&self) -> bool {
@@ -150,8 +306,10 @@ type BoxedWebSocketIo = Box<dyn WebSocketIo>;
 type CodexWebSocketStream = WebSocketStream<BoxedWebSocketIo>;
 
 pub(super) struct WebSocketProxyConfig {
+    scope: u64,
     matcher: ProxyMatcher,
     tls_config: Arc<rustls::ClientConfig>,
+    cache_policy: crate::config::CodexCachePolicy,
 }
 
 #[derive(Clone)]
@@ -181,14 +339,18 @@ impl WebSocketProxyConfig {
             builder = builder.no(no_proxy.to_string());
         }
         Self {
+            scope: next_monotonic_nonzero(&NEXT_CLIENT_SCOPE, "WebSocket client scope"),
             matcher: builder.build(),
             tls_config: websocket_tls_config(),
+            cache_policy: crate::config::codex_cache_policy(),
         }
     }
 
     #[cfg(test)]
     pub(super) fn direct() -> Self {
-        Self::new(None, None, None, None)
+        let mut config = Self::new(None, None, None, None);
+        config.scope = 0;
+        config
     }
 
     pub(super) fn uses_proxy_for(&self, websocket_url: &str) -> bool {
@@ -304,31 +466,92 @@ impl std::fmt::Display for CodexWebSocketError {
 // Pool
 // ---------------------------------------------------------------------------
 
+static NEXT_CLIENT_SCOPE: AtomicU64 = AtomicU64::new(0);
+
+// Deliberately neither Debug nor Serialize: credentials are represented only by
+// an opaque digest and never exposed through diagnostics or pool metadata.
+#[derive(Clone, PartialEq, Eq)]
+struct PoolCompatibility {
+    client_scope: u64,
+    endpoint: String,
+    auth_and_handshake_revision: [u8; 32],
+    model: Option<String>,
+}
+
+impl PoolCompatibility {
+    fn capture(
+        config: &WebSocketProxyConfig,
+        endpoint: &str,
+        headers: &HeaderMap,
+        reservation: Option<&ContinuationReservation>,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut revision = Sha256::new();
+        for name in [
+            "authorization",
+            "chatgpt-account-id",
+            "openai-beta",
+            "originator",
+            "user-agent",
+            "session-id",
+            "x-codex-beta-features",
+            "x-openai-internal-codex-responses-lite",
+        ] {
+            revision.update(name.as_bytes());
+            let value = headers.get(name).map_or(&[][..], |value| value.as_bytes());
+            revision.update((value.len() as u64).to_be_bytes());
+            revision.update(value);
+        }
+        Self {
+            client_scope: config.scope,
+            endpoint: endpoint.into(),
+            auth_and_handshake_revision: revision.finalize().into(),
+            model: reservation
+                .and_then(ContinuationReservation::model)
+                .map(str::to_owned),
+        }
+    }
+}
+
 struct PoolEntry {
-    ws: Arc<AsyncMutex<CodexWebSocketStream>>,
+    compatibility: Option<PoolCompatibility>,
+    published_turn: AtomicU64,
+    connection: ConnectionHandle,
     socket_id: u64,
-    created_at: u64,
+    created_at: tokio::time::Instant,
+    idle_since: Mutex<tokio::time::Instant>,
     last_activity: AtomicU64,
 }
 
 impl PoolEntry {
+    #[cfg(test)]
     fn new(ws: CodexWebSocketStream) -> Self {
+        Self::with_compatibility(ws, None)
+    }
+
+    fn with_compatibility(
+        ws: CodexWebSocketStream,
+        compatibility: Option<PoolCompatibility>,
+    ) -> Self {
         Self {
-            ws: Arc::new(AsyncMutex::new(ws)),
+            compatibility,
+            published_turn: AtomicU64::new(0),
+            connection: ConnectionHandle::new(ws),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
-            created_at: now_ms(),
+            created_at: tokio::time::Instant::now(),
+            idle_since: Mutex::new(tokio::time::Instant::now()),
             last_activity: AtomicU64::new(next_pool_activity()),
         }
     }
 
     fn touch(&self) {
+        *self.idle_since.lock().unwrap() = tokio::time::Instant::now();
         self.last_activity
             .fetch_max(next_pool_activity(), Ordering::Relaxed);
     }
 }
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
-static POOLED_VALIDATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static POOL_ACTIVITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<ConversationIdentity, Arc<PoolEntry>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
@@ -337,9 +560,11 @@ static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
     once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
 
+// fetch_update supports the Rust 1.89 toolchain.
+#[allow(deprecated)]
 fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
     let previous = sequence
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .unwrap_or_else(|_| panic!("{label} sequence exhausted"));
@@ -348,13 +573,6 @@ fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
 
 fn next_pool_activity() -> u64 {
     POOL_ACTIVITY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 pub fn clear_codex_websocket_pool_for_tests() {
@@ -406,6 +624,7 @@ pub fn invalidate_codex_websocket_pool_turn(session_id: &str, turn_id: Option<u6
     invalidate_codex_websocket_pool_turn_for_owner(&owner, turn_id);
 }
 
+#[cfg(test)]
 fn invalidate_pool_entry(owner: &ConversationIdentity, entry: &Arc<PoolEntry>) {
     let mut guard = WS_POOL.lock().unwrap();
     if guard
@@ -416,6 +635,7 @@ fn invalidate_pool_entry(owner: &ConversationIdentity, entry: &Arc<PoolEntry>) {
     }
 }
 
+#[cfg(test)]
 fn invalidate_pool_owner(owner: Option<&ConversationIdentity>, entry: Option<&Arc<PoolEntry>>) {
     let Some(owner) = owner else {
         return;
@@ -430,7 +650,7 @@ fn reservation_pool_owner(
     reservation: Option<&ContinuationReservation>,
 ) -> Option<&ConversationIdentity> {
     let reservation = reservation?;
-    if reservation.candidate().disabled_reason.as_deref() == Some("disabled") {
+    if !reservation.pool_enabled() {
         return None;
     }
     reservation.owner()
@@ -438,14 +658,28 @@ fn reservation_pool_owner(
 
 fn pool_take_for_turn(reservation: &ContinuationReservation) -> Option<Arc<PoolEntry>> {
     let owner = reservation.owner()?;
-    super::continuation::if_current_turn_for_owner(reservation, || {
-        WS_POOL.lock().ok()?.remove(owner)
-    })
-    .flatten()
+    let (entry, removed) = super::continuation::if_current_turn_for_owner(reservation, || {
+        let mut pool = WS_POOL.lock().unwrap();
+        let policy = crate::config::codex_cache_policy();
+        let now = tokio::time::Instant::now();
+        let mut removed = maintain_pool_at(&mut pool, policy, now);
+        let entry = pool.remove(owner).and_then(|entry| {
+            if pool_entry_expired(&entry, policy, now) {
+                removed.push(entry);
+                None
+            } else {
+                Some(entry)
+            }
+        });
+        (entry, removed)
+    })?;
+    drop(removed);
+    entry
 }
 
 fn take_pool_entry_for_request(
     reservation: Option<&ContinuationReservation>,
+    compatibility: &PoolCompatibility,
 ) -> Result<Option<Arc<PoolEntry>>, CodexError> {
     let candidate = reservation.map(ContinuationReservation::candidate);
     let requires_origin = candidate
@@ -455,7 +689,14 @@ fn take_pool_entry_for_request(
     let pool_owner = reservation_pool_owner(reservation);
     let pooled = reservation
         .filter(|_| pool_owner.is_some())
-        .and_then(pool_take_for_turn);
+        .and_then(pool_take_for_turn)
+        .filter(|entry| {
+            !entry.connection.is_closed()
+                && entry
+                    .compatibility
+                    .as_ref()
+                    .is_none_or(|stored| stored == compatibility)
+        });
 
     if requires_origin
         && (pool_owner.is_none()
@@ -478,11 +719,15 @@ fn pool_insert_for_turn(reservation: &ContinuationReservation, entry: Arc<PoolEn
         return false;
     };
     super::continuation::if_current_turn_for_owner(reservation, || {
+        entry
+            .published_turn
+            .store(reservation.turn_id().unwrap_or(0), Ordering::Release);
         pool_insert_if_vacant_or_same(owner, entry)
     })
     .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn pool_remove_entry(owner: &ConversationIdentity, entry: &Arc<PoolEntry>) {
     invalidate_pool_entry(owner, entry);
 }
@@ -497,70 +742,101 @@ pub(super) fn invalidate_codex_websocket_pool_socket(
     let Some(socket_id) = socket_id else {
         return;
     };
-    let entry = WS_POOL.lock().ok().and_then(|pool| {
-        pool.get(owner)
-            .filter(|entry| entry.socket_id == socket_id)
-            .cloned()
-    });
-    if let Some(entry) = entry {
-        pool_remove_entry(owner, &entry);
-    }
+    // Check and remove under one pool lock: the same Arc can be republished by
+    // a later turn between an unlocked check and removal.
+    let removed = {
+        let mut pool = WS_POOL.lock().unwrap();
+        let matches = pool.get(owner).is_some_and(|entry| {
+            let turn = entry.published_turn.load(Ordering::Acquire);
+            entry.socket_id == socket_id && (turn == 0 || Some(turn) == reservation.turn_id())
+        });
+        if matches { pool.remove(owner) } else { None }
+    };
+    drop(removed);
 }
 
 fn pool_insert_if_vacant_or_same(owner: ConversationIdentity, entry: Arc<PoolEntry>) -> bool {
+    let policy = crate::config::codex_cache_policy();
+    let now = tokio::time::Instant::now();
     entry.touch();
     let mut guard = WS_POOL.lock().unwrap();
-    if let Some(existing) = guard.get(&owner) {
-        return Arc::ptr_eq(existing, &entry);
-    }
-    if guard.len() >= MAX_POOL_ENTRIES
-        && let Some(oldest_owner) = guard.keys().next().cloned()
+    let mut removed = maintain_pool_at(&mut guard, policy, now);
+    let inserted = if now.saturating_duration_since(entry.created_at)
+        >= Duration::from_millis(policy.max_age_ms)
     {
-        guard.remove(&oldest_owner);
-    }
-    let now = now_ms();
-    guard.retain(|_, pooled| now.saturating_sub(pooled.created_at) < POOL_IDLE_TTL_MS);
-    guard.insert(owner, entry);
-    true
+        false
+    } else if let Some(existing) = guard.get(&owner) {
+        Arc::ptr_eq(existing, &entry)
+    } else {
+        guard.insert(owner, entry);
+        removed.extend(maintain_pool_at(&mut guard, policy, now));
+        true
+    };
+    drop(guard);
+    drop(removed);
+    inserted
 }
 
 #[cfg(test)]
 fn pool_insert(owner: ConversationIdentity, entry: Arc<PoolEntry>) {
-    entry.touch();
-    let mut guard = WS_POOL.lock().unwrap();
-    // Evict oldest if at capacity
-    if guard.len() >= MAX_POOL_ENTRIES
-        && let Some(oldest_owner) = guard.keys().next().cloned()
-    {
-        guard.remove(&oldest_owner);
-    }
-    // Evict expired entries
-    let now = now_ms();
-    guard.retain(|_, entry| now.saturating_sub(entry.created_at) < POOL_IDLE_TTL_MS);
-    guard.insert(owner, entry);
+    pool_insert_if_vacant_or_same(owner, entry);
 }
 
+#[cfg(test)]
 fn cleanup_pool_before_connect() {
-    let removed = {
-        let mut guard = WS_POOL.lock().unwrap();
-        if guard.len() <= POOL_CONNECT_CLEANUP_THRESHOLD {
-            return;
-        }
+    cleanup_pool_with_policy(crate::config::codex_cache_policy());
+}
 
-        let remove_count = guard.len() - POOL_CONNECT_CLEANUP_TARGET;
-        let mut candidates: Vec<_> = guard
-            .iter()
-            .filter(|(_, entry)| Arc::strong_count(entry) == 1)
-            .map(|(owner, entry)| (owner.clone(), entry.last_activity.load(Ordering::Relaxed)))
-            .collect();
-        candidates.sort_unstable_by_key(|(_, activity)| *activity);
-        candidates
-            .into_iter()
-            .take(remove_count)
-            .filter_map(|(owner, _)| guard.remove(&owner))
-            .collect::<Vec<_>>()
-    };
+fn cleanup_pool_with_policy(policy: crate::config::CodexCachePolicy) {
+    let removed = maintain_pool_at(
+        &mut WS_POOL.lock().unwrap(),
+        policy,
+        tokio::time::Instant::now(),
+    );
     drop(removed);
+}
+
+fn maintain_pool_at(
+    pool: &mut HashMap<ConversationIdentity, Arc<PoolEntry>>,
+    policy: crate::config::CodexCachePolicy,
+    now: tokio::time::Instant,
+) -> Vec<Arc<PoolEntry>> {
+    // Checked-out entries are absent; extra Arc owners represent active leases
+    // or delivery guards. Only idle, unleased sockets count toward the cap.
+    let mut expired = Vec::new();
+    let mut idle = Vec::new();
+    for (owner, entry) in pool.iter() {
+        if Arc::strong_count(entry) != 1 {
+            continue;
+        }
+        if pool_entry_expired(entry, policy, now) {
+            expired.push(owner.clone());
+        } else {
+            idle.push((owner.clone(), entry.last_activity.load(Ordering::Relaxed)));
+        }
+    }
+    idle.sort_unstable_by_key(|(_, activity)| *activity);
+    expired.extend(
+        idle.iter()
+            .take(idle.len().saturating_sub(policy.idle_cap))
+            .map(|(owner, _)| owner.clone()),
+    );
+    expired
+        .into_iter()
+        .filter_map(|owner| pool.remove(&owner))
+        .collect()
+}
+
+fn pool_entry_expired(
+    entry: &PoolEntry,
+    policy: crate::config::CodexCachePolicy,
+    now: tokio::time::Instant,
+) -> bool {
+    entry.connection.is_closed()
+        || now.saturating_duration_since(entry.created_at)
+            >= Duration::from_millis(policy.max_age_ms)
+        || now.saturating_duration_since(*entry.idle_since.lock().unwrap())
+            >= Duration::from_millis(policy.idle_ttl_ms)
 }
 
 struct WebSocketConnectGate {
@@ -637,7 +913,6 @@ pub fn codex_websocket_headers(http_headers: &HeaderMap) -> HeaderMap {
     let mut ws = HeaderMap::new();
     for (key, value) in http_headers.iter() {
         let key_str = key.as_str().to_lowercase();
-        // Skip hop-by-hop headers
         if matches!(
             key_str.as_str(),
             "content-length"
@@ -651,9 +926,7 @@ pub fn codex_websocket_headers(http_headers: &HeaderMap) -> HeaderMap {
         }
         ws.insert(key.clone(), value.clone());
     }
-    // Rewrite openai-beta for WebSocket protocol
     ws.insert("openai-beta", WEBSOCKET_PROTOCOL_HEADER.parse().unwrap());
-    // Ensure WebSocket key is present
     if !ws.contains_key("sec-websocket-key") {
         ws.insert("sec-websocket-key", generate_key().parse().unwrap());
     }
@@ -700,7 +973,6 @@ fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
     {
         return true;
     }
-    // Case-insensitive message check
     if let Some(msg) = error
         .and_then(|error| error.get("message"))
         .and_then(|value| value.as_str())
@@ -713,8 +985,19 @@ fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
     false
 }
 
+fn malformed_event_error() -> CodexError {
+    CodexError {
+        status: 502,
+        message: "Malformed JSON in Codex WebSocket event".to_string(),
+        detail: None,
+        retry_after: None,
+        usage_limit: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
 pub(super) fn event_error_status(payload: &serde_json::Value) -> Option<u16> {
-    super::events::classify_event_failure(payload).and_then(|failure| failure.explicit_status)
+    super::events::classify_event_failure(payload).map(|failure| failure.client_status())
 }
 
 #[allow(dead_code)]
@@ -730,6 +1013,7 @@ fn extract_retry_after(payload: &serde_json::Value) -> Option<String> {
 // Main request function
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn codex_websocket_request(
     websocket_client: &reqwest::Client,
@@ -737,171 +1021,53 @@ pub(super) async fn codex_websocket_request(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<&TrafficCapture>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
     reservation: Option<&ContinuationReservation>,
 ) -> Result<OwnerAwareCodexResponse, CodexError> {
-    let continuation = reservation.map(ContinuationReservation::candidate);
-    let pool_owner = reservation_pool_owner(reservation);
-    let ws_url = to_websocket_url(url).map_err(|e| CodexError {
-        status: 0,
-        message: e.message,
-        detail: None,
-        retry_after: None,
-        usage_limit: None,
-        origin: CodexErrorOrigin::WebSocketHandshake,
-    })?;
-    let body_json = serde_json::to_string(body_value).unwrap_or_default();
-    if let Some(tc) = traffic {
-        tc.write_json("020-upstream-request", body_value);
-        tc.write_json(
-            "021-upstream-request-metadata",
-            &serde_json::json!({
-                "provider": "codex",
-                "transport": "websocket",
-                "url": ws_url,
-                "method": "GET",
-                "headers": headers_to_json(headers),
-                "size": summarize_json_request_size(body_value, &body_json),
-                "continuation": {
-                    "previousResponseId": continuation
-                        .and_then(|c| c.previous_response_id.as_deref()),
-                    "inputDeltaCount": continuation
-                        .and_then(|c| c.input_delta.as_ref())
-                        .map(|items| items.len()),
-                    "disabledReason": continuation
-                        .and_then(|c| c.disabled_reason.as_deref()),
-                },
-            }),
-        );
-    }
     let started_at = Instant::now();
-
-    let requires_origin = continuation
-        .and_then(|candidate| candidate.previous_response_id.as_deref())
-        .is_some();
-    let pooled = take_pool_entry_for_request(reservation)?;
-    let mut used_pooled = pooled.is_some();
-    let mut entry = if let Some(entry) = pooled {
-        entry
-    } else {
-        Arc::new(PoolEntry::new(
-            connect_with_timeout(
-                websocket_client,
-                proxy_config,
-                &ws_url,
-                headers,
-                connect_timeout_ms,
-            )
-            .await?,
-        ))
-    };
-    let mut guard = entry.ws.clone().lock_owned().await;
-
-    if used_pooled
-        && validate_pooled_websocket(&mut guard, connect_timeout_ms)
-            .await
-            .is_err()
-    {
-        drop(guard);
-        if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
-        }
-        if requires_origin {
-            return Err(continuation_socket_missing_error());
-        }
-        entry = Arc::new(PoolEntry::new(
-            connect_with_timeout(
-                websocket_client,
-                proxy_config,
-                &ws_url,
-                headers,
-                connect_timeout_ms,
-            )
-            .await?,
-        ));
-        guard = entry.ws.clone().lock_owned().await;
-        used_pooled = false;
-    }
-
-    guard
-        .send(Message::Text(body_json))
-        .await
-        .map_err(|error| {
-            if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
-            }
-            CodexError {
-                status: 0,
-                message: format!("WebSocket send error: {error}"),
-                detail: None,
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::WebSocket,
-            }
-        })?;
-
-    let collected = collect_ws_events(
-        &mut guard,
+    let events = codex_websocket_event_stream(
+        websocket_client,
+        proxy_config,
+        url,
+        headers,
+        body_value,
+        ctx,
+        ctx.traffic.clone(),
+        connect_timeout_ms,
         idle_timeout_ms,
-        pool_owner,
-        Some(&entry),
-        traffic,
+        reservation,
     )
-    .await;
-    drop(guard);
-    let (sse_body, terminal_event) = match collected {
-        Ok(result) => result,
-        Err(error) => {
-            if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
-            }
-            return Err(error);
-        }
-    };
-    let Some(terminal_event) = terminal_event else {
-        if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
-        }
-        return Err(missing_terminal_error());
-    };
+    .await?;
+    collect_codex_websocket_response(events, traffic, started_at).await
+}
 
-    if is_previous_response_missing(&terminal_event.payload) {
-        if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
+pub(super) async fn collect_codex_websocket_response(
+    mut events: CodexWebSocketEventStream,
+    traffic: Option<&TrafficCapture>,
+    started_at: Instant,
+) -> Result<OwnerAwareCodexResponse, CodexError> {
+    let mut sse_body = Vec::new();
+    let mut status = 200;
+    let mut completed = false;
+    while let Some(item) = events.recv().await {
+        let payload = item?;
+        sse_body.extend_from_slice(&encode_sse(&payload.to_string()));
+        if is_terminal_event(&payload) {
+            status = event_error_status(&payload).unwrap_or(200);
+            completed = true;
+            events.accept_terminal();
+            break;
         }
-        return Err(CodexError {
-            status: 0,
-            message: "Previous response not found".to_string(),
-            detail: Some("previous_response_not_found".to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::WebSocket,
-        });
     }
-
-    let completed = terminal_event.event_type == "response.completed";
-    let origin_reinserted = if completed {
-        reservation.is_some_and(|reservation| pool_insert_for_turn(reservation, entry.clone()))
-    } else {
-        if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
-        }
-        false
-    };
-    let status = if terminal_event.event_type == "error" {
-        event_error_status(&terminal_event.payload).unwrap_or(500)
-    } else {
-        200
-    };
-
+    if !completed {
+        return Err(missing_terminal_error());
+    }
     if let Some(tc) = traffic {
-        write_websocket_metadata_capture(tc, &ws_url, reservation, used_pooled);
         write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
     }
-
     Ok(OwnerAwareCodexResponse::new(
         CodexResponse {
             body: sse_body,
@@ -909,55 +1075,59 @@ pub(super) async fn codex_websocket_request(
             headers: vec![],
             transport: ActualTransport::WebSocket,
         },
-        origin_reinserted.then_some(entry.socket_id),
-    ))
+        events.socket_id(),
+    )
+    .with_intervening_failure(events.had_intervening_failure()))
 }
 
-async fn validate_pooled_websocket<S>(
-    websocket: &mut WebSocketStream<S>,
-    timeout_ms: u64,
-) -> Result<(), String>
+fn handle_connection_metadata(payload: &serde_json::Value) -> bool {
+    match payload.get("type").and_then(serde_json::Value::as_str) {
+        Some("codex.rate_limits") => {
+            super::rate_limits::record_event(payload);
+            true
+        }
+        Some("keepalive") => true,
+        _ => false,
+    }
+}
+
+fn pong_write_error() -> CodexError {
+    CodexError {
+        status: 0,
+        message: "WebSocket Pong write failed".into(),
+        detail: None,
+        retry_after: None,
+        usage_limit: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
+async fn write_request<S>(ws: &mut WebSocketStream<S>, body: String) -> Result<(), CodexError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let nonce = next_monotonic_nonzero(&POOLED_VALIDATION_SEQUENCE, "pooled validation")
-        .to_be_bytes()
-        .to_vec();
-    websocket
-        .send(Message::Ping(nonce.clone()))
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-        loop {
-            match websocket.next().await {
-                Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
-                Some(Ok(Message::Ping(payload))) => websocket
-                    .send(Message::Pong(payload))
-                    .await
-                    .map_err(|error| error.to_string())?,
-                Some(Ok(Message::Pong(_))) => {
-                    return Err("unexpected Pong during pooled validation".to_string());
-                }
-                Some(Ok(_)) => {
-                    return Err("unexpected frame during pooled validation".to_string());
-                }
-                Some(Err(error)) => return Err(error.to_string()),
-                None => return Err("connection closed during pooled validation".to_string()),
-            }
-        }
-    })
-    .await
-    .map_err(|_| "validation timeout".to_string())?
+    let result = tokio::time::timeout(Duration::from_secs(15), ws.send(Message::Text(body))).await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(CodexError {
+            status: 0,
+            message: "WebSocket request write did not complete; delivery is ambiguous".into(),
+            detail: Some(WEBSOCKET_AMBIGUOUS_WRITE_DETAIL.into()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::WebSocket,
+        }),
+    }
 }
 
 pub(super) struct ReadyWebSocket {
     ws_url: String,
-    guard: OwnedMutexGuard<CodexWebSocketStream>,
     entry: Arc<PoolEntry>,
     used_pooled: bool,
     reservation: Option<ContinuationReservation>,
     traffic: Option<Arc<TrafficCapture>>,
     idle_timeout_ms: u64,
+    diagnostics: WsDiagnostics,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -966,13 +1136,14 @@ pub(super) async fn prepare_codex_websocket(
     proxy_config: &WebSocketProxyConfig,
     url: &str,
     headers: &HeaderMap,
+    req_id: Option<&str>,
     traffic: Option<Arc<TrafficCapture>>,
     reservation: Option<&ContinuationReservation>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
 ) -> Result<ReadyWebSocket, CodexError> {
-    let pool_owner = reservation_pool_owner(reservation);
-    let continuation = reservation.map(ContinuationReservation::candidate);
+    let mut diagnostics = WsDiagnostics::new(req_id, headers, reservation);
+    diagnostics.logger.info("websocket_attempt_start", None);
     let ws_url = to_websocket_url(url).map_err(|error| CodexError {
         status: 0,
         message: error.message,
@@ -981,10 +1152,9 @@ pub(super) async fn prepare_codex_websocket(
         usage_limit: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
-    let requires_origin = continuation
-        .and_then(|candidate| candidate.previous_response_id.as_deref())
-        .is_some();
-    let pooled = take_pool_entry_for_request(reservation)?;
+    let compatibility = PoolCompatibility::capture(proxy_config, &ws_url, headers, reservation);
+    let pooled = take_pool_entry_for_request(reservation, &compatibility)
+        .inspect_err(|error| diagnostics.failure("pool_checkout", &error.message))?;
     let used_pooled = pooled.is_some();
     let entry = if let Some(entry) = pooled {
         entry
@@ -996,52 +1166,77 @@ pub(super) async fn prepare_codex_websocket(
             headers,
             connect_timeout_ms,
         )
-        .await?;
-        Arc::new(PoolEntry::new(stream))
+        .await
+        .inspect_err(|error| diagnostics.failure("connect", &error.message))?;
+        Arc::new(PoolEntry::with_compatibility(stream, Some(compatibility)))
     };
-    let mut guard = entry.ws.clone().lock_owned().await;
-    if used_pooled
-        && let Err(detail) = validate_pooled_websocket(&mut guard, connect_timeout_ms).await
-    {
-        drop(guard);
-        if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
-        }
-        return Err(if requires_origin {
-            continuation_socket_missing_error()
-        } else {
-            pooled_validation_error(detail)
-        });
-    }
+    diagnostics.ready(&entry, used_pooled);
     Ok(ReadyWebSocket {
         ws_url,
-        guard,
         entry,
         used_pooled,
         reservation: reservation.cloned(),
         traffic,
         idle_timeout_ms,
+        diagnostics,
     })
 }
 
-fn pooled_validation_error(detail: String) -> CodexError {
-    CodexError {
-        status: 0,
-        message: format!("WebSocket pooled connection validation failed: {detail}"),
-        detail: None,
-        retry_after: None,
-        usage_limit: None,
-        origin: CodexErrorOrigin::WebSocketHandshake,
-    }
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn codex_websocket_responses_stream(
+    websocket_client: &reqwest::Client,
+    proxy_config: &WebSocketProxyConfig,
+    url: &str,
+    headers: &HeaderMap,
+    body: &super::translate::request::ResponsesRequest,
+    ctx: &RequestContext,
+    reservation: Option<&ContinuationReservation>,
+) -> Result<CodexWebSocketEventStream, CodexError> {
+    let mut ready = prepare_codex_websocket(
+        websocket_client,
+        proxy_config,
+        url,
+        headers,
+        Some(&ctx.req_id),
+        ctx.traffic.clone(),
+        reservation,
+        WEBSOCKET_CONNECT_TIMEOUT_MS,
+        WEBSOCKET_IDLE_TIMEOUT_MS,
+    )
+    .await?;
+    // Checkout and origin-affinity checks happen before allocating the selected wire input.
+    let wire = super::client::build_websocket_request(
+        body,
+        reservation.map(ContinuationReservation::candidate),
+    );
+    ready.diagnostics.logger = ready.diagnostics.logger.child(serde_json::Map::from_iter([(
+        "fullInputItems".into(),
+        body.input.len().into(),
+    )]));
+    let json = serde_json::to_string(&wire).expect("wire request serializes");
+    Ok(start_codex_websocket_events(
+        ready,
+        &wire,
+        json,
+        headers,
+        reservation,
+    ))
 }
 
 pub(super) fn start_codex_websocket_events(
-    ready: ReadyWebSocket,
+    mut ready: ReadyWebSocket,
     body_value: &serde_json::Value,
     body_json: String,
     headers: &HeaderMap,
     reservation: Option<&ContinuationReservation>,
 ) -> CodexWebSocketEventStream {
+    ready.diagnostics.model(body_value);
+    ready.diagnostics.logger = ready.diagnostics.logger.child(serde_json::json!({
+        "requestMode": if body_value.get("previous_response_id").and_then(serde_json::Value::as_str).is_some() {"delta"} else {"full"},
+        "wireInputItems":body_value.get("input").and_then(serde_json::Value::as_array).map(Vec::len),
+        "wireBytes":body_json.len(),
+        "continuationReason":reservation.and_then(|r|r.candidate().disabled_reason.as_deref()).unwrap_or("eligible"),
+    }).as_object().unwrap().clone());
     if let Some(tc) = ready.traffic.as_deref() {
         write_websocket_metadata_capture(tc, &ready.ws_url, reservation, ready.used_pooled);
         tc.write_json("020-upstream-request", body_value);
@@ -1057,61 +1252,26 @@ pub(super) fn start_codex_websocket_events(
     }
     let (tx, rx) = mpsc::channel(64);
     let (receiver, socket_id_publisher) = CodexWebSocketEventStream::pending(rx);
-    tokio::spawn(async move {
-        let ReadyWebSocket {
-            ws_url: _,
-            mut guard,
-            entry,
-            used_pooled: _,
-            reservation,
-            traffic,
-            idle_timeout_ms,
-        } = ready;
-        let pool_owner = reservation_pool_owner(reservation.as_ref());
-        if let Err(error) = guard.send(Message::Text(body_json)).await {
-            drop(guard);
-            if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
-            }
-            socket_id_publisher.publish(None);
-            let _ = tx
-                .send(Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket send error: {error}"),
-                    detail: None,
-                    retry_after: None,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                }))
-                .await;
-            return;
-        }
-        let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx).await;
-        drop(guard);
-
-        let origin_reinserted = if reusable {
-            reservation
-                .as_ref()
-                .is_some_and(|reservation| pool_insert_for_turn(reservation, entry.clone()))
-        } else {
-            if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
-            }
-            false
-        };
-        socket_id_publisher.publish(origin_reinserted.then_some(entry.socket_id));
-        if let Some(item) = terminal_item
-            && tx.send(item).await.is_err()
-            && origin_reinserted
-            && let Some(owner) = pool_owner
-        {
-            pool_remove_entry(owner, &entry);
-        }
-    });
+    let receiver = receiver.track_attempt(reservation, false);
+    socket_id_publisher.publish_diagnostic_attempt(Some(ready.diagnostics.attempt_id));
+    let tx = socket_id_publisher.sender(tx);
+    let connection = ready.entry.connection.clone();
+    let turn = connection::StartTurn {
+        body_json,
+        entry: ready.entry,
+        reservation: ready.reservation,
+        traffic: ready.traffic,
+        idle_timeout_ms: ready.idle_timeout_ms,
+        diagnostics: ready.diagnostics,
+        settings: crate::config::captured_request_settings(),
+        tx,
+        publisher: socket_id_publisher,
+    };
+    connection.start(turn);
     receiver
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn codex_websocket_event_stream(
     websocket_client: &reqwest::Client,
@@ -1119,7 +1279,7 @@ pub(super) async fn codex_websocket_event_stream(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<Arc<TrafficCapture>>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -1138,6 +1298,7 @@ pub(super) async fn codex_websocket_event_stream(
         proxy_config,
         url,
         headers,
+        Some(&ctx.req_id),
         traffic,
         reservation,
         connect_timeout_ms,
@@ -1949,7 +2110,7 @@ async fn connect_with_timeout(
         &WS_CONNECT_GATE,
         Duration::from_millis(connect_timeout_ms),
         WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN,
-        || async { cleanup_pool_before_connect() },
+        || async { cleanup_pool_with_policy(proxy_config.cache_policy) },
         || connect_once(websocket_client, proxy_config, url, headers),
     )
     .await
@@ -2008,21 +2169,278 @@ where
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
 struct WsEvent {
-    event_type: String,
     payload: serde_json::Value,
 }
 
+// Constant-size stream metadata: count events, emit only first milestones/terminal/failure.
+// Response bodies and headers never enter this logger.
+struct WsDiagnostics {
+    logger: Logger,
+    started: Instant,
+    events: u64,
+    response_events: u64,
+    attempt_id: u64,
+    started_us: u64,
+    phase_times_us: [Option<u64>; 4],
+}
+
+const TTFT_PHASES: [&str; 4] = [
+    "response_created",
+    "reasoning_started",
+    "first_summary_delta",
+    "first_text_delta",
+];
+static NEXT_DIAGNOSTIC_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+
+fn diagnostic_text(text: &str) -> String {
+    let mut output = String::new();
+    for ch in text.chars().filter(|ch| !ch.is_control()) {
+        if output.len() + ch.len_utf8() > 256 {
+            break;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+impl WsDiagnostics {
+    fn new(
+        req_id: Option<&str>,
+        headers: &HeaderMap,
+        reservation: Option<&ContinuationReservation>,
+    ) -> Self {
+        let mut fields = serde_json::Map::new();
+        if let Some(req_id) = req_id.or_else(|| {
+            headers
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+        }) {
+            fields.insert("reqId".into(), diagnostic_text(req_id).into());
+        }
+        if let Some(model) = reservation.and_then(ContinuationReservation::model) {
+            fields.insert("model".into(), diagnostic_text(model).into());
+        }
+        if let Some(owner) = reservation.and_then(ContinuationReservation::owner) {
+            match owner {
+                ConversationIdentity::Main(session) => {
+                    fields.insert("sessionId".into(), diagnostic_text(session).into());
+                }
+                ConversationIdentity::Agent(session, agent) => {
+                    fields.insert("sessionId".into(), diagnostic_text(session).into());
+                    fields.insert("agentId".into(), diagnostic_text(agent).into());
+                }
+            }
+        }
+        Self {
+            logger: create_logger("codex").child(fields),
+            started: Instant::now(),
+            events: 0,
+            response_events: 0,
+            attempt_id: next_monotonic_nonzero(&NEXT_DIAGNOSTIC_ATTEMPT, "diagnostic attempt"),
+            started_us: super::timing::monotonic_us(),
+            phase_times_us: [None; 4],
+        }
+    }
+
+    fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::from_iter([
+            (
+                "elapsedMs".into(),
+                serde_json::json!(self.started.elapsed().as_millis()),
+            ),
+            ("eventCount".into(), self.events.into()),
+            ("responseEventCount".into(), self.response_events.into()),
+            ("attemptId".into(), self.attempt_id.into()),
+            ("processId".into(), std::process::id().into()),
+            ("attemptStartedUs".into(), self.started_us.into()),
+            ("monotonicUs".into(), super::timing::monotonic_us().into()),
+            (
+                "phaseTimesUs".into(),
+                serde_json::Value::Object(
+                    TTFT_PHASES
+                        .iter()
+                        .zip(self.phase_times_us)
+                        .map(|(name, time)| {
+                            (
+                                (*name).into(),
+                                time.map_or(serde_json::Value::Null, Into::into),
+                            )
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+
+    fn ready(&mut self, entry: &PoolEntry, reused: bool) {
+        self.logger = self.logger.child(serde_json::Map::from_iter([
+            ("socketId".into(), entry.socket_id.into()),
+            ("reused".into(), reused.into()),
+        ]));
+        self.logger.info("websocket_ready", Some(self.fields()));
+    }
+
+    fn model(&mut self, body: &serde_json::Value) {
+        if let Some(model) = body.get("model").and_then(|value| value.as_str()) {
+            self.logger = self.logger.child(serde_json::Map::from_iter([(
+                "model".into(),
+                diagnostic_text(model).into(),
+            )]));
+        }
+    }
+
+    fn event(&mut self, payload: &serde_json::Value) {
+        self.events += 1;
+        let phase = match payload.get("type").and_then(serde_json::Value::as_str) {
+            Some("response.created") => Some(0),
+            Some("response.output_item.added")
+                if payload
+                    .pointer("/item/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("reasoning") =>
+            {
+                Some(1)
+            }
+            Some("response.reasoning_summary_text.delta")
+                if payload
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !s.is_empty()) =>
+            {
+                Some(2)
+            }
+            Some("response.output_text.delta")
+                if payload
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !s.is_empty()) =>
+            {
+                Some(3)
+            }
+            _ => None,
+        };
+        if let Some(index) = phase.filter(|&index| self.phase_times_us[index].is_none()) {
+            let observed = super::timing::monotonic_us();
+            self.phase_times_us[index] = Some(observed);
+            let mut fields = self.fields();
+            fields.insert("monotonicUs".into(), observed.into());
+            fields.insert("phase".into(), TTFT_PHASES[index].into());
+            fields.insert("boundary".into(), "upstream_reader".into());
+            self.logger.info("websocket_phase", Some(fields));
+        }
+        if is_response_event(payload) {
+            self.response_events += 1;
+            if self.response_events == 1 {
+                self.logger.info(
+                    "websocket_first_response",
+                    Some({
+                        let mut fields = self.fields();
+                        fields.insert(
+                            "event".into(),
+                            diagnostic_text(
+                                payload
+                                    .get("type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown"),
+                            )
+                            .into(),
+                        );
+                        fields
+                    }),
+                );
+            }
+        }
+        if let Some(outcome) = super::events::terminal_outcome(payload) {
+            let mut fields = self.fields();
+            fields.insert("phase".into(), "upstream_terminal".into());
+            fields.insert("outcome".into(), outcome.into());
+            fields.insert(
+                "event".into(),
+                diagnostic_text(
+                    payload
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown"),
+                )
+                .into(),
+            );
+            fields.insert(
+                "status".into(),
+                event_error_status(payload).unwrap_or(200).into(),
+            );
+            if let Some(status) = payload
+                .pointer("/response/status")
+                .and_then(|value| value.as_str())
+            {
+                fields.insert("responseStatus".into(), diagnostic_text(status).into());
+            }
+            self.logger.info("websocket_terminal", Some(fields));
+        }
+    }
+
+    fn timeout(&self, response_started: bool, waited: Duration, budget_ms: u64) {
+        let mut fields = self.fields();
+        fields.insert(
+            "phase".into(),
+            if response_started {
+                "response_idle"
+            } else {
+                "response_start"
+            }
+            .into(),
+        );
+        fields.insert("waitedMs".into(), serde_json::json!(waited.as_millis()));
+        fields.insert("timeoutMs".into(), budget_ms.into());
+        self.logger.warn("websocket_timeout", Some(fields));
+    }
+
+    fn failure(&self, phase: &str, error: &str) {
+        let mut fields = self.fields();
+        fields.insert("phase".into(), phase.into());
+        fields.insert("error".into(), diagnostic_text(error).into());
+        self.logger.warn("websocket_error", Some(fields));
+    }
+
+    fn close(&self, close: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame<'_>>) {
+        let mut fields = self.fields();
+        fields.insert("terminalSeen".into(), false.into());
+        if let Some(close) = close {
+            fields.insert("closeCode".into(), u16::from(close.code).into());
+            fields.insert("closeReason".into(), diagnostic_text(&close.reason).into());
+        }
+        self.logger.warn("websocket_close", Some(fields));
+    }
+
+    fn eof(&self) {
+        let mut fields = self.fields();
+        fields.insert("terminalSeen".into(), false.into());
+        self.logger.warn("websocket_eof", Some(fields));
+    }
+}
+
+#[cfg(test)]
 async fn collect_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
+    diagnostics: Option<&mut WsDiagnostics>,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut fallback = WsDiagnostics::new(None, &HeaderMap::new(), None);
+    let diagnostics = diagnostics.unwrap_or(&mut fallback);
+    if let Some(entry) = pool_entry {
+        diagnostics.logger = diagnostics.logger.child(serde_json::Map::from_iter([(
+            "socketId".into(),
+            entry.socket_id.into(),
+        )]));
+    }
     collect_ws_events_with_keepalive_interval(
         ws,
         idle_timeout_ms,
@@ -2030,10 +2448,12 @@ where
         pool_entry,
         traffic,
         WEBSOCKET_KEEPALIVE_INTERVAL,
+        Some(diagnostics),
     )
     .await
 }
 
+#[cfg(test)]
 async fn collect_ws_events_with_keepalive_interval<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
@@ -2041,186 +2461,85 @@ async fn collect_ws_events_with_keepalive_interval<S>(
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
     keepalive_interval: Duration,
+    diagnostics: Option<&mut WsDiagnostics>,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut sse_body: Vec<u8> = Vec::new();
-    let mut terminal_event: Option<WsEvent> = None;
-    let response_event_budget = Duration::from_millis(idle_timeout_ms);
-    let response_wait_started = Instant::now();
-    let mut last_response_event_at = response_wait_started;
-    let mut response_started = false;
-
-    loop {
-        let response_deadline_started = if response_started {
-            last_response_event_at
-        } else {
-            response_wait_started
-        };
-        let read_timeout = if response_started {
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    invalidate_pool_owner(pool_owner, pool_entry);
-                    return Err(CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    });
-                }
-            }
-        } else {
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    invalidate_pool_owner(pool_owner, pool_entry);
-                    return Err(response_start_timeout_error(idle_timeout_ms));
-                }
-            }
-        };
-
-        let frame = match read_ws_frame_with_keepalive(ws, read_timeout, keepalive_interval).await {
-            WebSocketRead::Frame(frame) => frame,
-            WebSocketRead::Timeout => {
-                invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(if response_started {
-                    CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    }
-                } else {
-                    response_start_timeout_error(idle_timeout_ms)
-                });
-            }
-            WebSocketRead::KeepaliveError(error) => {
-                invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket keepalive error: {error}"),
-                    detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
-                    retry_after: None,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                });
-            }
-        };
-
-        match frame {
-            Some(Ok(Message::Text(text))) => {
-                // Parse JSON
-                let parsed: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        if let Some(tc) = traffic {
-                            tc.write_json_event(
-                                "040-upstream-event",
-                                &serde_json::json!({
-                                    "unparseable": true,
-                                    "data": text,
-                                }),
-                            );
-                        }
-                        // Write invalid JSON as-is
-                        sse_body.extend_from_slice(&encode_sse(&text));
-                        continue;
-                    }
-                };
-
-                // Convert to SSE bytes
-                sse_body.extend_from_slice(&encode_sse(&text));
-                if let Some(tc) = traffic {
-                    tc.write_json_event("040-upstream-event", &parsed);
-                }
-
-                if is_response_event(&parsed) {
-                    response_started = true;
-                    last_response_event_at = Instant::now();
-                }
-
-                // Check for terminal events
-                if is_terminal_event(&parsed) {
-                    terminal_event = Some(WsEvent {
-                        event_type: parsed
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        payload: parsed,
-                    });
-                    break;
-                }
-            }
-            Some(Ok(Message::Binary(_))) => {
-                // Reject binary frames
-                invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(CodexError {
-                    status: 0,
-                    message: "WebSocket binary frames not supported".to_string(),
-                    detail: None,
-                    retry_after: None,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                });
-            }
-            Some(Ok(Message::Ping(data))) => {
-                // Respond to ping automatically, continue
-                let _ = ws.send(Message::Pong(data)).await;
-                continue;
-            }
-            Some(Ok(Message::Pong(_))) => {
-                continue;
-            }
-            Some(Ok(Message::Frame(_))) => {
-                // Raw frame passthrough - continue
-                continue;
-            }
-            Some(Ok(Message::Close(_))) => {
-                // Connection closed - invalidate pool
-                invalidate_pool_owner(pool_owner, pool_entry);
-                break;
-            }
-            Some(Err(e)) => {
-                // Stream error - invalidate pool
-                invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket stream error: {e}"),
-                    detail: None,
-                    retry_after: None,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                });
-            }
-            None => {
-                // Stream ended - invalidate pool
-                invalidate_pool_owner(pool_owner, pool_entry);
-                break;
-            }
+    let (sender, mut receiver) = mpsc::channel(64);
+    let tx = EventSender {
+        sender,
+        aborted: Arc::new(AtomicBool::new(false)),
+    };
+    let read = async {
+        let result = stream_ws_events_with_keepalive_interval(
+            ws,
+            idle_timeout_ms,
+            traffic,
+            &tx,
+            diagnostics,
+            keepalive_interval,
+        )
+        .await;
+        drop(tx);
+        result
+    };
+    let collect = async {
+        let mut body = Vec::new();
+        while let Some(item) = receiver.recv().await {
+            body.extend_from_slice(&encode_sse(&item.unwrap().to_string()));
         }
+        body
+    };
+    let ((reusable, terminal), mut body) = tokio::join!(read, collect);
+    if !reusable {
+        invalidate_pool_owner(pool_owner, pool_entry);
     }
-
-    Ok((sse_body, terminal_event))
+    let terminal = match terminal {
+        Some(item) => Some(WsEvent { payload: item? }),
+        None => None,
+    };
+    if let Some(event) = terminal.as_ref() {
+        body.extend_from_slice(&encode_sse(&event.payload.to_string()));
+    }
+    Ok((body, terminal))
 }
 
 async fn stream_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
-    traffic: Option<Arc<TrafficCapture>>,
-    tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    traffic: Option<&TrafficCapture>,
+    tx: &EventSender,
+    diagnostics: Option<&mut WsDiagnostics>,
 ) -> (bool, Option<Result<serde_json::Value, CodexError>>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    stream_ws_events_with_keepalive_interval(
+        ws,
+        idle_timeout_ms,
+        traffic,
+        tx,
+        diagnostics,
+        WEBSOCKET_KEEPALIVE_INTERVAL,
+    )
+    .await
+}
+
+async fn stream_ws_events_with_keepalive_interval<S>(
+    ws: &mut WebSocketStream<S>,
+    idle_timeout_ms: u64,
+    traffic: Option<&TrafficCapture>,
+    tx: &EventSender,
+    diagnostics: Option<&mut WsDiagnostics>,
+    keepalive_interval: Duration,
+) -> (bool, Option<Result<serde_json::Value, CodexError>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut fallback = WsDiagnostics::new(None, &HeaderMap::new(), None);
+    let diagnostics = diagnostics.unwrap_or(&mut fallback);
     let started_at = Instant::now();
-    let mut sse_body: Vec<u8> = Vec::new();
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
     let response_wait_started = Instant::now();
     let mut last_response_event_at = response_wait_started;
@@ -2239,6 +2558,11 @@ where
             match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
+                    diagnostics.timeout(
+                        response_started,
+                        response_deadline_started.elapsed(),
+                        idle_timeout_ms,
+                    );
                     terminal_item = Some(Err(if response_started {
                         CodexError {
                             status: 0,
@@ -2257,14 +2581,18 @@ where
 
         let frame = tokio::select! {
             biased;
-            _ = tx.closed() => break,
+            _ = tx.closed() => {
+                diagnostics.failure("downstream_delivery", "consumer closed");
+                break;
+            },
             frame = read_ws_frame_with_keepalive(
                 ws,
                 read_timeout,
-                WEBSOCKET_KEEPALIVE_INTERVAL,
+                keepalive_interval,
             ) => match frame {
                 WebSocketRead::Frame(frame) => frame,
                 WebSocketRead::Timeout => {
+                    diagnostics.timeout(response_started, response_deadline_started.elapsed(), idle_timeout_ms);
                     terminal_item = Some(Err(if response_started {
                         CodexError {
                             status: 0,
@@ -2280,10 +2608,11 @@ where
                     break;
                 }
                 WebSocketRead::KeepaliveError(error) => {
+                    diagnostics.failure("keepalive_write", &error);
                     terminal_item = Some(Err(CodexError {
                         status: 0,
                         message: format!("WebSocket keepalive error: {error}"),
-                        detail: None,
+                        detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.into()),
                         retry_after: None,
                         usage_limit: None,
                         origin: CodexErrorOrigin::WebSocket,
@@ -2298,22 +2627,27 @@ where
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(value) => value,
                     Err(_) => {
-                        if let Some(tc) = traffic.as_deref() {
+                        diagnostics.failure("response_parse", "malformed JSON event");
+                        if let Some(tc) = traffic {
                             tc.write_json_event(
                                 "040-upstream-event",
                                 &serde_json::json!({
                                     "unparseable": true,
-                                    "data": text,
+                                    "bytes": text.len(),
                                 }),
                             );
                         }
-                        sse_body.extend_from_slice(&encode_sse(&text));
-                        continue;
+                        terminal_item = Some(Err(malformed_event_error()));
+                        break;
                     }
                 };
 
-                sse_body.extend_from_slice(&encode_sse(&text));
-                if let Some(tc) = traffic.as_deref() {
+                if handle_connection_metadata(&parsed) && parsed["type"] != "codex.rate_limits" {
+                    continue;
+                }
+                diagnostics.event(&parsed);
+
+                if let Some(tc) = traffic {
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
 
@@ -2336,18 +2670,19 @@ where
                             origin: CodexErrorOrigin::WebSocket,
                         }));
                     } else {
-                        reusable = parsed.get("type").and_then(|value| value.as_str())
-                            == Some("response.completed");
+                        reusable = super::events::event_is_success_terminal(&parsed);
                         terminal_item = Some(Ok(parsed));
                     }
                     break;
                 }
 
-                if tx.send(Ok(parsed)).await.is_err() {
+                if tx.send_bounded(Ok(parsed)).await.is_err() {
+                    diagnostics.failure("downstream_delivery", "consumer stalled or closed");
                     break;
                 }
             }
             Some(Ok(Message::Binary(_))) => {
+                diagnostics.failure("response_read", "binary frames not supported");
                 terminal_item = Some(Err(CodexError {
                     status: 0,
                     message: "WebSocket binary frames not supported".to_string(),
@@ -2359,14 +2694,30 @@ where
                 break;
             }
             Some(Ok(Message::Ping(data))) => {
-                let _ = ws.send(Message::Pong(data)).await;
+                let pong = tokio::select! {
+                    biased;
+                    _ = tx.closed() => break,
+                    result = tokio::time::timeout(WEBSOCKET_KEEPALIVE_SEND_TIMEOUT, ws.send(Message::Pong(data))) => result,
+                };
+                if !matches!(pong, Ok(Ok(()))) {
+                    diagnostics.failure("pong_write", "Pong write failed or timed out");
+                    terminal_item = Some(Err(pong_write_error()));
+                    break;
+                }
             }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
-            Some(Ok(Message::Close(_))) | None => {
+            Some(Ok(Message::Close(close))) => {
+                diagnostics.close(close.as_ref());
+                terminal_item = Some(Err(missing_terminal_error()));
+                break;
+            }
+            None => {
+                diagnostics.eof();
                 terminal_item = Some(Err(missing_terminal_error()));
                 break;
             }
             Some(Err(error)) => {
+                diagnostics.failure("response_read", &error.to_string());
                 terminal_item = Some(Err(CodexError {
                     status: 0,
                     message: format!("WebSocket stream error: {error}"),
@@ -2380,8 +2731,17 @@ where
         }
     }
 
-    if let Some(tc) = traffic.as_deref() {
-        write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
+    if let Some(tc) = traffic {
+        // Individual events are captured above. Buffered collection alone keeps
+        // a complete SSE body; live capture intentionally omits that raw mirror.
+        tc.write_json(
+            "030-upstream-response-headers",
+            &serde_json::json!({
+                "status": status, "elapsedMs": started_at.elapsed().as_millis(),
+                "headers": {"content-type":"text/event-stream"},
+                "bodyCapture": "per-event records; live SSE body omitted"
+            }),
+        );
     }
     (reusable, terminal_item)
 }
@@ -2421,6 +2781,328 @@ mod tests {
 
     use super::*;
 
+    fn diagnostics_settings(root: &std::path::Path) -> Arc<crate::config::CodexRequestSettings> {
+        crate::config::CodexRequestSettings::for_env(HashMap::from([
+            (
+                "CCP_CONFIG_DIR".into(),
+                root.join("config").display().to_string(),
+            ),
+            (
+                "XDG_STATE_HOME".into(),
+                root.join("state").display().to_string(),
+            ),
+        ]))
+    }
+
+    fn diagnostic_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+        assert!(crate::logging::flush_diagnostics(Duration::from_secs(2)));
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn diagnostic_outcomes_keep_websocket_terminal_scope_and_attempt() {
+        for (terminal, outcome) in [
+            (
+                serde_json::json!({"type":"response.completed","response":{"status":"completed"}}),
+                "completed",
+            ),
+            (
+                serde_json::json!({"type":"response.failed","response":{"status":"failed","error":{"code":"server_error"}}}),
+                "failed",
+            ),
+            (
+                serde_json::json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}),
+                "incomplete",
+            ),
+            (
+                serde_json::json!({"type":"response.done","response":{"status":"failed"}}),
+                "failed",
+            ),
+            (
+                serde_json::json!({"type":"response.completed","response":{"status":"cancelled"}}),
+                "cancelled",
+            ),
+            (
+                serde_json::json!({"type":"error","error":{"code":"server_error"}}),
+                "failed",
+            ),
+            (
+                serde_json::json!({"type":"response.completed","response":{"status":"completed","error":{"code":"server_error"}}}),
+                "failed",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let settings = diagnostics_settings(temp.path());
+            let path = settings.clone().sync_scope(crate::logging::log_file);
+            settings
+                .scope(async {
+                    let (io, peer) = tokio::io::duplex(16 * 1024);
+                    let mut client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+                    let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+                    for event in [
+                        serde_json::json!({"type":"response.created"}),
+                        terminal.clone(),
+                    ] {
+                        peer.send(Message::Text(event.to_string())).await.unwrap();
+                    }
+                    let mut diagnostics =
+                        WsDiagnostics::new(Some("ws-outcome"), &HeaderMap::new(), None);
+                    // Upstream failure is still a terminal event, forwarded unchanged.
+                    let (bytes, _) = collect_ws_events(
+                        &mut client,
+                        1_000,
+                        None,
+                        None,
+                        None,
+                        Some(&mut diagnostics),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        String::from_utf8(bytes)
+                            .unwrap()
+                            .contains(terminal["type"].as_str().unwrap())
+                    );
+                })
+                .await;
+            let records = diagnostic_records(&path);
+            let first = records
+                .iter()
+                .find(|r| r["msg"] == "websocket_first_response")
+                .unwrap();
+            let record = records
+                .iter()
+                .find(|r| r["msg"] == "websocket_terminal")
+                .unwrap();
+            assert_eq!(record["fields"]["phase"], "upstream_terminal");
+            assert_eq!(record["fields"]["outcome"], outcome);
+            assert_eq!(record["fields"]["event"], terminal["type"]);
+            assert_eq!(record["fields"]["reqId"], "ws-outcome");
+            assert!(record["fields"]["attemptId"].is_u64());
+            assert_eq!(record["fields"]["attemptId"], first["fields"]["attemptId"]);
+            assert_eq!(record["fields"]["processId"], first["fields"]["processId"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_ttft_phases_are_once_only_and_content_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = diagnostics_settings(temp.path());
+        let path = settings.clone().sync_scope(crate::logging::log_file);
+        settings.scope(async {
+            let (io, peer) = tokio::io::duplex(16 * 1024);
+            let mut client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+            for event in [
+                serde_json::json!({"type":"response.created"}),
+                serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"private-id"}}),
+                serde_json::json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":""}),
+                serde_json::json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"private-summary"}),
+                serde_json::json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"private-summary"}),
+                serde_json::json!({"type":"response.output_text.delta","output_index":1,"delta":""}),
+                serde_json::json!({"type":"response.output_text.delta","output_index":1,"delta":"private-answer"}),
+                serde_json::json!({"type":"response.output_text.delta","output_index":1,"delta":"private-answer"}),
+                serde_json::json!({"type":"response.completed","response":{"status":"completed"}}),
+            ] {
+                peer.send(Message::Text(event.to_string())).await.unwrap();
+            }
+            collect_ws_events(&mut client, 1_000, None, None, None, None).await.unwrap();
+        }).await;
+        let logs = diagnostic_records(&path);
+        let phases: Vec<_> = logs
+            .iter()
+            .filter(|r| r["msg"] == "websocket_phase")
+            .collect();
+        assert_eq!(
+            phases.len(),
+            4,
+            "each first upstream milestone must be logged once"
+        );
+        let mut previous = 0;
+        for (record, expected) in phases.iter().zip([
+            "response_created",
+            "reasoning_started",
+            "first_summary_delta",
+            "first_text_delta",
+        ]) {
+            assert_eq!(record["fields"]["phase"], expected);
+            assert_eq!(record["fields"]["boundary"], "upstream_reader");
+            assert!(record["fields"]["attemptId"].as_u64().is_some());
+            let observed = record["fields"]["monotonicUs"].as_u64().unwrap();
+            assert!(observed >= previous);
+            previous = observed;
+        }
+        let serialized = serde_json::to_string(&logs).unwrap();
+        assert!(!serialized.contains("private-"));
+        let terminal = logs
+            .iter()
+            .find(|r| r["msg"] == "websocket_terminal")
+            .unwrap();
+        assert!(terminal["fields"]["phaseTimesUs"]["first_summary_delta"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn websocket_ttft_missing_phases_remain_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = diagnostics_settings(temp.path());
+        let path = settings.clone().sync_scope(crate::logging::log_file);
+        settings
+            .scope(async {
+                let (io, peer) = tokio::io::duplex(1024);
+                let mut client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+                let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+                peer.send(Message::Text(
+                    r#"{"type":"response.completed","response":{"status":"completed"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                collect_ws_events(&mut client, 1_000, None, None, None, None)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        let logs = diagnostic_records(&path);
+        let terminal = logs
+            .iter()
+            .find(|r| r["msg"] == "websocket_terminal")
+            .unwrap();
+        for name in [
+            "response_created",
+            "reasoning_started",
+            "first_summary_delta",
+            "first_text_delta",
+        ] {
+            assert_eq!(
+                terminal["fields"]["phaseTimesUs"].get(name),
+                Some(&serde_json::Value::Null)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_diagnostics_logs_first_and_terminal_without_delta_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = diagnostics_settings(temp.path());
+        let path = settings.clone().sync_scope(crate::logging::log_file);
+        settings
+            .scope(async {
+                let (io, peer) = tokio::io::duplex(16 * 1024);
+                let mut client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+                let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+                peer.send(Message::Text(r#"{"type":"response.created"}"#.into()))
+                    .await
+                    .unwrap();
+                for _ in 0..20 {
+                    peer.send(Message::Text(
+                        r#"{"type":"response.output_text.delta","delta":"private-output"}"#.into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                peer.send(Message::Text(
+                    r#"{"type":"response.completed","response":{"status":"completed"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                collect_ws_events(&mut client, 1_000, None, None, None, None)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        let logs = diagnostic_records(&path);
+        let logs: Vec<_> = logs
+            .into_iter()
+            .filter(|r| r["msg"] != "websocket_phase")
+            .collect();
+        assert_eq!(
+            logs.len(),
+            2,
+            "only first response and terminal should be emitted"
+        );
+        assert_eq!(logs[0]["msg"], "websocket_first_response");
+        assert_eq!(logs[1]["msg"], "websocket_terminal");
+        assert_eq!(logs[1]["fields"]["eventCount"], 22);
+        assert_eq!(logs[1]["fields"]["status"], 200);
+        assert!(
+            !logs
+                .iter()
+                .any(|log| log.to_string().contains("private-output"))
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_diagnostics_preserves_close_code_and_sanitizes_reason() {
+        for live in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let settings = diagnostics_settings(temp.path());
+            let path = settings.clone().sync_scope(crate::logging::log_file);
+            settings.scope(async {
+                let (io, peer) = tokio::io::duplex(1024);
+                let mut client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+                let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+                peer.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    reason: "policy\nclosed".into(),
+                }))).await.unwrap();
+                if live {
+                    let (tx, rx) = mpsc::channel(64);
+                    let (_stream, publisher) = CodexWebSocketEventStream::pending(rx);
+                    let (reusable, terminal) = stream_ws_events(&mut client, 1_000, None, &publisher.sender(tx), None).await;
+                    assert!(!reusable);
+                    assert!(terminal.unwrap().is_err());
+                } else {
+                    assert!(collect_ws_events(&mut client, 1_000, None, None, None, None).await.unwrap_err().detail.as_deref() == Some(WEBSOCKET_MISSING_TERMINAL_DETAIL));
+                }
+            }).await;
+            let logs = diagnostic_records(&path);
+            let close = logs
+                .iter()
+                .find(|log| log["msg"] == "websocket_close")
+                .expect("close metadata missing");
+            assert_eq!(close["fields"]["closeCode"], 1008);
+            assert_eq!(close["fields"]["closeReason"], "policyclosed");
+            assert_eq!(close["fields"]["terminalSeen"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_diagnostics_names_timeout_phase_and_wait() {
+        for (started, phase) in [(false, "response_start"), (true, "response_idle")] {
+            let temp = tempfile::tempdir().unwrap();
+            let settings = diagnostics_settings(temp.path());
+            let path = settings.clone().sync_scope(crate::logging::log_file);
+            settings
+                .scope(async {
+                    let (io, peer) = tokio::io::duplex(1024);
+                    let mut client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+                    let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+                    if started {
+                        peer.send(Message::Text(r#"{"type":"response.created"}"#.into()))
+                            .await
+                            .unwrap();
+                    }
+                    assert!(
+                        collect_ws_events(&mut client, 20, None, None, None, None)
+                            .await
+                            .is_err()
+                    );
+                })
+                .await;
+            let logs = diagnostic_records(&path);
+            let timeout = logs
+                .iter()
+                .find(|log| log["msg"] == "websocket_timeout")
+                .expect("timeout metadata missing");
+            assert_eq!(timeout["fields"]["phase"], phase);
+            assert!(timeout["fields"]["waitedMs"].as_u64().unwrap() >= 10);
+            assert_eq!(timeout["fields"]["timeoutMs"], 20);
+        }
+    }
+
     #[test]
     fn provider_retry_handoff_is_attempt_local() {
         let (_tx_a, rx_a) = mpsc::channel(1);
@@ -2433,6 +3115,130 @@ mod tests {
         stream_a.mark_provider_retry_handoff();
         assert!(publisher_a.is_provider_retry_handoff());
         assert!(!publisher_b.is_provider_retry_handoff());
+    }
+
+    #[tokio::test]
+    async fn idle_reader_answers_ping_and_isolates_metadata_between_turns() {
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("idle-reader");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+        let (pong_tx, pong_rx) = tokio::sync::oneshot::channel();
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (io, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(io).await.unwrap();
+            assert!(matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+            ws.send(Message::Text(
+                serde_json::json!({"type":"response.completed","response":{"id":"first"}})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            idle_rx.await.unwrap();
+            ws.send(Message::Text(
+                serde_json::json!({"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":99}}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            // Pong acknowledges the preceding idle metadata before the next create.
+            ws.send(Message::Ping(vec![1, 2, 3])).await.unwrap();
+            assert!(matches!(ws.next().await, Some(Ok(Message::Pong(p))) if p == [1,2,3]));
+            pong_tx.send(()).unwrap();
+            assert!(matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+            ws.send(Message::Text(
+                serde_json::json!({"type":"response.completed","response":{"id":"second"}})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            close_rx.await.unwrap();
+            ws.close(None).await.unwrap();
+        });
+        let request = continuation_request();
+        let context = RequestContext {
+            req_id: "idle-test".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".into(),
+            traffic: None,
+            monitor: None,
+        };
+        let reservation =
+            super::super::continuation::reserve_owner_request(Some(&owner), &request, false, true);
+        let mut events = codex_websocket_event_stream(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &endpoint,
+            &HeaderMap::new(),
+            &serde_json::json!({"type":"response.create","input":[]}),
+            &context,
+            None,
+            1_000,
+            1_000,
+            Some(&reservation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().unwrap()["type"],
+            "response.completed"
+        );
+        let socket_id = events.socket_id();
+        events.accept_terminal();
+        idle_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), pong_rx)
+            .await
+            .expect("idle Ping must be answered before next create")
+            .unwrap();
+        let reservation =
+            super::super::continuation::reserve_owner_request(Some(&owner), &request, false, true);
+        let mut events = codex_websocket_event_stream(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &endpoint,
+            &HeaderMap::new(),
+            &serde_json::json!({"type":"response.create","input":[]}),
+            &context,
+            None,
+            1_000,
+            1_000,
+            Some(&reservation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().unwrap()["type"],
+            "response.completed"
+        );
+        assert_eq!(events.socket_id(), socket_id);
+        events.accept_terminal();
+        close_tx.send(()).unwrap();
+        peer.await.unwrap();
+        // Let the persistent reader consume the Close, without a new request/probe.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if WS_POOL
+                    .lock()
+                    .unwrap()
+                    .get(&owner)
+                    .is_none_or(|entry| entry.connection.is_closed())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            pool_take_for_turn(&reservation).is_none(),
+            "closed socket must not be handed out"
+        );
+        invalidate_codex_websocket_pool_owner(&owner);
     }
 
     fn main_owner(session_id: &str) -> ConversationIdentity {
@@ -2589,23 +3395,239 @@ mod tests {
         WebSocketStream::from_raw_socket(io, Role::Client, None).await
     }
 
-    fn shared_pool_entry(ws: &Arc<AsyncMutex<CodexWebSocketStream>>) -> Arc<PoolEntry> {
+    fn shared_pool_entry(ws: &ConnectionHandle) -> Arc<PoolEntry> {
         Arc::new(PoolEntry {
-            ws: ws.clone(),
+            compatibility: None,
+            published_turn: AtomicU64::new(0),
+            connection: ws.clone(),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
-            created_at: now_ms(),
+            created_at: tokio::time::Instant::now(),
+            idle_since: Mutex::new(tokio::time::Instant::now()),
             last_activity: AtomicU64::new(next_pool_activity()),
         })
     }
 
     #[tokio::test]
-    async fn connect_cleanup_uses_threshold_target_lru_and_skips_leases() {
+    async fn pooled_peer_compatibility_rejects_auth_account_endpoint_flavor_and_client_changes() {
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = lock_codex_websocket_pool_for_tests().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let (capture_tx, mut captures) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut peers = tokio::task::JoinSet::new();
+            let mut ordinal = 0;
+            loop {
+                let (io, _) = listener.accept().await.unwrap();
+                ordinal += 1;
+                let capture = capture_tx.clone();
+                peers.spawn(async move {
+                    let mut peer = tokio_tungstenite::accept_async(io).await.unwrap();
+                    while let Some(Ok(frame)) = peer.next().await {
+                        match frame {
+                            Message::Ping(data) => { if peer.send(Message::Pong(data)).await.is_err() { break; } },
+                            Message::Text(text) => {
+                                let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                                assert!(body.get("previous_response_id").is_none());
+                                capture.send(ordinal).unwrap();
+                                peer.send(Message::Text(serde_json::json!({"type":"response.completed","response":{"id":"ok","status":"completed"}}).to_string())).await.unwrap();
+                            },
+                            _ => break,
+                        }
+                    }
+                });
+            }
+        });
+        let owner = main_owner("compatibility-matrix");
+        let request = continuation_request();
+        let context = RequestContext {
+            req_id: "compatibility".into(),
+            session_id: Some("compatibility-matrix".into()),
+            session_seq: None,
+            provider: "codex".into(),
+            traffic: None,
+            monitor: None,
+        };
+        let client = test_websocket_client();
+        let mut config = WebSocketProxyConfig::new(None, None, None, None);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer revision-one".parse().unwrap());
+        headers.insert("chatgpt-account-id", "account-one".parse().unwrap());
+        let mut url = endpoint.clone();
+        let mut previous_socket = 0;
+        for change in [
+            "initial", "same", "auth", "account", "endpoint", "flavor", "client",
+        ] {
+            match change {
+                "auth" => {
+                    headers.insert("authorization", "Bearer revision-two".parse().unwrap());
+                }
+                "account" => {
+                    headers.insert("chatgpt-account-id", "account-two".parse().unwrap());
+                }
+                "endpoint" => {
+                    url = format!("{endpoint}?route=other");
+                }
+                "flavor" => {
+                    headers.insert(
+                        "x-openai-internal-codex-responses-lite",
+                        "true".parse().unwrap(),
+                    );
+                }
+                "client" => {
+                    config = WebSocketProxyConfig::new(None, None, None, None);
+                }
+                _ => {}
+            }
+            let reservation = super::super::continuation::reserve_owner_request(
+                Some(&owner),
+                &request,
+                false,
+                true,
+            );
+            codex_websocket_request(&client, &config, &url, &headers, &serde_json::json!({"type":"response.create","model":request.model,"input":request.input}), &context, None, 15_000, 300_000, Some(&reservation)).await.unwrap();
+            let socket = captures.recv().await.unwrap();
+            if change == "same" {
+                assert_eq!(socket, previous_socket);
+            } else {
+                assert_ne!(
+                    socket, previous_socket,
+                    "{change} must not reuse incompatible provenance"
+                );
+            }
+            previous_socket = socket;
+        }
+        invalidate_codex_websocket_pool_owner(&owner);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn dropped_consumer_interrupts_partial_request_write() {
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("partial-write-cancellation");
+        let request = continuation_request();
+        let reservation =
+            super::super::continuation::reserve_owner_request(Some(&owner), &request, false, true);
+        let (io, mut peer) = tokio::io::duplex(1);
+        let io: BoxedWebSocketIo = Box::new(io);
+        let websocket = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+        let entry = Arc::new(PoolEntry::new(websocket));
+        let ready = ReadyWebSocket {
+            ws_url: "ws://local-duplex".into(),
+            entry,
+            used_pooled: false,
+            reservation: Some(reservation.clone()),
+            traffic: None,
+            idle_timeout_ms: 300_000,
+            diagnostics: WsDiagnostics::new(None, &HeaderMap::new(), None),
+        };
+        let body = serde_json::json!({"type":"response.create","input":"x".repeat(4096)});
+        let events = start_codex_websocket_events(
+            ready,
+            &body,
+            body.to_string(),
+            &HeaderMap::new(),
+            Some(&reservation),
+        );
+        let mut first_byte = [0];
+        peer.read_exact(&mut first_byte).await.unwrap();
+        drop(events);
+        let mut remainder = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut remainder))
+            .await
+            .expect("consumer cancellation must drop a partially written socket immediately")
+            .unwrap();
+        assert!(pooled_socket_id_for_tests(&owner).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_pong_write_terminates_buffered_and_live_attempts() {
+        for live in [false, true] {
+            let (io, peer) = tokio::io::duplex(64);
+            let mut client = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+            let reader = tokio::spawn(async move {
+                if live {
+                    let (tx, rx) = mpsc::channel(64);
+                    let (_stream, publisher) = CodexWebSocketEventStream::pending(rx);
+                    let tx = publisher.sender(tx);
+                    let (reusable, terminal) =
+                        stream_ws_events(&mut client, 300_000, None, &tx, None).await;
+                    assert!(!reusable);
+                    terminal.is_some_and(|item| item.is_err())
+                } else {
+                    collect_ws_events(&mut client, 300_000, None, None, None, None)
+                        .await
+                        .is_err()
+                }
+            });
+            peer.send(Message::Ping(vec![1; 125])).await.unwrap();
+            let explicit_failure = tokio::time::timeout(Duration::from_secs(11), reader)
+                .await
+                .expect(
+                    "Pong write timeout must terminate the attempt rather than resume a 300s read",
+                )
+                .unwrap();
+            assert!(
+                explicit_failure,
+                "failed Pong write must be an explicit failure, not EOF compatibility"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_request_write_is_bounded_and_never_retryable() {
+        let (io, _unread_peer) = tokio::io::duplex(1);
+        let mut websocket = WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+        let error = write_request(&mut websocket, "request".repeat(1024))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_AMBIGUOUS_WRITE_DETAIL)
+        );
+        assert!(!super::super::retryable_live_start_codex_error(&error));
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_cleanup_preserves_same_socket_republished_by_new_turn() {
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("same-socket-new-turn");
+        let request = continuation_request();
+        let first =
+            super::super::continuation::reserve_owner_request(Some(&owner), &request, false, true);
+        let entry = Arc::new(PoolEntry::new(raw_test_stream(None).await));
+        assert!(pool_insert_for_turn(&first, entry.clone()));
+        let (_, rx) = mpsc::channel(64);
+        let (old, publisher) = CodexWebSocketEventStream::pending(rx);
+        let old = old.track_attempt(Some(&first), true);
+        publisher.publish(Some(entry.socket_id));
+        let newer =
+            super::super::continuation::reserve_owner_request(Some(&owner), &request, false, true);
+        let checked_out = pool_take_for_turn(&newer).unwrap();
+        assert!(pool_insert_for_turn(&newer, checked_out));
+        drop(old);
+        assert_eq!(pooled_socket_id_for_tests(&owner), Some(entry.socket_id));
+        assert!(super::super::continuation::is_current_turn_for_owner(
+            &newer
+        ));
+        invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn connect_cleanup_uses_one_idle_cap_lru_and_skips_leases() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
         clear_codex_websocket_pool_for_tests();
-        let ws = Arc::new(AsyncMutex::new(raw_test_stream(None).await));
+        let ws = ConnectionHandle::new(raw_test_stream(None).await);
         {
             let mut guard = WS_POOL.lock().unwrap();
-            for index in 0..POOL_CONNECT_CLEANUP_THRESHOLD {
+            for index in 0..64 {
                 guard.insert(
                     main_owner(&format!("entry-{index:02}")),
                     shared_pool_entry(&ws),
@@ -2614,15 +3636,16 @@ mod tests {
         }
 
         cleanup_pool_before_connect();
-        assert_eq!(
-            WS_POOL.lock().unwrap().len(),
-            POOL_CONNECT_CLEANUP_THRESHOLD
-        );
+        assert_eq!(WS_POOL.lock().unwrap().len(), 64);
 
         WS_POOL
             .lock()
             .unwrap()
-            .insert(main_owner("entry-50"), shared_pool_entry(&ws));
+            .insert(main_owner("entry-64"), shared_pool_entry(&ws));
+        WS_POOL
+            .lock()
+            .unwrap()
+            .insert(main_owner("entry-65"), shared_pool_entry(&ws));
         WS_POOL
             .lock()
             .unwrap()
@@ -2639,14 +3662,12 @@ mod tests {
         cleanup_pool_before_connect();
 
         let guard = WS_POOL.lock().unwrap();
-        assert_eq!(guard.len(), POOL_CONNECT_CLEANUP_TARGET);
+        assert_eq!(guard.len(), 65); // 64 idle entries plus one active lease.
         assert!(guard.contains_key(&main_owner("entry-00")));
         assert!(guard.contains_key(&main_owner("entry-01")));
-        for index in 2..=12 {
-            assert!(!guard.contains_key(&main_owner(&format!("entry-{index:02}"))));
-        }
-        assert!(guard.contains_key(&main_owner("entry-13")));
-        assert!(guard.contains_key(&main_owner("entry-50")));
+        assert!(!guard.contains_key(&main_owner("entry-02")));
+        assert!(guard.contains_key(&main_owner("entry-03")));
+        assert!(guard.contains_key(&main_owner("entry-65")));
         drop(guard);
         drop(leased);
         clear_codex_websocket_pool_for_tests();
@@ -2658,7 +3679,7 @@ mod tests {
         clear_codex_websocket_pool_for_tests();
         let dropped = Arc::new(AtomicBool::new(false));
         let pool_was_unlocked = Arc::new(AtomicBool::new(false));
-        let shared_ws = Arc::new(AsyncMutex::new(raw_test_stream(None).await));
+        let shared_ws = ConnectionHandle::new(raw_test_stream(None).await);
         let probe_stream =
             raw_test_stream(Some((dropped.clone(), pool_was_unlocked.clone()))).await;
         {
@@ -2667,7 +3688,7 @@ mod tests {
                 main_owner("entry-00"),
                 Arc::new(PoolEntry::new(probe_stream)),
             );
-            for index in 1..=POOL_CONNECT_CLEANUP_THRESHOLD {
+            for index in 1..=64 {
                 guard.insert(
                     main_owner(&format!("entry-{index:02}")),
                     shared_pool_entry(&shared_ws),
@@ -2677,9 +3698,119 @@ mod tests {
 
         cleanup_pool_before_connect();
 
-        assert!(dropped.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eviction must end the reader and drop its socket");
         assert!(pool_was_unlocked.load(Ordering::SeqCst));
         clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn pool_fake_clock_distinguishes_true_idle_from_absolute_age_and_leases() {
+        let ws = ConnectionHandle::new(raw_test_stream(None).await);
+        let policy = crate::config::CodexCachePolicy::default();
+        let fresh_idle = shared_pool_entry(&ws);
+        let expired_idle = shared_pool_entry(&ws);
+        let active = shared_pool_entry(&ws);
+        let now = tokio::time::Instant::now();
+        let mut pool = HashMap::new();
+        pool.insert(main_owner("fresh"), fresh_idle);
+        pool.insert(main_owner("expired"), expired_idle);
+        pool.insert(main_owner("active"), active.clone());
+        *pool
+            .get(&main_owner("fresh"))
+            .unwrap()
+            .idle_since
+            .lock()
+            .unwrap() = now + Duration::from_secs(299);
+        assert!(maintain_pool_at(&mut pool, policy, now + Duration::from_secs(299)).is_empty());
+        drop(maintain_pool_at(
+            &mut pool,
+            policy,
+            now + Duration::from_secs(300),
+        ));
+        assert!(pool.contains_key(&main_owner("fresh")));
+        assert!(!pool.contains_key(&main_owner("expired")));
+        assert!(pool.contains_key(&main_owner("active")));
+        *pool
+            .get(&main_owner("fresh"))
+            .unwrap()
+            .idle_since
+            .lock()
+            .unwrap() = now + Duration::from_secs(1799);
+        drop(maintain_pool_at(
+            &mut pool,
+            policy,
+            now + Duration::from_secs(1800),
+        ));
+        assert!(
+            !pool.contains_key(&main_owner("fresh")),
+            "use never extends absolute age"
+        );
+        assert!(pool.contains_key(&main_owner("active")));
+        drop(active);
+        drop(maintain_pool_at(
+            &mut pool,
+            policy,
+            now + Duration::from_secs(1800),
+        ));
+        assert!(pool.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkout_expires_idle_origin_and_insertion_refreshes_idle_but_not_age() {
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let request = continuation_request();
+        let owner = main_owner("clock-checkout");
+        let reservation =
+            super::super::continuation::reserve_owner_request(Some(&owner), &request, false, true);
+        let entry = Arc::new(PoolEntry::new(raw_test_stream(None).await));
+        assert!(pool_insert_for_turn(&reservation, entry));
+        tokio::time::advance(Duration::from_secs(299)).await;
+        let reused = pool_take_for_turn(&reservation).expect("before true idle expiry");
+        assert!(pool_insert_for_turn(&reservation, reused));
+        tokio::time::advance(Duration::from_secs(299)).await;
+        let reused = pool_take_for_turn(&reservation).expect("reinsertion must reset idle age");
+        assert!(pool_insert_for_turn(&reservation, reused));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert!(pool_take_for_turn(&reservation).is_none());
+
+        let mut entry = Arc::new(PoolEntry::new(raw_test_stream(None).await));
+        Arc::get_mut(&mut entry).unwrap().created_at =
+            tokio::time::Instant::now() - Duration::from_secs(1800);
+        assert!(
+            !pool_insert_for_turn(&reservation, entry),
+            "an expired leased origin must not be reinserted"
+        );
+        assert!(pooled_socket_id_for_tests(&owner).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insertion_expires_other_idle_entries_and_enforces_cap_immediately() {
+        let _pool = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let ws = ConnectionHandle::new(raw_test_stream(None).await);
+        pool_insert(main_owner("expired"), shared_pool_entry(&ws));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        pool_insert(main_owner("new"), shared_pool_entry(&ws));
+        assert!(pooled_socket_id_for_tests(&main_owner("expired")).is_none());
+        for index in 0..64 {
+            pool_insert(
+                main_owner(&format!("insert-{index}")),
+                shared_pool_entry(&ws),
+            );
+        }
+        let pool = WS_POOL.lock().unwrap();
+        assert_eq!(pool.len(), 64);
+        assert!(!pool.contains_key(&main_owner("new")));
+        assert!(pool.contains_key(&main_owner("insert-63")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3227,6 +4358,7 @@ mod tests {
 
     #[test]
     fn websocket_metadata_does_not_serialize_typed_owner() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = tempfile::tempdir().unwrap();
         let traffic = crate::traffic::test_capture(temp.path().join("traffic"));
         let owner = agent_owner("session-secret", "agent-secret");
@@ -3239,6 +4371,10 @@ mod tests {
             false,
         );
 
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
         let artifact = std::fs::read_dir(traffic.root())
             .unwrap()
             .next()
@@ -3275,60 +4411,6 @@ mod tests {
             &replacement
         ));
         clear_codex_websocket_pool_for_tests();
-    }
-
-    #[tokio::test]
-    async fn pooled_validation_uses_unique_nonce_and_rejects_stale_pong() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (queue_stale_tx, queue_stale_rx) = tokio::sync::oneshot::channel();
-        let (stale_queued_tx, stale_queued_rx) = tokio::sync::oneshot::channel();
-        let (release_peer_tx, release_peer_rx) = tokio::sync::oneshot::channel();
-        let peer = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            let prior_nonce = match websocket.next().await {
-                Some(Ok(Message::Ping(payload))) => payload,
-                other => panic!("unexpected first validation frame: {other:?}"),
-            };
-            assert_eq!(prior_nonce.len(), std::mem::size_of::<u64>());
-            assert_ne!(prior_nonce, 0_u64.to_be_bytes());
-            websocket
-                .send(Message::Pong(prior_nonce.clone()))
-                .await
-                .unwrap();
-
-            queue_stale_rx.await.unwrap();
-            websocket
-                .send(Message::Pong(prior_nonce.clone()))
-                .await
-                .unwrap();
-            stale_queued_tx.send(()).unwrap();
-
-            let current_nonce = match websocket.next().await {
-                Some(Ok(Message::Ping(payload))) => payload,
-                other => panic!("unexpected second validation frame: {other:?}"),
-            };
-            assert_ne!(current_nonce, prior_nonce);
-            assert_ne!(current_nonce, 0_u64.to_be_bytes());
-            release_peer_rx.await.unwrap();
-        });
-        let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
-            .await
-            .unwrap();
-
-        validate_pooled_websocket(&mut websocket, 1_000)
-            .await
-            .unwrap();
-        queue_stale_tx.send(()).unwrap();
-        stale_queued_rx.await.unwrap();
-        let error = validate_pooled_websocket(&mut websocket, 100)
-            .await
-            .unwrap_err();
-        assert_eq!(error, "unexpected Pong during pooled validation");
-
-        release_peer_tx.send(()).unwrap();
-        peer.await.unwrap();
     }
 
     #[tokio::test]
@@ -3369,6 +4451,7 @@ mod tests {
             "ws://127.0.0.1:9/responses",
             &HeaderMap::new(),
             None,
+            None,
             Some(&continuation),
             50,
             50,
@@ -3408,7 +4491,15 @@ mod tests {
             &request,
             true,
         );
-        let exact = Arc::new(PoolEntry::new(raw_test_stream(None).await));
+        let (io, peer) = tokio::io::duplex(1024);
+        drop(peer);
+        let io: BoxedWebSocketIo = Box::new(io);
+        let exact = Arc::new(PoolEntry::new(
+            WebSocketStream::from_raw_socket(io, Role::Client, None).await,
+        ));
+        while !exact.connection.is_closed() {
+            tokio::task::yield_now().await;
+        }
         let replacement = Arc::new(PoolEntry::new(raw_test_stream(None).await));
         pool_insert(owner.clone(), exact.clone());
         let continuation = test_continuation(
@@ -3437,6 +4528,7 @@ mod tests {
             &WebSocketProxyConfig::direct(),
             "ws://127.0.0.1:9/responses",
             &HeaderMap::new(),
+            None,
             None,
             Some(&continuation),
             50,
@@ -3486,6 +4578,24 @@ mod tests {
 
     #[tokio::test]
     async fn completed_terminal_is_published_after_origin_returns_to_pool() {
+        assert_terminal_pool_contract("response.completed", "completed", true).await;
+    }
+
+    #[tokio::test]
+    async fn done_success_reuses_origin_socket() {
+        assert_terminal_pool_contract("response.done", "completed", true).await;
+    }
+
+    #[tokio::test]
+    async fn completed_failed_status_never_reuses_socket() {
+        assert_terminal_pool_contract("response.completed", "failed", false).await;
+    }
+
+    async fn assert_terminal_pool_contract(
+        event_type: &'static str,
+        status: &'static str,
+        reusable: bool,
+    ) {
         let _registry_guard =
             super::super::continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
@@ -3514,8 +4624,8 @@ mod tests {
                         websocket
                             .send(Message::Text(
                                 serde_json::json!({
-                                    "type": "response.completed",
-                                    "response": {"id": "resp_terminal_order"}
+                                    "type": event_type,
+                                    "response": {"id": "resp_terminal_order", "status": status}
                                 })
                                 .to_string(),
                             ))
@@ -3555,15 +4665,20 @@ mod tests {
 
         assert_eq!(
             terminal.get("type").and_then(serde_json::Value::as_str),
-            Some("response.completed")
+            Some(event_type)
         );
-        let pooled = WS_POOL
-            .lock()
-            .unwrap()
-            .get(&owner)
-            .cloned()
-            .expect("origin must be reusable before terminal publication");
-        assert_eq!(events.socket_id(), Some(pooled.socket_id));
+        let pooled = WS_POOL.lock().unwrap().get(&owner).cloned();
+        if reusable {
+            let pooled =
+                pooled.expect("successful origin must be reusable before terminal publication");
+            assert_eq!(events.socket_id(), Some(pooled.socket_id));
+        } else {
+            assert!(
+                pooled.is_none(),
+                "failed terminal must never publish reusable socket"
+            );
+            assert_eq!(events.socket_id(), None);
+        }
         server.await.unwrap();
 
         invalidate_codex_websocket_pool_owner(&owner);
@@ -3623,6 +4738,7 @@ mod tests {
             &format!("http://{addr}/responses"),
             &headers,
             None,
+            None,
             Some(&continuation),
             1_000,
             1_000,
@@ -3658,6 +4774,199 @@ mod tests {
                 .is_none_or(|pooled| !Arc::ptr_eq(pooled, &exact)),
             "the exact completed socket must not remain pooled"
         );
+        super::super::continuation::abort_continuation_for_owner(&continuation);
+    }
+
+    #[tokio::test]
+    async fn dropped_receiver_after_terminal_enqueue_disposes_exact_origin() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("dropped-terminal-receiver-session");
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        invalidate_codex_websocket_pool_owner(&owner);
+        let request = continuation_request();
+        let continuation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_response_tx, release_response_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = websocket.next().await {
+                match message {
+                    Message::Ping(payload) => {
+                        websocket.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Message::Text(_) => {
+                        request_seen_tx.send(()).unwrap();
+                        release_response_rx.await.unwrap();
+                        websocket
+                            .send(Message::Text(
+                                serde_json::json!({
+                                    "type": "response.completed",
+                                    "response": {"id": "resp_dropped_receiver"}
+                                })
+                                .to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({"type":"response.create","input":[]});
+        let ready = prepare_codex_websocket(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("http://{addr}/responses"),
+            &headers,
+            None,
+            None,
+            Some(&continuation),
+            1_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+        let exact = ready.entry.clone();
+        let mut events = start_codex_websocket_events(
+            ready,
+            &body,
+            serde_json::to_string(&body).unwrap(),
+            &headers,
+            Some(&continuation),
+        );
+
+        request_seen_rx.await.unwrap();
+        release_response_tx.send(()).unwrap();
+        assert!(events.recv().await.unwrap().is_ok());
+        assert!(pooled_socket_id_for_tests(&owner).is_some());
+        drop(events);
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&exact) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed terminal publication must release the exact completed pool entry");
+
+        assert!(
+            WS_POOL
+                .lock()
+                .unwrap()
+                .get(&owner)
+                .is_none_or(|pooled| !Arc::ptr_eq(pooled, &exact)),
+            "the exact completed socket must not remain pooled"
+        );
+        super::super::continuation::abort_continuation_for_owner(&continuation);
+    }
+
+    #[tokio::test]
+    async fn terminal_capacity_is_reserved_before_pool_publication() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("dropped-terminal-receiver-session");
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        invalidate_codex_websocket_pool_owner(&owner);
+        let request = continuation_request();
+        let continuation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_response_tx, release_response_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = websocket.next().await {
+                match message {
+                    Message::Ping(payload) => {
+                        websocket.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Message::Text(_) => {
+                        request_seen_tx.send(()).unwrap();
+                        release_response_rx.await.unwrap();
+                        for _ in 0..64 {
+                            websocket.send(Message::Text(serde_json::json!({"type":"response.output_text.delta","delta":"x"}).to_string())).await.unwrap();
+                        }
+                        websocket
+                            .send(Message::Text(
+                                serde_json::json!({
+                                    "type": "response.completed",
+                                    "response": {"id": "resp_dropped_receiver"}
+                                })
+                                .to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({"type":"response.create","input":[]});
+        let ready = prepare_codex_websocket(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("http://{addr}/responses"),
+            &headers,
+            None,
+            None,
+            Some(&continuation),
+            1_000,
+            1_000,
+        )
+        .await
+        .unwrap();
+        let exact = ready.entry.clone();
+        let events = start_codex_websocket_events(
+            ready,
+            &body,
+            serde_json::to_string(&body).unwrap(),
+            &headers,
+            Some(&continuation),
+        );
+
+        request_seen_rx.await.unwrap();
+        release_response_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while events.receiver.len() < 64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            pooled_socket_id_for_tests(&owner).is_none(),
+            "full delivery queue must not publish an idle socket"
+        );
+        drop(events);
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&exact) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pooled_socket_id_for_tests(&owner).is_none());
+        invalidate_codex_websocket_pool_owner(&owner);
         super::super::continuation::abort_continuation_for_owner(&continuation);
     }
 
@@ -4096,7 +5405,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 1_000, Some(&owner), None, None).await {
+        let err = match collect_ws_events(&mut ws, 1_000, Some(&owner), None, None, None).await {
             Ok(_) => panic!("expected binary frame to fail"),
             Err(err) => err,
         };
@@ -4137,7 +5446,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None).await {
+        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None, None).await {
             Ok(_) => panic!("expected response start timeout"),
             Err(err) => err,
         };
@@ -4182,7 +5491,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None).await {
+        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None, None).await {
             Ok(_) => panic!("expected response idle timeout"),
             Err(err) => err,
         };
@@ -4232,6 +5541,7 @@ mod tests {
             None,
             None,
             WEBSOCKET_KEEPALIVE_INTERVAL,
+            None,
         )
         .await
         {
@@ -4271,6 +5581,7 @@ mod tests {
             None,
             None,
             Duration::from_millis(10),
+            None,
         )
         .await
         {

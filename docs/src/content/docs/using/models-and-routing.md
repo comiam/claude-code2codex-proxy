@@ -3,7 +3,7 @@ title: Models and routing
 description: Understand provider model patterns, aliases, Codex fast mode, context hints, small models, model listing, and Claude Code gateway discovery.
 ---
 
-The model ID in each request selects its provider. One proxy listener can serve every provider through Anthropic Messages and the enabled OpenAI-compatible routes.
+The model ID in each request selects its provider. This fork supports compatibility only with Codex; other providers are available without guarantees and at your own risk.
 
 ## Routing patterns
 
@@ -41,7 +41,33 @@ Every registered Codex model also has a local `-fast` form. The proxy removes `-
 
 Models that offer the ultrafast tier also have a local `-ultrafast` form, which requests the ultrafast service tier. Today those are `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast`. An `-ultrafast` name on any other model is not a registered ID.
 
-For Claude Code requests on `/v1/messages`, a configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override wins over both suffixes. When the forced tier is `ultrafast` and the model does not offer it, the proxy requests priority instead.
+Without a `/proxy-speed` session override, Claude Code requests on `/v1/messages` use a configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override ahead of both suffixes. When the configured tier is `ultrafast` and the model does not offer it, the proxy requests priority instead.
+
+### Per-session `/proxy-speed`
+
+Install the supplied [Claude Code command](configure-claude-code.md#install-the-proxy-speed-command) to select a tier without changing the model or reasoning effort:
+
+```text
+/proxy-speed off
+/proxy-speed fast
+/proxy-speed ultrafast
+```
+
+| Command | Ordinary Codex Messages generation |
+| --- | --- |
+| `off` | Omits `service_tier`, even when a global setting or model suffix requests acceleration. |
+| `fast` | Sends the literal `service_tier: "fast"`. |
+| `ultrafast` | Sends the literal `service_tier: "ultrafast"`. |
+
+These explicit session choices take precedence over global tier settings and model suffixes. Unlike the `-fast` suffix, the command sends `fast` rather than `priority`. The command does not check the local tier-capability catalog or silently downgrade the requested mode. The API decides whether to accept the value; a rejection is not retried at another tier.
+
+The proxy confirms that the preference was saved locally. This is not confirmation of API support or measured acceleration, and the control request itself does not call Codex. The new value applies to subsequently accepted generation requests; an already-running request and its retries retain their captured value.
+
+The preference belongs to the current session, including agent requests carrying that session ID. Only the main conversation can change it. Other sessions, other providers, and the native Responses and Chat Completions routes are unaffected. Both full Responses and Responses Lite ordinary generations forward the selected tier, including `gpt-6.1-sol`. The command does not control standalone search or compaction.
+
+Preferences are in memory and expire after 30 minutes idle, on capacity eviction, or when the proxy restarts. Historical control messages do not restore them. Without a session choice, global settings and suffixes determine the tier; explicit `off` suppresses them only while its session preference exists. A tier change can require full context on the next request.
+
+This is a custom proxy command, not Claude Code's built-in `/fast` toggle.
 
 ## The `[1m]` hint
 

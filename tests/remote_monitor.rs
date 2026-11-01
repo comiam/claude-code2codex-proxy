@@ -173,6 +173,52 @@ async fn independent_dashboards_observe_existing_history_and_detach_without_stop
     );
 }
 
+#[tokio::test]
+async fn remote_snapshot_preserves_provenance_and_body_delivery_boundaries() {
+    use claude_code_proxy::monitor::{DeliveryEvent, TokenObservation, UsageObservation};
+    let monitor = MonitorHandle::default();
+    monitor.request_started("typed", None, None, EndpointKind::Messages);
+    monitor.typed_progress(
+        "typed",
+        10,
+        2,
+        UsageObservation {
+            input_tokens: Some(TokenObservation::estimated(321)),
+            ..Default::default()
+        },
+    );
+    monitor.delivery("typed", DeliveryEvent::ResponseReady);
+    monitor.delivery("typed", DeliveryEvent::BodyYield { bytes: 4 });
+    monitor.typed_progress(
+        "typed",
+        20,
+        2,
+        UsageObservation {
+            input_tokens: Some(TokenObservation::provider(300)),
+            cached_input_tokens: Some(240),
+            output_tokens: Some(TokenObservation::provider(30)),
+            ..Default::default()
+        },
+    );
+    monitor.delivery("typed", DeliveryEvent::BodyFinished);
+    monitor.request_completed("typed", 200, None, None);
+    let server = serve(app(Some(monitor))).await;
+    let remote = RemoteMonitor::connect(client(), server.url.clone())
+        .await
+        .unwrap();
+    let state = remote.snapshot();
+    let done = &state.snapshot().recent[0];
+    assert_eq!(done.input_tokens, Some(300));
+    assert_eq!(done.usage.cached_input_tokens, Some(240));
+    assert_eq!(state.snapshot().sessions[0].cached_input_tokens, Some(240));
+    assert_eq!(done.output_token_basis.as_deref(), Some("provider-total"));
+    assert_eq!(done.usage.reasoning_tokens, None);
+    assert_eq!(done.delivery.yielded_bytes, 4);
+    assert!(done.delivery.response_ready_at.is_some());
+    assert!(done.delivery.body_finished_at.is_some());
+    assert!(done.delivery.body_cancelled_at.is_none());
+}
+
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(4), async {
         while !predicate() {

@@ -829,6 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_downstream_body_finalizes_partial_capture() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = TempDir::new().unwrap();
         let traffic = Arc::new(test_capture(temp.path().join("traffic")));
         let (tx, rx) = mpsc::channel(2);
@@ -851,6 +852,10 @@ mod tests {
         let _ = body.frame().await.unwrap().unwrap();
         drop(body);
 
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
         let entries: Vec<_> = std::fs::read_dir(temp.path().join("traffic"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -877,6 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_capture_writes_redacted_complete_artifacts() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = TempDir::new().unwrap();
         let traffic = Arc::new(test_capture(temp.path().join("traffic")));
         let upstream = futures_util::stream::iter(vec![Ok(Bytes::from_static(
@@ -893,6 +899,10 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("tool_use"));
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
         let names: Vec<_> = std::fs::read_dir(temp.path().join("traffic"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -911,6 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_capture_records_fragmented_search_and_tool_events() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = TempDir::new().unwrap();
         let traffic = Arc::new(test_capture(temp.path().join("traffic")));
         let upstream = futures_util::stream::iter(vec![
@@ -932,7 +943,7 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("tool_use"));
-        let captured = capture_contents(temp.path().join("traffic"));
+        let captured = capture_contents(temp.path().join("traffic"), writer);
         assert!(captured.contains("x_search"));
         assert!(captured.contains("function_call"));
         assert!(captured.contains("stream_completion"));
@@ -947,6 +958,7 @@ mod tests {
                 "reducer",
             ),
         ] {
+            let writer = crate::logging::writer::pause_for_fixture();
             let temp = TempDir::new().unwrap();
             let traffic = Arc::new(test_capture(temp.path().join("traffic")));
             let response = stream_body(
@@ -960,7 +972,7 @@ mod tests {
             );
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert!(String::from_utf8_lossy(&body).contains("event: error"));
-            let captured = capture_contents(temp.path().join("traffic"));
+            let captured = capture_contents(temp.path().join("traffic"), writer);
             assert!(captured.contains(&format!("\"stage\": \"{stage}\"")));
             assert!(captured.contains("stream_error"));
         }
@@ -968,6 +980,7 @@ mod tests {
 
     #[test]
     fn non_streaming_malformed_capture_keeps_diagnostics() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = TempDir::new().unwrap();
         let traffic = test_capture(temp.path().join("traffic"));
         assert!(
@@ -979,17 +992,18 @@ mod tests {
             )
             .is_err()
         );
-        let captured = capture_contents(temp.path().join("traffic"));
+        let captured = capture_contents(temp.path().join("traffic"), writer);
         assert!(captured.contains("malformed_event"));
         assert!(captured.contains("\"outcome\": \"error\""));
     }
 
     #[test]
     fn transport_failure_capture_contains_no_credentials() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = TempDir::new().unwrap();
         let traffic = test_capture(temp.path().join("traffic"));
         client::capture_failure(Some(&traffic), "transport", "transport", 1);
-        let captured = capture_contents(temp.path().join("traffic"));
+        let captured = capture_contents(temp.path().join("traffic"), writer);
         assert!(captured.contains("transport"));
         for secret in [
             "Bearer token",
@@ -1001,7 +1015,14 @@ mod tests {
         }
     }
 
-    fn capture_contents(root: std::path::PathBuf) -> String {
+    fn capture_contents(
+        root: std::path::PathBuf,
+        writer: crate::logging::writer::FixtureWriterPause,
+    ) -> String {
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
         let mut captured = String::new();
         let mut pending = vec![root];
         while let Some(path) = pending.pop() {
@@ -1019,12 +1040,17 @@ mod tests {
 
     #[test]
     fn non_streaming_capture_writes_response_and_redacts_secrets() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = TempDir::new().unwrap();
         let traffic = test_capture(temp.path().join("traffic"));
         let upstream = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\",\"access_token\":\"secret\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
         let value = accumulate_response_with_traffic(upstream, "msg_1", "grok-4.5", Some(&traffic))
             .unwrap();
         traffic.write_json("051-downstream-response", &value);
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
         let mut captured = String::new();
         for entry in std::fs::read_dir(temp.path().join("traffic")).unwrap() {
             let path = entry.unwrap().path();

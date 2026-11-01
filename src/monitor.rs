@@ -19,6 +19,64 @@ const SESSION_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum UsageProvenance {
+    Estimated,
+    Provider,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TokenObservation {
+    pub tokens: u64,
+    pub provenance: UsageProvenance,
+}
+
+impl TokenObservation {
+    pub fn estimated(tokens: u64) -> Self {
+        Self {
+            tokens,
+            provenance: UsageProvenance::Estimated,
+        }
+    }
+    pub fn provider(tokens: u64) -> Self {
+        Self {
+            tokens,
+            provenance: UsageProvenance::Provider,
+        }
+    }
+}
+
+/// Cumulative provider counts. Output is the provider total, including any
+/// reasoning and tool tokens; absent breakdowns remain unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageObservation {
+    pub input_tokens: Option<TokenObservation>,
+    /// Reported cached input, included in the provider's gross input total.
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<TokenObservation>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeliveryTiming {
+    pub response_ready_at: Option<SystemTime>,
+    pub first_body_yield_at: Option<SystemTime>,
+    pub body_finished_at: Option<SystemTime>,
+    pub body_cancelled_at: Option<SystemTime>,
+    pub yielded_bytes: u64,
+    pub yielded_frames: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeliveryEvent {
+    ResponseReady,
+    BodyYield { bytes: u64 },
+    BodyFinished,
+    BodyCancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EndpointKind {
     Messages,
     CountTokens,
@@ -69,6 +127,20 @@ impl RequestStatus {
 
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
+    TypedProgress {
+        request_id: String,
+        bytes: u64,
+        events: u64,
+        usage: UsageObservation,
+    },
+    Delivery {
+        request_id: String,
+        event: DeliveryEvent,
+    },
+    StreamFailed {
+        request_id: String,
+        error: String,
+    },
     RequestStarted {
         request_id: String,
         session_id: Option<String>,
@@ -159,6 +231,8 @@ pub struct ActiveRequest {
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
+    pub usage: UsageObservation,
+    pub delivery: DeliveryTiming,
 }
 
 impl ActiveRequest {
@@ -169,6 +243,11 @@ impl ActiveRequest {
     pub fn rate(&self) -> Throughput {
         throughput(
             self.output_tokens
+                .filter(|_| {
+                    self.usage
+                        .output_tokens
+                        .is_none_or(|value| value.provenance == UsageProvenance::Provider)
+                })
                 .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens)),
             self.streamed_bytes,
             self.stream_chunks,
@@ -203,12 +282,19 @@ pub struct CompletedRequest {
     pub output_tokens: Option<u64>,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
+    pub usage: UsageObservation,
+    pub delivery: DeliveryTiming,
 }
 
 impl CompletedRequest {
     pub fn rate(&self) -> Throughput {
         throughput(
             self.output_tokens
+                .filter(|_| {
+                    self.usage
+                        .output_tokens
+                        .is_none_or(|value| value.provenance == UsageProvenance::Provider)
+                })
                 .and_then(|tokens| tokens.checked_sub(self.generation_initial_output_tokens)),
             self.streamed_bytes,
             self.stream_chunks,
@@ -238,6 +324,13 @@ impl Throughput {
             Self::None => "-".to_string(),
         }
     }
+
+    pub fn label_with_basis(&self) -> String {
+        match self {
+            Self::TokensPerSecond(value) => format!("{value:.1} provider-total tok/s"),
+            _ => self.label(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +354,7 @@ pub struct SessionSummary {
     pub effort: Option<String>,
     pub last_seen: SystemTime,
     pub input_tokens: u64,
+    pub cached_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub output_token_samples: Vec<(SystemTime, u64)>,
     rate_output_tokens: u64,
@@ -300,6 +394,7 @@ struct MonitorStore {
 #[derive(Debug)]
 struct SessionUsage {
     input_tokens: u64,
+    cached_input_tokens: Option<u64>,
     output_tokens: u64,
     last_seen: SystemTime,
 }
@@ -308,6 +403,7 @@ impl Default for SessionUsage {
     fn default() -> Self {
         Self {
             input_tokens: 0,
+            cached_input_tokens: None,
             output_tokens: 0,
             last_seen: SystemTime::now(),
         }
@@ -466,6 +562,35 @@ impl MonitorHandle {
         });
     }
 
+    pub fn typed_progress(
+        &self,
+        request_id: impl Into<String>,
+        bytes: u64,
+        events: u64,
+        usage: UsageObservation,
+    ) {
+        self.publish(MonitorEvent::TypedProgress {
+            request_id: request_id.into(),
+            bytes,
+            events,
+            usage,
+        });
+    }
+
+    pub fn delivery(&self, request_id: impl Into<String>, event: DeliveryEvent) {
+        self.publish(MonitorEvent::Delivery {
+            request_id: request_id.into(),
+            event,
+        });
+    }
+
+    pub fn stream_failed(&self, request_id: impl Into<String>, error: impl Into<String>) {
+        self.publish(MonitorEvent::StreamFailed {
+            request_id: request_id.into(),
+            error: error.into(),
+        });
+    }
+
     pub fn request_completed(
         &self,
         request_id: impl Into<String>,
@@ -505,6 +630,86 @@ impl MonitorHandle {
 impl MonitorStore {
     fn apply(&mut self, event: MonitorEvent) {
         match event {
+            MonitorEvent::TypedProgress {
+                request_id,
+                bytes,
+                events,
+                usage,
+            } => {
+                let update = if let Some(active) = self.active.get_mut(&request_id) {
+                    if bytes > 0 {
+                        active.status = RequestStatus::Streaming;
+                        if active.generation_started_instant.is_none() {
+                            active.generation_started_at = Some(SystemTime::now());
+                            active.generation_started_instant = Some(Instant::now());
+                        }
+                        active.generation_finished_at = Some(SystemTime::now());
+                        active.generation_duration = active
+                            .generation_started_instant
+                            .map(|start| start.elapsed());
+                    }
+                    active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
+                    active.stream_chunks = active.stream_chunks.saturating_add(events);
+                    let delta = apply_usage(
+                        &mut active.input_tokens,
+                        &mut active.output_tokens,
+                        &mut active.usage,
+                        usage,
+                    );
+                    Some((active.session_id.clone(), delta, None))
+                } else if let Some(done) = self
+                    .recent
+                    .iter_mut()
+                    .find(|request| request.request_id == request_id)
+                {
+                    done.streamed_bytes = done.streamed_bytes.saturating_add(bytes);
+                    done.stream_chunks = done.stream_chunks.saturating_add(events);
+                    let delta = apply_usage(
+                        &mut done.input_tokens,
+                        &mut done.output_tokens,
+                        &mut done.usage,
+                        usage,
+                    );
+                    Some((
+                        done.session_id.clone(),
+                        delta,
+                        Some(done.generation_finished_at.unwrap_or(done.finished_at)),
+                    ))
+                } else {
+                    None
+                };
+                if let Some((session, (input, output, cached), timestamp)) = update {
+                    self.record_session_usage(session.clone(), input, output, cached);
+                    if let Some(timestamp) = timestamp
+                        && output > 0
+                    {
+                        self.record_session_output(session, timestamp, output);
+                    }
+                }
+            }
+            MonitorEvent::Delivery { request_id, event } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    apply_delivery(&mut active.delivery, event);
+                } else if let Some(done) = self
+                    .recent
+                    .iter_mut()
+                    .find(|request| request.request_id == request_id)
+                {
+                    apply_delivery(&mut done.delivery, event);
+                }
+            }
+            MonitorEvent::StreamFailed { request_id, error } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.error = Some(error);
+                } else if let Some(done) = self
+                    .recent
+                    .iter_mut()
+                    .find(|request| request.request_id == request_id)
+                {
+                    done.status = RequestStatus::Failed;
+                    done.error = Some(error);
+                }
+            }
             MonitorEvent::RequestStarted {
                 request_id,
                 session_id,
@@ -536,6 +741,8 @@ impl MonitorStore {
                         output_tokens: None,
                         error: None,
                         traffic_capture_path: None,
+                        usage: UsageObservation::default(),
+                        delivery: DeliveryTiming::default(),
                     },
                 );
             }
@@ -591,7 +798,15 @@ impl MonitorStore {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.generation_started_at = Some(SystemTime::now());
                     active.generation_started_instant = Some(Instant::now());
-                    active.generation_initial_output_tokens = active.output_tokens.unwrap_or(0);
+                    active.generation_initial_output_tokens = active
+                        .output_tokens
+                        .filter(|_| {
+                            active
+                                .usage
+                                .output_tokens
+                                .is_none_or(|value| value.provenance == UsageProvenance::Provider)
+                        })
+                        .unwrap_or(0);
                     active.generation_finished_at = None;
                     active.generation_duration = None;
                 }
@@ -625,8 +840,16 @@ impl MonitorStore {
                     }
                     active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
                     active.stream_chunks = active.stream_chunks.saturating_add(chunks);
-                    let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
-                    let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
+                    let input_delta = apply_observation(
+                        &mut active.input_tokens,
+                        &mut active.usage.input_tokens,
+                        input_tokens.map(TokenObservation::provider),
+                    );
+                    let output_delta = apply_observation(
+                        &mut active.output_tokens,
+                        &mut active.usage.output_tokens,
+                        output_tokens.map(TokenObservation::provider),
+                    );
                     usage_update = Some((active.session_id.clone(), input_delta, output_delta));
                 } else if let Some(completed) = self
                     .recent
@@ -639,9 +862,16 @@ impl MonitorStore {
                     }
                     completed.streamed_bytes = completed.streamed_bytes.saturating_add(bytes);
                     completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
-                    let input_delta = update_token_count(&mut completed.input_tokens, input_tokens);
-                    let output_delta =
-                        update_token_count(&mut completed.output_tokens, output_tokens);
+                    let input_delta = apply_observation(
+                        &mut completed.input_tokens,
+                        &mut completed.usage.input_tokens,
+                        input_tokens.map(TokenObservation::provider),
+                    );
+                    let output_delta = apply_observation(
+                        &mut completed.output_tokens,
+                        &mut completed.usage.output_tokens,
+                        output_tokens.map(TokenObservation::provider),
+                    );
                     usage_update = Some((completed.session_id.clone(), input_delta, output_delta));
                     if output_delta > 0 {
                         history_update = Some((
@@ -654,7 +884,7 @@ impl MonitorStore {
                     }
                 }
                 if let Some((session_id, input_delta, output_delta)) = usage_update {
-                    self.record_session_usage(session_id, input_delta, output_delta);
+                    self.record_session_usage(session_id, input_delta, output_delta, None);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
@@ -674,8 +904,16 @@ impl MonitorStore {
                         active.generation_finished_at = Some(SystemTime::now());
                         active.generation_duration = Some(started.elapsed());
                     }
-                    let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
-                    let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
+                    let input_delta = apply_observation(
+                        &mut active.input_tokens,
+                        &mut active.usage.input_tokens,
+                        input_tokens.map(TokenObservation::provider),
+                    );
+                    let output_delta = apply_observation(
+                        &mut active.output_tokens,
+                        &mut active.usage.output_tokens,
+                        output_tokens.map(TokenObservation::provider),
+                    );
                     usage_update = Some((active.session_id.clone(), input_delta, output_delta));
                 } else if let Some(completed) = self
                     .recent
@@ -688,9 +926,16 @@ impl MonitorStore {
                         completed.generation_finished_at = Some(SystemTime::now());
                         completed.generation_duration = Some(started.elapsed());
                     }
-                    let input_delta = update_token_count(&mut completed.input_tokens, input_tokens);
-                    let output_delta =
-                        update_token_count(&mut completed.output_tokens, output_tokens);
+                    let input_delta = apply_observation(
+                        &mut completed.input_tokens,
+                        &mut completed.usage.input_tokens,
+                        input_tokens.map(TokenObservation::provider),
+                    );
+                    let output_delta = apply_observation(
+                        &mut completed.output_tokens,
+                        &mut completed.usage.output_tokens,
+                        output_tokens.map(TokenObservation::provider),
+                    );
                     usage_update = Some((completed.session_id.clone(), input_delta, output_delta));
                     if output_delta > 0 {
                         history_update = Some((
@@ -703,7 +948,7 @@ impl MonitorStore {
                     }
                 }
                 if let Some((session_id, input_delta, output_delta)) = usage_update {
-                    self.record_session_usage(session_id, input_delta, output_delta);
+                    self.record_session_usage(session_id, input_delta, output_delta, None);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
@@ -808,6 +1053,8 @@ impl MonitorStore {
                 output_tokens: None,
                 error: None,
                 traffic_capture_path: None,
+                usage: UsageObservation::default(),
+                delivery: DeliveryTiming::default(),
             });
         if output_tokens.is_some()
             && let Some(started) = active.generation_started_instant
@@ -815,9 +1062,22 @@ impl MonitorStore {
             active.generation_finished_at = Some(SystemTime::now());
             active.generation_duration = Some(started.elapsed());
         }
-        let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
-        let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
-        self.record_session_usage(active.session_id.clone(), input_delta, output_delta);
+        let input_delta = apply_observation(
+            &mut active.input_tokens,
+            &mut active.usage.input_tokens,
+            input_tokens.map(TokenObservation::provider),
+        );
+        let output_delta = apply_observation(
+            &mut active.output_tokens,
+            &mut active.usage.output_tokens,
+            output_tokens.map(TokenObservation::provider),
+        );
+        self.record_session_usage(active.session_id.clone(), input_delta, output_delta, None);
+        let status = if status == RequestStatus::Completed && active.error.is_some() {
+            RequestStatus::Failed
+        } else {
+            status
+        };
         let completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,
@@ -843,8 +1103,16 @@ impl MonitorStore {
             output_tokens: active.output_tokens,
             error: error.or(active.error),
             traffic_capture_path: active.traffic_capture_path,
+            usage: active.usage,
+            delivery: active.delivery,
         };
-        if let Some(tokens) = completed.output_tokens.filter(|tokens| *tokens > 0) {
+        if let Some(tokens) = completed.output_tokens.filter(|tokens| {
+            *tokens > 0
+                && completed
+                    .usage
+                    .output_tokens
+                    .is_none_or(|value| value.provenance == UsageProvenance::Provider)
+        }) {
             self.record_session_output(
                 completed.session_id.clone(),
                 completed
@@ -864,10 +1132,19 @@ impl MonitorStore {
         session_id: Option<String>,
         input_tokens: u64,
         output_tokens: u64,
+        cached_input_tokens: Option<u64>,
     ) {
         let usage = self.session_usage.entry(session_id).or_default();
         usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
         usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+        if let Some(tokens) = cached_input_tokens {
+            usage.cached_input_tokens = Some(
+                usage
+                    .cached_input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(tokens),
+            );
+        }
         usage.last_seen = SystemTime::now();
     }
 
@@ -958,6 +1235,7 @@ fn session_summaries(
                 effort: None,
                 last_seen: request.finished_at,
                 input_tokens: 0,
+                cached_input_tokens: None,
                 output_tokens: 0,
                 output_token_samples: Vec::new(),
                 rate_output_tokens: 0,
@@ -976,6 +1254,12 @@ fn session_summaries(
         if let (Some(tokens), Some(duration)) = (
             request
                 .output_tokens
+                .filter(|_| {
+                    request
+                        .usage
+                        .output_tokens
+                        .is_none_or(|value| value.provenance == UsageProvenance::Provider)
+                })
                 .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
                 .filter(|tokens| *tokens > 0),
             request
@@ -1002,6 +1286,7 @@ fn session_summaries(
                 effort: None,
                 last_seen: request.started_at,
                 input_tokens: 0,
+                cached_input_tokens: None,
                 output_tokens: 0,
                 output_token_samples: Vec::new(),
                 rate_output_tokens: 0,
@@ -1018,6 +1303,12 @@ fn session_summaries(
         if let (Some(tokens), Some(duration)) = (
             request
                 .output_tokens
+                .filter(|_| {
+                    request
+                        .usage
+                        .output_tokens
+                        .is_none_or(|value| value.provenance == UsageProvenance::Provider)
+                })
                 .and_then(|tokens| tokens.checked_sub(request.generation_initial_output_tokens))
                 .filter(|tokens| *tokens > 0),
             request
@@ -1034,6 +1325,7 @@ fn session_summaries(
     for (session_id, session) in &mut sessions {
         if let Some(usage) = session_usage.get(session_id) {
             session.input_tokens = usage.input_tokens;
+            session.cached_input_tokens = usage.cached_input_tokens;
             session.output_tokens = usage.output_tokens;
         }
         if let Some(buckets) = session_output_buckets.get(session_id) {
@@ -1066,15 +1358,70 @@ fn first_session_output_bucket(now: SystemTime) -> u64 {
     session_token_bucket(now).saturating_sub(SESSION_OUTPUT_HISTORY_BUCKETS.saturating_sub(1))
 }
 
-fn update_token_count(current: &mut Option<u64>, incoming: Option<u64>) -> u64 {
+fn apply_usage(
+    input: &mut Option<u64>,
+    output: &mut Option<u64>,
+    current: &mut UsageObservation,
+    incoming: UsageObservation,
+) -> (u64, u64, Option<u64>) {
+    let input_delta = apply_observation(input, &mut current.input_tokens, incoming.input_tokens);
+    let output_delta =
+        apply_observation(output, &mut current.output_tokens, incoming.output_tokens);
+    if incoming.reasoning_tokens.is_some() {
+        current.reasoning_tokens = incoming.reasoning_tokens;
+    }
+    let cached_delta = incoming.cached_input_tokens.map(|tokens| {
+        let previous = current.cached_input_tokens.unwrap_or(0);
+        let total = previous.max(tokens);
+        current.cached_input_tokens = Some(total);
+        total.saturating_sub(previous)
+    });
+    (input_delta, output_delta, cached_delta)
+}
+
+fn apply_observation(
+    display: &mut Option<u64>,
+    current: &mut Option<TokenObservation>,
+    incoming: Option<TokenObservation>,
+) -> u64 {
     let Some(incoming) = incoming else {
         return 0;
     };
-    let previous = current.unwrap_or(0);
-    if incoming > previous || current.is_none() {
-        *current = Some(incoming);
+    let previous_provider = match *current {
+        Some(value) if value.provenance == UsageProvenance::Estimated => None,
+        _ => *display,
+    };
+    if incoming.provenance == UsageProvenance::Estimated {
+        if previous_provider.is_none() {
+            *display = Some(incoming.tokens);
+            *current = Some(incoming);
+        }
+        return 0;
     }
-    incoming.saturating_sub(previous)
+    let tokens = previous_provider.unwrap_or(0).max(incoming.tokens);
+    *display = Some(tokens);
+    *current = Some(TokenObservation::provider(tokens));
+    tokens.saturating_sub(previous_provider.unwrap_or(0))
+}
+
+fn apply_delivery(timing: &mut DeliveryTiming, event: DeliveryEvent) {
+    let now = SystemTime::now();
+    match event {
+        DeliveryEvent::ResponseReady => {
+            timing.response_ready_at.get_or_insert(now);
+        }
+        DeliveryEvent::BodyYield { bytes } => {
+            timing.first_body_yield_at.get_or_insert(now);
+            timing.yielded_bytes = timing.yielded_bytes.saturating_add(bytes);
+            timing.yielded_frames = timing.yielded_frames.saturating_add(1);
+        }
+        DeliveryEvent::BodyFinished => {
+            timing.body_finished_at.get_or_insert(now);
+        }
+        DeliveryEvent::BodyCancelled => {
+            timing.body_cancelled_at.get_or_insert(now);
+        }
+    }
 }
 
 fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
@@ -1140,6 +1487,165 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_input_counts_once_and_survives_recent_eviction() {
+        let monitor = MonitorHandle::new(1);
+        monitor.request_started("cached", Some("s".into()), None, EndpointKind::Messages);
+        let usage: UsageObservation = serde_json::from_value(serde_json::json!({
+            "input_tokens": {"tokens": 790845, "provenance": "provider"},
+            "cached_input_tokens": 782848
+        }))
+        .unwrap();
+        monitor.typed_progress("cached", 10, 1, usage.clone());
+        monitor.typed_progress("cached", 0, 0, usage.clone());
+        monitor.request_completed("cached", 200, Some(790845), None);
+        monitor.typed_progress("cached", 0, 0, usage.clone());
+        let before =
+            serde_json::to_value(snapshot::MonitorSnapshot::from(monitor.snapshot())).unwrap();
+        assert_eq!(before["recent"][0]["usage"]["cached_input_tokens"], 782848);
+        assert_eq!(before["sessions"][0]["cached_input_tokens"], 782848);
+        monitor.request_started("next", Some("s".into()), None, EndpointKind::Messages);
+        monitor.request_completed("next", 200, Some(1), None);
+        monitor.typed_progress("cached", 0, 0, usage);
+        let after =
+            serde_json::to_value(snapshot::MonitorSnapshot::from(monitor.snapshot())).unwrap();
+        assert_eq!(after["recent"][0]["request_id"], "next");
+        assert_eq!(after["sessions"][0]["request_count"], 1);
+        assert_eq!(after["sessions"][0]["input_tokens"], 790846);
+        assert_eq!(after["sessions"][0]["cached_input_tokens"], 782848);
+        monitor.request_started("more", Some("s".into()), None, EndpointKind::Messages);
+        for cached in [64, 256, 32] {
+            monitor.typed_progress(
+                "more",
+                0,
+                0,
+                UsageObservation {
+                    input_tokens: Some(TokenObservation::provider(400)),
+                    cached_input_tokens: Some(cached),
+                    ..Default::default()
+                },
+            );
+        }
+        monitor.request_completed("more", 200, Some(400), None);
+        let state = monitor.snapshot();
+        assert_eq!(state.recent[0].usage.cached_input_tokens, Some(256));
+        assert_eq!(state.sessions[0].input_tokens, 791246);
+        assert_eq!(state.sessions[0].cached_input_tokens, Some(783104));
+    }
+
+    #[test]
+    fn cached_input_distinguishes_unknown_and_reported_zero() {
+        let monitor = MonitorHandle::default();
+        monitor.request_started(
+            "unknown",
+            Some("unknown".into()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.request_completed("unknown", 200, Some(10), None);
+        monitor.request_started("zero", Some("zero".into()), None, EndpointKind::Messages);
+        let zero = serde_json::from_value(serde_json::json!({"cached_input_tokens": 0})).unwrap();
+        monitor.typed_progress("zero", 0, 0, zero);
+        monitor.typed_progress("zero", 0, 0, UsageObservation::default());
+        monitor.request_completed("zero", 200, Some(10), None);
+        let value =
+            serde_json::to_value(snapshot::MonitorSnapshot::from(monitor.snapshot())).unwrap();
+        assert_eq!(value["recent"][0]["usage"]["cached_input_tokens"], 0);
+        assert_eq!(
+            value["recent"][1]["usage"]["cached_input_tokens"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["sessions"][0]["cached_input_tokens"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["sessions"][1]["cached_input_tokens"], 0);
+    }
+
+    #[test]
+    fn typed_usage_replaces_estimates_and_counts_cumulative_provider_fields_once() {
+        let monitor = MonitorHandle::default();
+        monitor.request_started("r", Some("s".into()), None, EndpointKind::Messages);
+        monitor.typed_progress(
+            "r",
+            10,
+            2,
+            UsageObservation {
+                input_tokens: Some(TokenObservation::estimated(321)),
+                output_tokens: Some(TokenObservation::estimated(99)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(monitor.snapshot().sessions[0].input_tokens, 0);
+        assert_eq!(monitor.snapshot().sessions[0].output_tokens, 0);
+        let actual = UsageObservation {
+            input_tokens: Some(TokenObservation::provider(300)),
+            output_tokens: Some(TokenObservation::provider(48)),
+            reasoning_tokens: None,
+            ..Default::default()
+        };
+        monitor.typed_progress("r", 5, 1, actual.clone());
+        monitor.typed_progress("r", 0, 0, actual.clone());
+        monitor.request_completed("r", 200, None, None);
+        monitor.typed_progress("r", 0, 0, actual);
+        let state = monitor.snapshot();
+        assert_eq!(state.recent[0].input_tokens, Some(300));
+        assert_eq!(state.recent[0].output_tokens, Some(48));
+        assert_eq!(state.recent[0].usage.reasoning_tokens, None);
+        assert_eq!(state.recent[0].stream_chunks, 3);
+        assert_eq!(state.sessions[0].input_tokens, 300);
+        assert_eq!(state.sessions[0].output_tokens, 48);
+        assert_eq!(
+            state.sessions[0]
+                .output_token_samples
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<u64>(),
+            48
+        );
+    }
+
+    #[test]
+    fn unknown_usage_is_distinct_from_provider_zero_and_estimate_only_history() {
+        let monitor = MonitorHandle::default();
+        monitor.request_started("r", None, None, EndpointKind::Messages);
+        monitor.typed_progress(
+            "r",
+            1,
+            1,
+            UsageObservation {
+                input_tokens: Some(TokenObservation::estimated(321)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(monitor.snapshot().active[0].output_tokens, None);
+        monitor.typed_progress(
+            "r",
+            0,
+            0,
+            UsageObservation {
+                output_tokens: Some(TokenObservation::provider(0)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(monitor.snapshot().active[0].output_tokens, Some(0));
+        assert_eq!(
+            monitor.snapshot().active[0]
+                .usage
+                .input_tokens
+                .unwrap()
+                .provenance,
+            UsageProvenance::Estimated
+        );
+        monitor.request_completed("r", 200, None, None);
+        assert_eq!(monitor.snapshot().sessions[0].input_tokens, 0);
+        assert!(
+            monitor.snapshot().sessions[0]
+                .output_token_samples
+                .is_empty()
+        );
+    }
 
     #[test]
     fn started_requests_appear_active() {
@@ -1400,6 +1906,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             output_tokens: Some(output_tokens),
             error: None,
             traffic_capture_path: None,
+            usage: UsageObservation::default(),
+            delivery: DeliveryTiming::default(),
         }
     }
 

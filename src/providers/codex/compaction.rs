@@ -45,6 +45,7 @@ struct CompactionState {
     native_history: Vec<ResponsesInputItem>,
     phase: CompactionPhase,
     updated_at: u64,
+    retained_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,20 @@ pub struct CompactionReplay {
 struct CompactionRegistry {
     states: HashMap<String, CompactionState>,
     total_bytes: usize,
+}
+
+impl CompactionRegistry {
+    fn remove(&mut self, session_id: &str) {
+        if let Some(state) = self.states.remove(session_id) {
+            self.total_bytes -= state.retained_bytes;
+        }
+    }
+
+    fn insert(&mut self, session_id: String, state: CompactionState) {
+        self.remove(&session_id);
+        self.total_bytes += state.retained_bytes;
+        self.states.insert(session_id, state);
+    }
 }
 
 static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
@@ -98,12 +113,14 @@ pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
         native_history: Vec::new(),
         phase: CompactionPhase::Preparing,
         updated_at: now_ms(),
+        // Empty JSON input is two bytes. Metadata and summary use UTF-8 lengths.
+        retained_bytes: session_id.len() + model.len() + 2,
     };
     let now = state.updated_at;
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(CompactionRegistry::default);
     evict_states(registry, now);
-    registry.states.insert(session_id.to_string(), state);
+    registry.insert(session_id.to_string(), state);
     evict_states(registry, now);
     attempt
 }
@@ -113,6 +130,13 @@ pub fn store_compaction(
     attempt: CompactionAttempt,
     native_history: Vec<ResponsesInputItem>,
 ) -> bool {
+    // The potentially large history is measured before acquiring the registry.
+    // Publication below rechecks the attempt after this work.
+    let history_bytes = serialized_size(&native_history);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_HISTORY_MEASUREMENT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let now = now_ms();
     let mut guard = REGISTRY.lock().unwrap();
     let Some(registry) = guard.as_mut() else {
@@ -125,14 +149,19 @@ pub fn store_compaction(
     if state.attempt != attempt || !matches!(state.phase, CompactionPhase::Preparing) {
         return false;
     }
+    let retained_bytes = session_id
+        .len()
+        .saturating_add(state.model.len())
+        .saturating_add(history_bytes);
+    if retained_bytes > MAX_STATE_BYTES {
+        registry.remove(session_id);
+        return false;
+    }
+    registry.total_bytes = registry.total_bytes - state.retained_bytes + retained_bytes;
+    state.retained_bytes = retained_bytes;
     state.native_history = native_history;
     state.phase = CompactionPhase::Unconfirmed;
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return false;
-    }
     evict_states(registry, now);
     registry
         .states
@@ -167,17 +196,18 @@ pub fn activate_compaction(
         return false;
     }
     if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        registry.remove(session_id);
         return false;
     }
+    let retained_bytes = state.retained_bytes.saturating_add(portable_summary.len());
+    if retained_bytes > MAX_STATE_BYTES {
+        registry.remove(session_id);
+        return false;
+    }
+    registry.total_bytes += retained_bytes - state.retained_bytes;
+    state.retained_bytes = retained_bytes;
     state.phase = CompactionPhase::Anchored { portable_summary };
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
-        return false;
-    }
     evict_states(registry, now);
     registry.states.contains_key(session_id)
 }
@@ -196,8 +226,7 @@ pub fn apply_compaction_replay(
         return None;
     }
     if state.model != request.model {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        registry.remove(session_id);
         return None;
     }
     let CompactionPhase::Anchored { portable_summary } = &state.phase else {
@@ -207,13 +236,11 @@ pub fn apply_compaction_replay(
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        registry.remove(session_id);
         return None;
     };
     if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        registry.remove(session_id);
         return None;
     }
     if conversation.len() == 1 {
@@ -228,8 +255,7 @@ pub fn apply_compaction_replay(
         .chain(conversation[1..].iter().cloned())
         .collect();
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        registry.remove(session_id);
         return None;
     }
     state.updated_at = now;
@@ -252,16 +278,14 @@ pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<Compac
         .get(session_id)
         .is_some_and(|state| state.attempt == attempt)
     {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        registry.remove(session_id);
     }
 }
 
 pub fn clear_compaction(session_id: &str) {
     let mut guard = REGISTRY.lock().unwrap();
     if let Some(registry) = guard.as_mut() {
-        registry.states.remove(session_id);
-        update_total_bytes(registry);
+        registry.remove(session_id);
     }
 }
 
@@ -502,15 +526,24 @@ fn truncate_text(mut text: String, remaining_chars: &mut usize) -> String {
 }
 
 fn serialized_size(items: &[ResponsesInputItem]) -> usize {
-    serde_json::to_vec(items).map_or(usize::MAX, |value| value.len())
+    #[cfg(test)]
+    {
+        HISTORY_MEASUREMENTS.with(|count| count.set(count.get() + 1));
+        if REGISTRY.try_lock().is_err() {
+            LOCKED_HISTORY_MEASUREMENTS.with(|count| count.set(count.get() + 1));
+        }
+    }
+    super::translate::request::bounded_json_size(items, MAX_STATE_BYTES)
+        .ok()
+        .flatten()
+        .unwrap_or(usize::MAX)
 }
 
-fn state_size(session_id: &str, state: &CompactionState) -> usize {
-    let summary_len = match &state.phase {
-        CompactionPhase::Preparing | CompactionPhase::Unconfirmed => 0,
-        CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
-    };
-    session_id.len() + state.model.len() + summary_len + serialized_size(&state.native_history)
+#[cfg(test)]
+thread_local! {
+    static HISTORY_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOCKED_HISTORY_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_HISTORY_MEASUREMENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn now_ms() -> u64 {
@@ -520,19 +553,15 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn update_total_bytes(registry: &mut CompactionRegistry) {
-    registry.total_bytes = registry
-        .states
-        .iter()
-        .map(|(session_id, state)| state_size(session_id, state))
-        .sum();
-}
-
 fn evict_states(registry: &mut CompactionRegistry, now: u64) {
-    registry
-        .states
-        .retain(|_, state| now.saturating_sub(state.updated_at) <= STATE_TTL_MS);
-    update_total_bytes(registry);
+    let total_bytes = &mut registry.total_bytes;
+    registry.states.retain(|_, state| {
+        let keep = now.saturating_sub(state.updated_at) <= STATE_TTL_MS;
+        if !keep {
+            *total_bytes -= state.retained_bytes;
+        }
+        keep
+    });
     while registry.states.len() > MAX_STATES || registry.total_bytes > MAX_TOTAL_STATE_BYTES {
         let oldest = registry
             .states
@@ -542,8 +571,7 @@ fn evict_states(registry: &mut CompactionRegistry, now: u64) {
         let Some(oldest) = oldest else {
             break;
         };
-        registry.states.remove(&oldest);
-        update_total_bytes(registry);
+        registry.remove(&oldest);
     }
 }
 
@@ -561,6 +589,127 @@ mod tests {
     const STALE_SUMMARY: &str =
         "stale portable summary from an older overlapping compaction attempt";
     static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn maintenance_never_remeasures_retained_histories() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let first = stored_compaction("first", output("first retained history"));
+        stored_compaction("second", output("second retained history"));
+        HISTORY_MEASUREMENTS.with(|count| count.set(0));
+        clear_compaction("absent");
+        abort_compaction_attempt(Some("first"), Some(first));
+        let mut guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_mut().unwrap();
+        evict_states(registry, u64::MAX);
+        assert_eq!(registry.total_bytes, 0);
+        assert_eq!(HISTORY_MEASUREMENTS.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn storing_history_measures_once_and_activation_only_adds_summary_bytes() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let attempt = begin_compaction("owner", "gpt-5.6-sol");
+        HISTORY_MEASUREMENTS.with(|count| count.set(0));
+        LOCKED_HISTORY_MEASUREMENTS.with(|count| count.set(0));
+        assert!(store_compaction("owner", attempt, output("retained")));
+        assert_eq!(HISTORY_MEASUREMENTS.with(|count| count.get()), 1);
+        assert_eq!(LOCKED_HISTORY_MEASUREMENTS.with(|count| count.get()), 0);
+        let before = REGISTRY.lock().unwrap().as_ref().unwrap().total_bytes;
+        assert!(activate_compaction(
+            Some("owner"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        assert_eq!(
+            REGISTRY.lock().unwrap().as_ref().unwrap().total_bytes,
+            before + SUMMARY.len()
+        );
+        assert_eq!(HISTORY_MEASUREMENTS.with(|count| count.get()), 1);
+        begin_compaction("owner", "gpt-5.6-sol");
+        assert_eq!(
+            REGISTRY.lock().unwrap().as_ref().unwrap().total_bytes,
+            "owner".len() + "gpt-5.6-sol".len() + 2
+        );
+    }
+
+    #[test]
+    fn store_rechecks_attempt_after_outside_lock_history_measurement() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let old = begin_compaction("racing-owner", "gpt-5.6-sol");
+        AFTER_HISTORY_MEASUREMENT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                begin_compaction("racing-owner", "gpt-5.6-sol");
+            }))
+        });
+        assert!(!store_compaction(
+            "racing-owner",
+            old,
+            output("old large history")
+        ));
+        let guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_ref().unwrap();
+        let current = registry.states.get("racing-owner").unwrap();
+        assert_ne!(current.attempt, old);
+        assert!(current.native_history.is_empty());
+        assert_eq!(
+            registry.total_bytes,
+            "racing-owner".len() + "gpt-5.6-sol".len() + 2
+        );
+    }
+
+    #[test]
+    fn total_eviction_uses_cached_sizes_and_activation_enforces_owner_budget() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let history = output(&"x".repeat(3_900_000));
+        HISTORY_MEASUREMENTS.with(|count| count.set(0));
+        for index in 0..6 {
+            // Order the previously published sessions before the new insertion.
+            // Activation updates timestamps, so order them at this boundary.
+            let now = now_ms();
+            if let Some(registry) = REGISTRY.lock().unwrap().as_mut() {
+                for prior in 0..index {
+                    if let Some(state) = registry.states.get_mut(&format!("large-{prior}")) {
+                        state.updated_at = now - (index - prior) as u64;
+                    }
+                }
+            }
+            let owner = format!("large-{index}");
+            let attempt = stored_compaction(&owner, history.clone());
+            assert!(activate_compaction(
+                Some(&owner),
+                Some(attempt),
+                "gpt-5.6-sol",
+                &output(SUMMARY)
+            ));
+        }
+        let mut guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_mut().unwrap();
+        assert!(registry.total_bytes <= 20_000_000);
+        assert!(!registry.states.contains_key("large-0"));
+        assert_eq!(
+            HISTORY_MEASUREMENTS.with(|count| count.get()),
+            6,
+            "one new measurement per session, including eviction/activation"
+        );
+        HISTORY_MEASUREMENTS.with(|count| count.set(0));
+        evict_states(registry, u64::MAX);
+        assert_eq!(registry.total_bytes, 0);
+        assert_eq!(HISTORY_MEASUREMENTS.with(|count| count.get()), 0);
+        drop(guard);
+        let attempt = stored_compaction("owner", output("small history"));
+        assert!(!activate_compaction(
+            Some("owner"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(&"x".repeat(MAX_STATE_BYTES))
+        ));
+        assert_eq!(REGISTRY.lock().unwrap().as_ref().unwrap().total_bytes, 0);
+    }
 
     fn request(input: serde_json::Value) -> ResponsesRequest {
         serde_json::from_value(json!({

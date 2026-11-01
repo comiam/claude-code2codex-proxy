@@ -32,8 +32,20 @@ impl PendingReasoning {
         if let Some(id) = non_empty_string(item.get("id")) {
             self.id = Some(id.to_string());
         }
-        if let Some(encrypted_content) = non_empty_string(item.get("encrypted_content")) {
-            self.encrypted_content = Some(encrypted_content.to_string());
+    }
+
+    /// Only output_item.done supplies a trustworthy replay blob. The ID can
+    /// originate in added, but an omitted final blob invalidates replay.
+    pub fn capture_done(&mut self, item: &Value) {
+        self.capture(item);
+        self.encrypted_content =
+            non_empty_string(item.get("encrypted_content")).map(str::to_string);
+    }
+
+    pub(crate) fn has_encodable_replay(&self) -> bool {
+        match (self.id.as_deref(), self.encrypted_content.as_deref()) {
+            (Some(id), Some(content)) => encodable_replay_parts(id, content),
+            _ => false,
         }
     }
 
@@ -45,12 +57,15 @@ impl PendingReasoning {
     }
 }
 
+fn encodable_replay_parts(id: &str, content: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ID_BYTES
+        && !content.is_empty()
+        && content.len() <= MAX_ENCRYPTED_CONTENT_BYTES
+}
+
 pub fn encode_reasoning_signature(replay: &ReasoningReplay) -> Option<String> {
-    if replay.id.is_empty()
-        || replay.id.len() > MAX_ID_BYTES
-        || replay.encrypted_content.is_empty()
-        || replay.encrypted_content.len() > MAX_ENCRYPTED_CONTENT_BYTES
-    {
+    if !encodable_replay_parts(&replay.id, &replay.encrypted_content) {
         return None;
     }
     let encoded_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(replay.id.as_bytes());
@@ -100,6 +115,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reasoning_done_replaces_provisional_exactly() {
+        let mut pending = PendingReasoning::default();
+        pending.capture(&json!({"id":"rs_1","encrypted_content":"early"}));
+        pending.capture_done(&json!({"encrypted_content":"final:opaque\nexact"}));
+        assert_eq!(
+            pending.replay(),
+            Some(ReasoningReplay {
+                id: "rs_1".to_string(),
+                encrypted_content: "final:opaque\nexact".to_string()
+            })
+        );
+    }
+
+    #[test]
     fn signature_round_trip_preserves_reasoning_identity() {
         let replay = ReasoningReplay {
             id: "rs_1".to_string(),
@@ -118,19 +147,15 @@ mod tests {
     }
 
     #[test]
-    fn pending_reasoning_keeps_early_metadata_when_done_omits_it() {
+    fn reasoning_added_blob_is_not_replayed_when_done_omits_content() {
         let mut pending = PendingReasoning::default();
-        pending.capture(&json!({
-            "id": "rs_1",
-            "encrypted_content": "early"
-        }));
-        pending.capture(&json!({"id": "rs_1"}));
+        pending.capture(&json!({"id":"rs_1","encrypted_content":"early"}));
+        assert_eq!(pending.replay(), None, "added is provisional");
+        pending.capture_done(&json!({"id":"rs_1"}));
         assert_eq!(
             pending.replay(),
-            Some(ReasoningReplay {
-                id: "rs_1".to_string(),
-                encrypted_content: "early".to_string(),
-            })
+            None,
+            "omission cannot promote early content"
         );
     }
 

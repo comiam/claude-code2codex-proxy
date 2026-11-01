@@ -8,6 +8,11 @@ use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
 use super::count_tokens::{approx_token_count, truncate_to_token_budget};
+use super::translate::event::{SkipDiagnostics, SkippedEvent};
+use super::translate::web_search_compat::{
+    SearchCard, WebSearchResult, markdown_link, server_tool_use_id_from_codex_web_search_id,
+    source_url_is_represented,
+};
 
 const SEARCH_OUTPUT_TOKEN_BUDGET: u64 = 2_500;
 const SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET: u64 = 1_000;
@@ -59,12 +64,6 @@ pub struct SearchResponse {
     pub output: String,
     #[serde(default)]
     pub results: Option<Vec<Value>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SearchResult {
-    title: String,
-    url: String,
 }
 
 pub fn is_standalone_search_request(req: &MessagesRequest) -> bool {
@@ -170,11 +169,42 @@ pub fn anthropic_search_response(
     input_tokens: u64,
     traffic: Option<&TrafficCapture>,
 ) -> axum::response::Response {
+    anthropic_search_response_with_request_id(
+        response,
+        query,
+        message_id,
+        model,
+        stream,
+        input_tokens,
+        traffic,
+        None,
+    )
+}
+
+// Search response fields share the request-scoped diagnostic context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn anthropic_search_response_with_request_id(
+    response: &SearchResponse,
+    query: &str,
+    message_id: &str,
+    model: &str,
+    stream: bool,
+    input_tokens: u64,
+    traffic: Option<&TrafficCapture>,
+    request_id: Option<&str>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let tool_use_id = format!("srvtoolu_ws_{}", uuid::Uuid::new_v4().simple());
-    let results = search_results(response);
-    let content = response_content(response, query, &tool_use_id, &results);
+    let content = response_content(response, query, message_id);
+    let mut diagnostics = SkipDiagnostics::default();
+    if let Some(request_id) = request_id {
+        diagnostics.set_request_id(request_id);
+    }
+    diagnostics.no_representable_output = content.is_empty();
+    diagnostics.record(&SkippedEvent::new(
+        &json!({"type":"standalone_search.native_pair"}),
+        "anthropic_search_opaque_replay_unavailable",
+    ));
     let output_tokens = search_response_output_tokens(response);
     let usage = json!({
         "input_tokens": input_tokens,
@@ -220,72 +250,30 @@ pub fn anthropic_search_response(
             }
         }),
     );
-    emit(
-        &mut body,
-        traffic,
-        "content_block_start",
-        &json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "server_tool_use",
-                "id": tool_use_id,
-                "name": "web_search",
-                "input": {}
-            }
-        }),
-    );
-    emit(
-        &mut body,
-        traffic,
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "input_json_delta",
-                "partial_json": json!({"query": query}).to_string()
-            }
-        }),
-    );
-    emit_block_stop(&mut body, traffic, 0);
-    emit(
-        &mut body,
-        traffic,
-        "content_block_start",
-        &json!({
-            "type": "content_block_start",
-            "index": 1,
-            "content_block": {
-                "type": "web_search_tool_result",
-                "tool_use_id": tool_use_id,
-                "content": web_search_result_values(&results)
-            }
-        }),
-    );
-    emit_block_stop(&mut body, traffic, 1);
-    if !response.output.is_empty() {
+    for (index, block) in content.iter().enumerate() {
         emit(
             &mut body,
             traffic,
             "content_block_start",
             &json!({
                 "type": "content_block_start",
-                "index": 2,
-                "content_block": {"type": "text", "text": ""}
+                "index": index,
+                "content_block": if block["type"] == "text" { json!({"type": "text", "text": ""}) } else { block.clone() }
             }),
         );
-        emit(
-            &mut body,
-            traffic,
-            "content_block_delta",
-            &json!({
-                "type": "content_block_delta",
-                "index": 2,
-                "delta": {"type": "text_delta", "text": response.output}
-            }),
-        );
-        emit_block_stop(&mut body, traffic, 2);
+        if block["type"] == "text" {
+            emit(
+                &mut body,
+                traffic,
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "text_delta", "text": block["text"]}
+                }),
+            );
+        }
+        emit_block_stop(&mut body, traffic, index);
     }
     emit(
         &mut body,
@@ -420,65 +408,38 @@ fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
     (!values.is_empty()).then_some(values)
 }
 
-fn search_results(response: &SearchResponse) -> Vec<SearchResult> {
+fn search_results(response: &SearchResponse) -> Vec<WebSearchResult> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
     for result in response.results.iter().flatten() {
-        let Some(url) = result.get("url").and_then(Value::as_str) else {
+        let Some(result) = WebSearchResult::from_value(result) else {
             continue;
         };
-        if !seen.insert(url.to_string()) {
-            continue;
+        if seen.insert(result.url.clone()) {
+            results.push(result);
         }
-        let title = result
-            .get("title")
-            .and_then(Value::as_str)
-            .or_else(|| result.get("ref_id").and_then(Value::as_str))
-            .unwrap_or(url);
-        results.push(SearchResult {
-            title: title.to_string(),
-            url: url.to_string(),
-        });
     }
     results
 }
 
-fn response_content(
-    response: &SearchResponse,
-    query: &str,
-    tool_use_id: &str,
-    results: &[SearchResult],
-) -> Vec<Value> {
-    let mut content = vec![
-        json!({
-            "type": "server_tool_use",
-            "id": tool_use_id,
-            "name": "web_search",
-            "input": {"query": query}
-        }),
-        json!({
-            "type": "web_search_tool_result",
-            "tool_use_id": tool_use_id,
-            "content": web_search_result_values(results)
-        }),
-    ];
-    if !response.output.is_empty() {
-        content.push(json!({"type": "text", "text": response.output}));
+fn response_content(response: &SearchResponse, query: &str, message_id: &str) -> Vec<Value> {
+    let mut text = response.output.clone();
+    for result in search_results(response) {
+        if !source_url_is_represented(&text, &result.url) {
+            text.push_str(&markdown_link(&result.title, &result.url));
+        }
     }
+    let card = SearchCard {
+        id: server_tool_use_id_from_codex_web_search_id(message_id),
+        input: json!({"query": query}),
+        results: search_results(response),
+    };
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(json!({"type":"text","text":text}));
+    }
+    content.extend(card.blocks());
     content
-}
-
-fn web_search_result_values(results: &[SearchResult]) -> Vec<Value> {
-    results
-        .iter()
-        .map(|result| {
-            json!({
-                "type": "web_search_result",
-                "title": result.title,
-                "url": result.url,
-            })
-        })
-        .collect()
 }
 
 fn emit_block_stop(out: &mut Vec<u8>, traffic: Option<&TrafficCapture>, index: usize) {
@@ -525,6 +486,25 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "web_search"}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn session_speed_does_not_add_service_tier_to_standalone_search() {
+        use crate::proxy_speed::ProxySpeedMode;
+        for mode in [
+            ProxySpeedMode::Off,
+            ProxySpeedMode::Fast,
+            ProxySpeedMode::Ultrafast,
+        ] {
+            let mut req = request();
+            req.proxy_speed_snapshot = Some(mode);
+            let (search, query) =
+                build_search_request(&req, "gpt-5.6-luna", Some("search-session")).unwrap();
+            let wire = serde_json::to_value(search).unwrap();
+            assert!(wire.get("service_tier").is_none());
+            assert_eq!(wire["model"], "gpt-5.6-luna");
+            assert_eq!(query, "Codex standalone search");
+        }
     }
 
     #[test]
@@ -633,51 +613,56 @@ mod tests {
         assert!(search_response_output_tokens(&response) > 0);
     }
 
-    #[test]
-    fn streamed_response_matches_claude_server_tool_shape() {
-        let response = SearchResponse {
-            encrypted_output: Some("opaque".to_string()),
-            output: "See [OpenAI](https://openai.com).".to_string(),
-            results: Some(vec![json!({
-                "type": "text_result",
-                "ref_id": "turn0search0",
-                "url": "https://openai.com",
-                "title": "OpenAI"
-            })]),
-        };
-        let response = anthropic_search_response(
-            &response,
-            "Codex standalone search",
-            "msg_test",
-            "claude-haiku-4-5-20251001",
-            true,
-            12,
-            None,
-        );
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let body = runtime.block_on(axum::body::to_bytes(response.into_body(), usize::MAX));
-        let events = parse_sse_events(&body.unwrap());
-        let payloads: Vec<Value> = events
-            .iter()
-            .filter_map(|event| serde_json::from_str(&event.data).ok())
-            .collect();
-        assert!(payloads.iter().any(|payload| {
-            payload
-                .pointer("/content_block/type")
-                .and_then(Value::as_str)
-                == Some("server_tool_use")
-        }));
-        assert!(payloads.iter().any(|payload| {
-            payload
-                .pointer("/content_block/type")
-                .and_then(Value::as_str)
-                == Some("web_search_tool_result")
-        }));
-        assert!(payloads.iter().any(|payload| {
-            payload
-                .pointer("/usage/server_tool_use/web_search_requests")
-                .and_then(Value::as_u64)
-                == Some(1)
-        }));
+    #[tokio::test]
+    async fn standalone_response_projects_real_text_links_with_json_sse_parity() {
+        for (response, expected) in [
+            (
+                SearchResponse {
+                    encrypted_output: Some("opaque-must-not-escape".into()),
+                    output: "See [OpenAI](https://openai.com/article_%28topic%29) and https://example.com/longer.".into(),
+                    results: Some(vec![
+                        json!({"url":"https://openai.com/article_(topic)","title":"OpenAI"}),
+                        json!({"url":"https://example.com/long","title":"Distinct source"}),
+                        json!({"url":"https://example.com/long","title":"Duplicate"}),
+                    ]),
+                },
+                "See [OpenAI](https://openai.com/article_%28topic%29) and https://example.com/longer.\n[Distinct source](https://example.com/long)\n",
+            ),
+            (SearchResponse { encrypted_output: None, output: "Actual plain https://example.test/text".into(), results: None }, "Actual plain https://example.test/text"),
+            (SearchResponse { encrypted_output: None, output: String::new(), results: Some(vec![json!({"url":"https://example.test/only","title":"Only source"})]) }, "\n[Only source](https://example.test/only)\n"),
+            (SearchResponse { encrypted_output: Some("opaque-must-not-escape".into()), output: String::new(), results: None }, ""),
+        ] {
+            let buffered = anthropic_search_response(&response, "query-must-not-be-invented-output", "msg_test", "model", false, 12, None);
+            let body = axum::body::to_bytes(buffered.into_body(), usize::MAX).await.unwrap();
+            let buffered: Value = serde_json::from_slice(&body).unwrap();
+            let expected_content = if expected.is_empty() { json!([]) } else { json!([{"type":"text","text":expected}]) };
+            let text_content = buffered["content"].as_array().unwrap().iter().filter(|block| block["type"] == "text").cloned().collect::<Vec<_>>();
+            assert_eq!(serde_json::json!(text_content), expected_content);
+            assert_eq!(buffered["content"].as_array().unwrap().iter().filter(|block| block["type"] == "server_tool_use").count(), 1);
+            assert_eq!(buffered["content"].as_array().unwrap().iter().filter(|block| block["type"] == "web_search_tool_result").count(), 1);
+            let streamed = anthropic_search_response(&response, "query-must-not-be-invented-output", "msg_test", "model", true, 12, None);
+            let body = axum::body::to_bytes(streamed.into_body(), usize::MAX).await.unwrap();
+            let payloads: Vec<Value> = parse_sse_events(&body).iter().map(|event| serde_json::from_str(&event.data).unwrap()).collect();
+            let mut text = String::new();
+            for payload in &payloads {
+                if payload["type"] == "content_block_start" && payload["content_block"]["type"] == "text" {
+                    assert_eq!(payload["index"], 0);
+                    assert_eq!(payload["content_block"], json!({"type":"text","text":""}));
+                }
+                if payload["type"] == "content_block_delta" {
+                    assert_eq!(payload["delta"]["type"], "text_delta");
+                    text.push_str(payload["delta"]["text"].as_str().unwrap());
+                }
+            }
+            assert_eq!(text, expected);
+            assert_eq!(payloads.iter().filter(|p| p["type"] == "content_block_start").count(), usize::from(!expected.is_empty()) + 2);
+            assert_eq!(payloads.iter().filter(|p| p["type"] == "message_start").count(), 1);
+            assert_eq!(payloads.iter().filter(|p| p["type"] == "message_stop").count(), 1);
+            let final_delta = payloads.iter().find(|p| p["type"] == "message_delta").unwrap();
+            assert_eq!(final_delta["usage"], buffered["usage"]);
+            assert_eq!(buffered["usage"]["server_tool_use"]["web_search_requests"], 1);
+            assert_eq!(buffered["usage"]["output_tokens"], search_response_output_tokens(&response));
+            assert!(!String::from_utf8_lossy(&body).contains("opaque-must-not-escape"));
+        }
     }
 }

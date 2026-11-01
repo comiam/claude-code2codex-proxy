@@ -93,6 +93,7 @@ fn mock_state_for_tick(
     streaming.streamed_bytes = 18_432;
     streaming.stream_chunks = 96;
     streaming.input_tokens = Some(12_480);
+    streaming.usage.cached_input_tokens = Some(10_000);
     streaming.output_tokens = Some(420);
     streaming.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-proxy-demo/traffic/req-active-codex",
@@ -358,6 +359,14 @@ fn mock_state_for_tick(
         usage.output_tokens = usage
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
+        if let Some(tokens) = request.usage.cached_input_tokens {
+            usage.cached_input_tokens = Some(
+                usage
+                    .cached_input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(tokens),
+            );
+        }
     }
     for request in &active {
         let usage = session_usage.entry(request.session_id.clone()).or_default();
@@ -367,6 +376,14 @@ fn mock_state_for_tick(
         usage.output_tokens = usage
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
+        if let Some(tokens) = request.usage.cached_input_tokens {
+            usage.cached_input_tokens = Some(
+                usage
+                    .cached_input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(tokens),
+            );
+        }
     }
     let sessions = session_summaries(&active, &recent, &session_usage, output_buckets, now);
     MonitorState {
@@ -680,6 +697,8 @@ fn active_request(
         output_tokens: None,
         error: None,
         traffic_capture_path: None,
+        usage: Default::default(),
+        delivery: Default::default(),
     }
 }
 
@@ -721,6 +740,8 @@ fn completed_request(
         output_tokens: None,
         error: None,
         traffic_capture_path: None,
+        usage: Default::default(),
+        delivery: Default::default(),
     }
 }
 

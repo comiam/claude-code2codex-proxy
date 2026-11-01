@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 
 use claude_code_proxy::provider::RequestContext;
 use claude_code_proxy::providers::codex::client::{
-    ActualTransport, CodexError, CodexHttpClient, CodexResponse,
+    ActualTransport, CodexError, CodexErrorOrigin, CodexHttpClient, CodexResponse,
 };
 use claude_code_proxy::providers::codex::continuation::{
     ContinuationCandidate, abort_continuation, clear_continuation, continuation_candidate,
@@ -55,6 +55,23 @@ async fn baseline_client_forms(
 
 #[test]
 fn baseline_codex_public_api_forms_compile() {
+    let _error = CodexError {
+        status: 422,
+        message: "synthetic failure".to_string(),
+        detail: None,
+        retry_after: None,
+        usage_limit: None,
+        origin: CodexErrorOrigin::Http,
+    };
+    let _context = RequestContext {
+        req_id: "compat-request".to_string(),
+        session_id: None,
+        session_seq: None,
+        provider: "codex".to_string(),
+        traffic: None,
+        monitor: None,
+    };
+
     let (_tx, receiver) = tokio::sync::mpsc::channel::<Result<serde_json::Value, CodexError>>(1);
     let mut receiver: CodexWebSocketEventReceiver = receiver;
 

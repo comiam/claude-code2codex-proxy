@@ -1,7 +1,9 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::paths;
 
@@ -57,6 +59,19 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "websocketReuse")]
+    pub websocket_reuse: Option<bool>,
+    #[serde(rename = "websocketIdleCap")]
+    pub websocket_idle_cap: Option<u64>,
+    #[serde(rename = "websocketIdleTtlMs")]
+    pub websocket_idle_ttl_ms: Option<u64>,
+    #[serde(rename = "websocketMaxAgeMs")]
+    pub websocket_max_age_ms: Option<u64>,
+    #[serde(rename = "continuationOwnerBytes")]
+    pub continuation_owner_bytes: Option<u64>,
+    #[serde(rename = "continuationTotalBytes")]
+    pub continuation_total_bytes: Option<u64>,
+    /// Deprecated compatibility setting; ignored by the Claude Messages route.
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
@@ -134,11 +149,16 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
 
 fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
     let path = config_dir.join("config.json");
+    crate::providers::codex::performance::record(|m, _| m.config_reads += 1);
     let raw = fs::read_to_string(path).ok()?;
+    crate::providers::codex::performance::record(|m, _| m.config_parses += 1);
     serde_json::from_str(&raw).ok()
 }
 
 pub fn load_config() -> LoadedConfig {
+    if let Some(settings) = captured_request_settings() {
+        return settings.loaded.clone();
+    }
     let env = paths::DirResolverEnv::default();
     let config_dir = paths::resolve_config_dir(&env);
     load_config_from_env(&env.env, config_dir)
@@ -161,7 +181,14 @@ pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
 
 fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> LoadedConfig {
     let file = read_file_config(&config_dir);
+    resolve_loaded_config(env, config_dir, file.as_ref())
+}
 
+fn resolve_loaded_config(
+    env: &HashMap<String, String>,
+    config_dir: PathBuf,
+    file: Option<&FileConfig>,
+) -> LoadedConfig {
     let mut out = LoadedConfig {
         bind_address: "127.0.0.1".to_string(),
         port: 18765,
@@ -641,236 +668,188 @@ pub fn kimi_user_agent(default: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn codex_base_url(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
-        return raw.clone();
-    }
-    if let Some(raw) = env.get("CLAUDE_CODE_PROXY_CODEX_BASE_URL") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(url) = codex.base_url
-    {
-        return url;
-    }
-    default.to_string()
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings
+        .base_url
+        .clone()
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub fn codex_originator(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_ORIGINATOR") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(val) = codex.originator
-    {
-        return val;
-    }
-    default.to_string()
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings
+        .originator
+        .clone()
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub fn codex_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_USER_AGENT") {
-        return raw.clone();
-    }
-    if let Some(raw) = env.get("CCP_USER_AGENT") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(ua) = codex.user_agent
-    {
-        return ua;
-    }
-    default.to_string()
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings
+        .user_agent
+        .clone()
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub fn codex_previous_response_id() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
-        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(val) = codex.previous_response_id
-    {
-        return val;
-    }
-    false
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.previous_response_id
 }
 
-pub fn codex_server_compaction() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => return true,
-            "0" | "false" | "no" | "off" => return false,
-            _ => {}
+/// Reuse is enabled at startup independently of response continuation.
+pub(crate) fn codex_websocket_reuse() -> bool {
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.websocket_reuse.unwrap_or(true)
+}
+
+/// Process startup cache limits. Accounted bytes are retained serialized input
+/// plus the prompt signature; they are not a bound on process RSS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CodexCachePolicy {
+    pub idle_cap: usize,
+    pub idle_ttl_ms: u64,
+    pub max_age_ms: u64,
+    pub owner_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl Default for CodexCachePolicy {
+    fn default() -> Self {
+        Self {
+            idle_cap: 64,
+            idle_ttl_ms: 300_000,
+            max_age_ms: 1_800_000,
+            owner_bytes: 8 * 1024 * 1024,
+            total_bytes: 128 * 1024 * 1024,
         }
     }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.server_compaction
-    {
-        return enabled;
+}
+
+fn resolve_codex_cache_policy(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> CodexCachePolicy {
+    fn limit(
+        env: &HashMap<String, String>,
+        name: &str,
+        file: Option<u64>,
+        default: u64,
+        max: u64,
+    ) -> u64 {
+        env.get(name)
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| (1..=max).contains(value))
+            .or_else(|| file.filter(|value| (1..=max).contains(value)))
+            .unwrap_or(default)
     }
-    false
+    let defaults = CodexCachePolicy::default();
+    let total_bytes = limit(
+        env,
+        "CCP_CODEX_CONTINUATION_TOTAL_BYTES",
+        codex.and_then(|c| c.continuation_total_bytes),
+        defaults.total_bytes,
+        512 * 1024 * 1024,
+    );
+    CodexCachePolicy {
+        idle_cap: limit(
+            env,
+            "CCP_CODEX_WEBSOCKET_IDLE_CAP",
+            codex.and_then(|c| c.websocket_idle_cap),
+            defaults.idle_cap as u64,
+            4096,
+        ) as usize,
+        idle_ttl_ms: limit(
+            env,
+            "CCP_CODEX_WEBSOCKET_IDLE_TTL_MS",
+            codex.and_then(|c| c.websocket_idle_ttl_ms),
+            defaults.idle_ttl_ms,
+            86_400_000,
+        ),
+        max_age_ms: limit(
+            env,
+            "CCP_CODEX_WEBSOCKET_MAX_AGE_MS",
+            codex.and_then(|c| c.websocket_max_age_ms),
+            defaults.max_age_ms,
+            86_400_000,
+        ),
+        owner_bytes: limit(
+            env,
+            "CCP_CODEX_CONTINUATION_OWNER_BYTES",
+            codex.and_then(|c| c.continuation_owner_bytes),
+            defaults.owner_bytes,
+            128 * 1024 * 1024,
+        )
+        .min(total_bytes),
+        total_bytes,
+    }
+}
+
+pub(crate) fn codex_cache_policy() -> CodexCachePolicy {
+    static POLICY: once_cell::sync::Lazy<CodexCachePolicy> = once_cell::sync::Lazy::new(|| {
+        let resolver = paths::DirResolverEnv::default();
+        let file = read_file_config(&paths::resolve_config_dir(&resolver));
+        resolve_codex_cache_policy(
+            &resolver.env,
+            file.as_ref().and_then(|file| file.codex.as_ref()),
+        )
+    });
+    *POLICY
+}
+
+/// Returns the deprecated setting for compatibility. Claude Messages ignores it.
+pub fn codex_server_compaction() -> bool {
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.server_compaction
 }
 
 pub fn codex_responses_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
-        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.responses_api
-    {
-        return enabled;
-    }
-    false
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.responses_api
 }
 
 pub fn codex_full_lane() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
-        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.full_lane
-    {
-        return enabled;
-    }
-    false
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.full_lane
 }
 
 pub fn codex_images_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
-        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.images_api
-    {
-        return enabled;
-    }
-    false
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.images_api
 }
 
 pub fn codex_transcriptions_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
-        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.transcriptions_api
-    {
-        return enabled;
-    }
-    false
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.transcriptions_api
 }
 
 pub fn codex_images_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(url) = codex.images_base_url
-    {
-        return url;
-    }
-    "https://chatgpt.com/backend-api/codex".to_string()
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.images_base_url.clone()
 }
 
 pub fn codex_service_tier() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
-        return Some(raw.clone());
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.service_tier;
-    }
-    None
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.service_tier.clone()
 }
 
 pub fn codex_effort() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
-        return Some(raw.clone());
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.effort;
-    }
-    None
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.effort.clone()
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env
-        .get("CCP_CODEX_REASONING_SUMMARY")
-        .filter(|raw| !raw.is_empty())
-    {
-        return Some(raw.clone());
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(summary) = codex.reasoning_summary.filter(|raw| !raw.is_empty())
-    {
-        return Some(summary);
-    }
-    None
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.reasoning_summary.clone()
 }
 
 pub fn codex_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_MODEL") {
-        return Some(raw.clone());
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.model;
-    }
-    None
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.model.clone()
 }
 
 pub fn auto_review_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env
-        .get("CCP_AUTO_REVIEW_MODEL")
-        .filter(|raw| !raw.is_empty())
-    {
-        return Some(raw.clone());
-    }
-    read_file_config(&paths::config_dir())
-        .and_then(|file| file.auto_review_model)
-        .filter(|model| !model.is_empty())
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.auto_review_model.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -904,20 +883,8 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
 }
 
 pub fn codex_transport() -> CodexTransport {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
-        && let Some(transport) = parse_codex_transport(raw)
-    {
-        return transport;
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport)
-    {
-        return transport;
-    }
-    CodexTransport::Auto
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.transport
 }
 
 /// How long an HTTP-transport request waits for the Codex response headers.
@@ -934,24 +901,8 @@ pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
 pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
 
 pub fn codex_header_timeout_ms() -> u64 {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(ms) = env
-        .get("CCP_CODEX_HEADER_TIMEOUT_MS")
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
-    {
-        return ms;
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(ms) = codex
-            .header_timeout_ms
-            .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
-    {
-        return ms;
-    }
-    CODEX_DEFAULT_HEADER_TIMEOUT_MS
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.header_timeout_ms
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +974,405 @@ pub fn cursor_agent_bundle() -> Option<String> {
     None
 }
 
+// Contains only request settings: the raw environment and file (including
+// credentials for other providers) are dropped after resolution. Deliberately
+// no Debug implementation.
+pub(crate) struct CodexRequestSettings {
+    loaded: LoadedConfig,
+    directories: paths::DirResolverEnv,
+    log_file: PathBuf,
+    auto_review_model: Option<String>,
+    compact_effort: Option<String>,
+    traffic_log: bool,
+    base_url: Option<String>,
+    originator: Option<String>,
+    user_agent: Option<String>,
+    previous_response_id: bool,
+    websocket_reuse: Option<bool>,
+    server_compaction: bool,
+    full_lane: bool,
+    responses_api: bool,
+    images_api: bool,
+    transcriptions_api: bool,
+    images_base_url: String,
+    service_tier: Option<String>,
+    effort: Option<String>,
+    reasoning_summary: Option<String>,
+    model: Option<String>,
+    transport: CodexTransport,
+    header_timeout_ms: u64,
+}
+tokio::task_local! { static REQUEST_SETTINGS: Arc<CodexRequestSettings>; }
+
+impl CodexRequestSettings {
+    pub(crate) fn capture() -> Arc<Self> {
+        Self::for_env(std::env::vars().collect())
+    }
+
+    pub(crate) fn for_env(env: HashMap<String, String>) -> Arc<Self> {
+        let home = env
+            .get("HOME")
+            .or_else(|| env.get("USERPROFILE"))
+            .cloned()
+            .unwrap_or_else(|| "/".to_string());
+        let resolver = paths::DirResolverEnv {
+            platform: std::env::consts::OS.into(),
+            env,
+            home,
+        };
+        let config_dir = paths::resolve_config_dir(&resolver);
+        let file = read_file_config(&config_dir);
+        let codex = file.as_ref().and_then(|file| file.codex.as_ref());
+        Arc::new(Self {
+            directories: paths::DirResolverEnv {
+                platform: resolver.platform.clone(),
+                home: resolver.home.clone(),
+                env: resolver
+                    .env
+                    .iter()
+                    .filter(|(key, _)| {
+                        matches!(
+                            key.as_str(),
+                            "CCP_CONFIG_DIR"
+                                | "XDG_CONFIG_HOME"
+                                | "XDG_STATE_HOME"
+                                | "APPDATA"
+                                | "LOCALAPPDATA"
+                        )
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            },
+            loaded: resolve_loaded_config(&resolver.env, config_dir, file.as_ref()),
+            log_file: paths::resolve_state_dir(&resolver).join("proxy.log"),
+            auto_review_model: resolver
+                .env
+                .get("CCP_AUTO_REVIEW_MODEL")
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .or_else(|| {
+                    file.as_ref()
+                        .and_then(|file| file.auto_review_model.clone())
+                        .filter(|value| !value.is_empty())
+                }),
+            compact_effort: resolver.env.get("CCP_COMPACT_EFFORT").cloned(),
+            traffic_log: crate::traffic::traffic_capture_enabled_for_env(&resolver.env),
+            base_url: resolve_codex_base_url(&resolver.env, codex),
+            originator: resolve_codex_originator(&resolver.env, codex),
+            user_agent: resolve_codex_user_agent(&resolver.env, codex),
+            previous_response_id: resolve_codex_previous_response_id(&resolver.env, codex),
+            websocket_reuse: resolver
+                .env
+                .get("CCP_CODEX_WEBSOCKET_REUSE")
+                .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .or_else(|| codex.and_then(|c| c.websocket_reuse)),
+            server_compaction: resolve_codex_server_compaction(&resolver.env, codex),
+            full_lane: resolver
+                .env
+                .get("CCP_CODEX_FULL_LANE")
+                .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .or_else(|| codex.and_then(|c| c.full_lane))
+                .unwrap_or(false),
+            responses_api: resolve_codex_responses_api(&resolver.env, codex),
+            images_api: resolve_codex_images_api(&resolver.env, codex),
+            transcriptions_api: resolve_codex_transcriptions_api(&resolver.env, codex),
+            images_base_url: resolve_codex_images_base_url(&resolver.env, codex),
+            service_tier: resolve_codex_service_tier(&resolver.env, codex),
+            effort: resolve_codex_effort(&resolver.env, codex),
+            reasoning_summary: resolve_codex_reasoning_summary(&resolver.env, codex),
+            model: resolve_codex_model(&resolver.env, codex),
+            transport: resolve_codex_transport(&resolver.env, codex),
+            header_timeout_ms: resolve_codex_header_timeout_ms(&resolver.env, codex),
+        })
+    }
+
+    pub(crate) async fn scope<F: Future>(self: Arc<Self>, future: F) -> F::Output {
+        REQUEST_SETTINGS.scope(self, future).await
+    }
+
+    // For explicitly propagated CPU work; this scope ends before returning and
+    // must never enclose an await.
+    pub(crate) fn sync_scope<T>(self: Arc<Self>, work: impl FnOnce() -> T) -> T {
+        REQUEST_SETTINGS.sync_scope(self, work)
+    }
+}
+
+pub(crate) fn captured_request_settings() -> Option<Arc<CodexRequestSettings>> {
+    REQUEST_SETTINGS.try_with(Arc::clone).ok()
+}
+
+pub(crate) fn captured_dir_resolver() -> Option<paths::DirResolverEnv> {
+    captured_request_settings().map(|settings| settings.directories.clone())
+}
+
+pub(crate) fn captured_traffic_log() -> Option<bool> {
+    captured_request_settings().map(|settings| settings.traffic_log)
+}
+
+pub(crate) async fn request_scope<F: Future>(future: F) -> F::Output {
+    let settings = captured_request_settings().unwrap_or_else(CodexRequestSettings::capture);
+    settings.scope(future).await
+}
+
+// Capture now, before tokio::spawn polls the returned future.
+pub(crate) fn inherit_request_scope<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let settings = captured_request_settings();
+    async move {
+        match settings {
+            Some(settings) => settings.scope(future).await,
+            None => future.await,
+        }
+    }
+}
+
+pub(crate) fn request_log_file() -> PathBuf {
+    captured_request_settings().map_or_else(paths::log_file, |settings| settings.log_file.clone())
+}
+
+pub(crate) fn codex_compact_effort() -> Option<String> {
+    captured_request_settings().map_or_else(
+        || std::env::var("CCP_COMPACT_EFFORT").ok(),
+        |settings| settings.compact_effort.clone(),
+    )
+}
+
+fn resolve_codex_base_url(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> Option<String> {
+    if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
+        return Some(raw.clone());
+    }
+    if let Some(raw) = env.get("CLAUDE_CODE_PROXY_CODEX_BASE_URL") {
+        return Some(raw.clone());
+    }
+    if let Some(codex) = codex
+        && let Some(url) = codex.base_url.clone()
+    {
+        return Some(url);
+    }
+    None
+}
+
+fn resolve_codex_originator(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> Option<String> {
+    if let Some(raw) = env.get("CCP_CODEX_ORIGINATOR") {
+        return Some(raw.clone());
+    }
+    if let Some(codex) = codex
+        && let Some(val) = codex.originator.clone()
+    {
+        return Some(val);
+    }
+    None
+}
+
+fn resolve_codex_user_agent(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> Option<String> {
+    if let Some(raw) = env.get("CCP_CODEX_USER_AGENT") {
+        return Some(raw.clone());
+    }
+    if let Some(raw) = env.get("CCP_USER_AGENT") {
+        return Some(raw.clone());
+    }
+    if let Some(codex) = codex
+        && let Some(ua) = codex.user_agent.clone()
+    {
+        return Some(ua);
+    }
+    None
+}
+
+fn resolve_codex_previous_response_id(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> bool {
+    if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    if let Some(codex) = codex
+        && let Some(val) = codex.previous_response_id
+    {
+        return val;
+    }
+    true
+}
+
+fn resolve_codex_server_compaction(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> bool {
+    if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    if let Some(codex) = codex
+        && let Some(enabled) = codex.server_compaction
+    {
+        return enabled;
+    }
+    false
+}
+
+fn resolve_codex_responses_api(env: &HashMap<String, String>, codex: Option<&CodexConfig>) -> bool {
+    if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    if let Some(codex) = codex
+        && let Some(enabled) = codex.responses_api
+    {
+        return enabled;
+    }
+    false
+}
+
+fn resolve_codex_images_api(env: &HashMap<String, String>, codex: Option<&CodexConfig>) -> bool {
+    if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    if let Some(codex) = codex
+        && let Some(enabled) = codex.images_api
+    {
+        return enabled;
+    }
+    false
+}
+
+fn resolve_codex_transcriptions_api(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> bool {
+    if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    if let Some(codex) = codex
+        && let Some(enabled) = codex.transcriptions_api
+    {
+        return enabled;
+    }
+    false
+}
+
+fn resolve_codex_images_base_url(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> String {
+    if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
+        return raw.clone();
+    }
+    if let Some(codex) = codex
+        && let Some(url) = codex.images_base_url.clone()
+    {
+        return url;
+    }
+    "https://chatgpt.com/backend-api/codex".to_string()
+}
+
+fn resolve_codex_service_tier(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> Option<String> {
+    if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
+        return Some(raw.clone());
+    }
+    if let Some(codex) = codex {
+        return codex.service_tier.clone();
+    }
+    None
+}
+
+fn resolve_codex_effort(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> Option<String> {
+    if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
+        return Some(raw.clone());
+    }
+    if let Some(codex) = codex {
+        return codex.effort.clone();
+    }
+    None
+}
+
+fn resolve_codex_reasoning_summary(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> Option<String> {
+    if let Some(raw) = env
+        .get("CCP_CODEX_REASONING_SUMMARY")
+        .filter(|raw| !raw.is_empty())
+    {
+        return Some(raw.clone());
+    }
+    if let Some(codex) = codex
+        && let Some(summary) = codex
+            .reasoning_summary
+            .clone()
+            .filter(|raw| !raw.is_empty())
+    {
+        return Some(summary);
+    }
+    None
+}
+
+fn resolve_codex_model(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> Option<String> {
+    if let Some(raw) = env.get("CCP_CODEX_MODEL") {
+        return Some(raw.clone());
+    }
+    if let Some(codex) = codex {
+        return codex.model.clone();
+    }
+    None
+}
+
+fn resolve_codex_transport(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> CodexTransport {
+    if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
+        && let Some(transport) = parse_codex_transport(raw)
+    {
+        return transport;
+    }
+    if let Some(codex) = codex
+        && let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport)
+    {
+        return transport;
+    }
+    CodexTransport::Auto
+}
+
+fn resolve_codex_header_timeout_ms(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> u64 {
+    if let Some(ms) = env
+        .get("CCP_CODEX_HEADER_TIMEOUT_MS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    if let Some(codex) = codex
+        && let Some(ms) = codex
+            .header_timeout_ms
+            .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+    {
+        return ms;
+    }
+    CODEX_DEFAULT_HEADER_TIMEOUT_MS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1380,287 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[test]
+    fn cache_policy_validates_file_and_env_with_stateful_defaults() {
+        let codex: CodexConfig = serde_json::from_value(serde_json::json!({
+            "websocketIdleCap": 128, "websocketIdleTtlMs": 600_000
+        }))
+        .unwrap();
+        let mut env = HashMap::new();
+        let configured = resolve_codex_cache_policy(&env, Some(&codex));
+        assert_eq!(configured.idle_cap, 128);
+        assert_eq!(configured.idle_ttl_ms, 600_000);
+        assert_eq!(
+            (configured.owner_bytes, configured.total_bytes),
+            (8 * 1024 * 1024, 128 * 1024 * 1024)
+        );
+        env.insert("CCP_CODEX_WEBSOCKET_IDLE_CAP".into(), "32".into());
+        env.insert(
+            "CCP_CODEX_CONTINUATION_OWNER_BYTES".into(),
+            "8388608".into(),
+        );
+        env.insert(
+            "CCP_CODEX_CONTINUATION_TOTAL_BYTES".into(),
+            "134217728".into(),
+        );
+        let configured = resolve_codex_cache_policy(&env, Some(&codex));
+        assert_eq!(configured.idle_cap, 32);
+        assert_eq!(
+            (configured.owner_bytes, configured.total_bytes),
+            (8_388_608, 134_217_728)
+        );
+        for invalid in ["0", "-1", "garbage", "18446744073709551615"] {
+            env.insert("CCP_CODEX_WEBSOCKET_IDLE_CAP".into(), invalid.into());
+            assert_eq!(resolve_codex_cache_policy(&env, Some(&codex)).idle_cap, 128);
+        }
+        env.insert("CCP_CODEX_CONTINUATION_TOTAL_BYTES".into(), "1024".into());
+        let configured = resolve_codex_cache_policy(&env, Some(&codex));
+        assert!(configured.owner_bytes <= configured.total_bytes);
+    }
+
+    #[test]
+    fn continuation_defaults_on_with_explicit_opt_out() {
+        let mut env = HashMap::new();
+        assert!(resolve_codex_previous_response_id(&env, None));
+        let off: CodexConfig =
+            serde_json::from_value(serde_json::json!({"previousResponseId":false})).unwrap();
+        assert!(!resolve_codex_previous_response_id(&env, Some(&off)));
+        env.insert("CCP_CODEX_PREVIOUS_RESPONSE_ID".into(), "0".into());
+        assert!(!resolve_codex_previous_response_id(&env, None));
+    }
+
+    #[test]
+    fn websocket_reuse_defaults_on_and_respects_explicit_startup_policy() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        let _reuse = EnvGuard::unset("CCP_CODEX_WEBSOCKET_REUSE");
+        let _previous = EnvGuard::unset("CCP_CODEX_PREVIOUS_RESPONSE_ID");
+        let client = || {
+            crate::providers::codex::client::CodexHttpClient::new_for_test(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                "http://127.0.0.1:9/responses".into(),
+                100,
+                300_000,
+            )
+        };
+        assert!(
+            client().websocket_reuse(),
+            "reuse defaults on without continuation"
+        );
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"previousResponseId":false}}"#,
+        )
+        .unwrap();
+        assert!(
+            client().websocket_reuse(),
+            "disabled continuation does not disable reuse"
+        );
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"previousResponseId":true}}"#,
+        )
+        .unwrap();
+        assert!(
+            client().websocket_reuse(),
+            "continuation can use the default reusable transport"
+        );
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"previousResponseId":true,"websocketReuse":false}}"#,
+        )
+        .unwrap();
+        assert!(
+            !client().websocket_reuse(),
+            "explicit file false overrides previous IDs"
+        );
+        let _override = EnvGuard::set("CCP_CODEX_WEBSOCKET_REUSE", "true");
+        let running = client();
+        assert!(running.websocket_reuse());
+        let _changed = EnvGuard::set("CCP_CODEX_WEBSOCKET_REUSE", "false");
+        assert!(
+            running.websocket_reuse(),
+            "a running client's transport policy is fixed"
+        );
+        assert!(
+            !client().websocket_reuse(),
+            "a new client observes changed startup policy"
+        );
+    }
+
+    // The environment lock must cover the entire asynchronous isolation test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn config_loaded_once_per_logical_request_and_next_request_observes_config_change() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&dir);
+        let _model = EnvGuard::unset("CCP_CODEX_MODEL");
+        let _effort = EnvGuard::unset("CCP_CODEX_EFFORT");
+        let _tier = EnvGuard::unset("CCP_CODEX_SERVICE_TIER");
+        fs::write(dir.path().join("config.json"), r#"{"codex":{"model":"gpt-6-sol","effort":"high","serviceTier":"priority","originator":"first"},"log":{"verbose":false}}"#).unwrap();
+        let (_, measurements) = crate::providers::codex::performance::observe(request_scope(async {
+            assert_eq!(codex_model().as_deref(), Some("gpt-6-sol"));
+            fs::write(dir.path().join("config.json"), r#"{"codex":{"model":"gpt-6-astra","effort":"low","serviceTier":"default","originator":"second"},"log":{"verbose":true}}"#).unwrap();
+            let _changed_env = EnvGuard::set("CCP_CODEX_EFFORT", "medium");
+            request_scope(async {
+                assert_eq!(codex_effort().as_deref(), Some("high"));
+                assert_eq!(codex_service_tier().as_deref(), Some("priority"));
+                assert_eq!(codex_originator("default"), "first");
+                assert!(!log_verbose());
+                crate::logging::create_logger("snapshot-test").info("request", Some(serde_json::json!({"nested":["first", "second"]}).as_object().unwrap().clone()));
+            }).await;
+        })).await;
+        assert_eq!(measurements.config_reads, 1);
+        assert_eq!(measurements.config_parses, 1);
+        request_scope(async {
+            assert_eq!(codex_model().as_deref(), Some("gpt-6-astra"));
+            assert_eq!(codex_effort().as_deref(), Some("low"));
+            assert_eq!(codex_service_tier().as_deref(), Some("default"));
+            assert_eq!(codex_originator("default"), "second");
+            assert!(log_verbose());
+        })
+        .await;
+    }
+
+    // The environment lock must cover the entire asynchronous isolation test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn direct_provider_and_server_style_logging_share_one_snapshot() {
+        use crate::provider::{Provider, RequestContext};
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&dir);
+        let _model = EnvGuard::unset("CCP_CODEX_MODEL");
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"codex":{"model":"gpt-6-sol","effort":"low"}}"#,
+        )
+        .unwrap();
+        let provider = crate::providers::codex::CodexProvider::new();
+        let request = || {
+            serde_json::from_value(serde_json::json!({"model":"gpt-6-astra","max_tokens":16,"messages":[{"role":"user","content":"hello"}]})).unwrap()
+        };
+        let context = || RequestContext {
+            req_id: "snapshot-integration".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".into(),
+            traffic: None,
+            monitor: None,
+        };
+        let (response, measurements) = crate::providers::codex::performance::observe(
+            provider.handle_count_tokens(request(), context()),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(measurements.config_reads, 1);
+        assert_eq!(measurements.config_parses, 1);
+        let (_, measurements) =
+            crate::providers::codex::performance::observe(request_scope(async {
+                crate::logging::create_logger("server").info("request", None);
+                assert_eq!(
+                    provider
+                        .handle_count_tokens(request(), context())
+                        .await
+                        .status(),
+                    http::StatusCode::OK
+                );
+                crate::logging::create_logger("server").info("request_completed", None);
+            }))
+            .await;
+        assert_eq!(measurements.config_reads, 1);
+        assert_eq!(measurements.config_parses, 1);
+    }
+
+    #[tokio::test]
+    async fn full_lane_and_transport_are_captured_per_request() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"codex":{"fullLane":true,"transport":"http"}}"#,
+        )
+        .unwrap();
+        let mut env = config_env(&dir);
+        env.insert("CCP_CODEX_TRANSPORT".into(), "invalid".into());
+        let first = CodexRequestSettings::for_env(env.clone());
+        env.insert("CCP_CODEX_FULL_LANE".into(), "false".into());
+        env.insert("CCP_CODEX_TRANSPORT".into(), "websocket".into());
+        let second = CodexRequestSettings::for_env(env);
+        first
+            .scope(async {
+                assert!(codex_full_lane());
+                assert_eq!(codex_transport(), CodexTransport::Http);
+            })
+            .await;
+        second
+            .scope(async {
+                assert!(!codex_full_lane());
+                assert_eq!(codex_transport(), CodexTransport::WebSocket);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_request_scopes_and_spawned_tasks_are_isolated() {
+        let first = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+        fs::write(
+            first.path().join("config.json"),
+            r#"{"codex":{"model":"gpt-6-sol"},"log":{"verbose":false}}"#,
+        )
+        .unwrap();
+        fs::write(
+            second.path().join("config.json"),
+            r#"{"codex":{"model":"gpt-6-astra"},"log":{"verbose":true}}"#,
+        )
+        .unwrap();
+        let scoped_env = |dir: &tempfile::TempDir| {
+            let mut env = config_env(dir);
+            env.insert(
+                "XDG_STATE_HOME".into(),
+                dir.path().join("state").to_string_lossy().into_owned(),
+            );
+            env
+        };
+        let a = CodexRequestSettings::for_env(scoped_env(&first));
+        let b = CodexRequestSettings::for_env(scoped_env(&second));
+        let run = |settings: std::sync::Arc<CodexRequestSettings>,
+                   dir: PathBuf,
+                   expected: &'static str,
+                   verbose| async move {
+            settings
+                .scope(async move {
+                    tokio::task::yield_now().await;
+                    assert_eq!(codex_model().as_deref(), Some(expected));
+                    let child = tokio::spawn(inherit_request_scope(async move {
+                        tokio::task::yield_now().await;
+                        assert_eq!(codex_model().as_deref(), Some(expected));
+                        assert_eq!(log_verbose(), verbose);
+                        assert_eq!(paths::config_dir(), dir);
+                        assert_eq!(
+                            paths::provider_auth_file("codex"),
+                            dir.join("codex/auth.json")
+                        );
+                        assert_eq!(
+                            crate::logging::log_file(),
+                            dir.join("state/claude-code-proxy/proxy.log")
+                        );
+                        captured_request_settings()
+                            .unwrap()
+                            .sync_scope(|| assert_eq!(codex_model().as_deref(), Some(expected)));
+                    }));
+                    child.await.unwrap();
+                })
+                .await;
+        };
+        tokio::join!(
+            run(a, first.path().to_path_buf(), "gpt-6-sol", false),
+            run(b, second.path().to_path_buf(), "gpt-6-astra", true)
+        );
+    }
 
     /// Clears the environment knobs the config accessors read and points the
     /// config dir at `config`, so neither the developer's shell nor their real

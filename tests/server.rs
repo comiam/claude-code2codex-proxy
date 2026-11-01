@@ -22,6 +22,480 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
 
+struct PendingMessagesProvider {
+    name: &'static str,
+    delay: std::time::Duration,
+    status: StatusCode,
+    payload: &'static str,
+    finished: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct ProviderFutureCleanup(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ProviderFutureCleanup {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Provider for PendingMessagesProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn supported_models(&self) -> Vec<String> {
+        vec!["pending-model".into()]
+    }
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        let _cleanup = ProviderFutureCleanup(self.finished.clone());
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        axum::response::Response::builder()
+            .status(self.status)
+            .header(
+                "content-type",
+                if self.status.is_success() && self.payload.starts_with("event:") {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
+            .header("request-id", "provider-request")
+            .header("retry-after", "7")
+            .body(Body::from(self.payload))
+            .unwrap()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        unreachable!("message tests must not dispatch token counting")
+    }
+}
+
+fn pending_messages_app(
+    name: &'static str,
+    delay: u64,
+    status: StatusCode,
+    payload: &'static str,
+    monitor: MonitorHandle,
+    finished: Arc<std::sync::atomic::AtomicUsize>,
+) -> axum::Router {
+    app_with_monitor(
+        Arc::new(Registry::from_providers(
+            if name == "codex" {
+                AliasProvider::Codex
+            } else {
+                AliasProvider::Kimi
+            },
+            vec![Arc::new(PendingMessagesProvider {
+                name,
+                delay: std::time::Duration::from_secs(delay),
+                status,
+                payload,
+                finished,
+            }) as Arc<dyn Provider>],
+        )),
+        Some(monitor),
+    )
+}
+
+fn pending_messages_request() -> Request<Body> {
+    Request::builder().method(Method::POST).uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"pending-model","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"hello"}]}"#))
+        .unwrap()
+}
+
+fn pending_compact_request(stream: bool) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "pending-model", "stream": stream, "max_tokens": 100,
+                "system": "You are a helpful AI assistant tasked with summarizing conversations",
+                "messages": [{"role": "user", "content": "Keep the user's focus"}]
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+const ORIGINAL_PENDING_SSE: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_pending\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"pending-model\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<summary>Original summary</summary>\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+
+// Keeping the provider future pending must not postpone compact headers, count
+// pings as generation, or replace the provider's eventual SSE transcript.
+#[tokio::test(start_paused = true)]
+async fn pending_compact_starts_sse_without_waiting_for_provider() {
+    use futures_util::FutureExt;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    let monitor = MonitorHandle::new(10);
+    let app = pending_messages_app(
+        "codex",
+        400,
+        StatusCode::OK,
+        ORIGINAL_PENDING_SSE,
+        monitor.clone(),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let started = tokio::time::Instant::now();
+    let response = app
+        .oneshot(pending_compact_request(true))
+        .now_or_never()
+        .expect("compact SSE headers must be ready without advancing time")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut body = response.into_body();
+    let first = body
+        .frame()
+        .now_or_never()
+        .expect("compact first ping must be ready without advancing time")
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, "event: ping\ndata: {\"type\":\"ping\"}\n\n");
+    assert_eq!(tokio::time::Instant::now(), started);
+    for _ in 0..26 {
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+        );
+    }
+    let snapshot = monitor.snapshot();
+    assert_eq!(snapshot.active.len(), 1);
+    assert!(snapshot.active[0].generation_started_at.is_none());
+    assert_eq!(snapshot.active[0].usage, Default::default());
+    assert!(snapshot.active[0].delivery.first_body_yield_at.is_some());
+    assert!(snapshot.recent.is_empty());
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let original = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(original, ORIGINAL_PENDING_SSE);
+    assert_eq!(
+        std::str::from_utf8(&original)
+            .unwrap()
+            .matches("event: message_start")
+            .count(),
+        1
+    );
+    assert!(body.frame().await.is_none());
+    let snapshot = monitor.snapshot();
+    assert!(snapshot.active.is_empty());
+    assert_eq!(snapshot.recent.len(), 1);
+    assert_eq!(snapshot.recent[0].status, RequestStatus::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_other_requests_keep_initial_heartbeat_delay() {
+    use futures_util::FutureExt;
+    use std::time::Duration;
+    for (name, compact) in [("codex", false), ("kimi", true)] {
+        let app = pending_messages_app(
+            name,
+            400,
+            StatusCode::OK,
+            ORIGINAL_PENDING_SSE,
+            MonitorHandle::new(10),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let response = app.oneshot(if compact {
+            pending_compact_request(true)
+        } else {
+            pending_messages_request()
+        });
+        tokio::pin!(response);
+        assert!(response.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(14)).await;
+        assert!(response.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            response.await.unwrap().headers()["content-type"],
+            "text/event-stream"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_compact_nonstream_waits_for_original_json_response() {
+    use futures_util::FutureExt;
+    use std::time::Duration;
+    const JSON: &str = r#"{"id":"msg_original","type":"message","content":[{"type":"text","text":"<summary>Original summary</summary>"}]}"#;
+    let app = pending_messages_app(
+        "codex",
+        400,
+        StatusCode::OK,
+        JSON,
+        MonitorHandle::new(10),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let response = app.oneshot(pending_compact_request(false));
+    tokio::pin!(response);
+    assert!(response.as_mut().now_or_never().is_none());
+    tokio::time::advance(Duration::from_secs(15)).await;
+    assert!(response.as_mut().now_or_never().is_none());
+    tokio::time::advance(Duration::from_secs(385)).await;
+    let response = response.await.unwrap();
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["request-id"], "provider-request");
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+        JSON
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_provider_stream_survives_six_minutes_then_forwards_original_sse() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    let monitor = MonitorHandle::new(10);
+    let app = pending_messages_app(
+        "kimi",
+        400,
+        StatusCode::OK,
+        ORIGINAL_PENDING_SSE,
+        monitor.clone(),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(20),
+        app.oneshot(pending_messages_request()),
+    )
+    .await
+    .expect("pending provider must send SSE headers before the client timeout")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert!(response.headers().contains_key("request-id"));
+    let mut body = response.into_body();
+    assert_eq!(
+        body.frame().await.unwrap().unwrap().into_data().unwrap(),
+        "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+    );
+    for _ in 0..24 {
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(bytes, "event: ping\ndata: {\"type\":\"ping\"}\n\n");
+    }
+    let snapshot = monitor.snapshot();
+    assert_eq!(snapshot.active.len(), 1);
+    assert!(snapshot.active[0].generation_started_at.is_none());
+    assert!(snapshot.active[0].delivery.first_body_yield_at.is_some());
+    assert!(snapshot.recent.is_empty());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(
+        body.frame().await.unwrap().unwrap().into_data().unwrap(),
+        ORIGINAL_PENDING_SSE
+    );
+    assert!(body.frame().await.is_none());
+    let snapshot = monitor.snapshot();
+    assert!(snapshot.active.is_empty());
+    assert_eq!(snapshot.recent.len(), 1);
+    assert_eq!(snapshot.recent[0].status, RequestStatus::Completed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_provider_fast_response_preserves_http_status_headers_and_body() {
+    check_pending_fast_response("kimi", false, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_compact_fast_response_preserves_http_status_headers_and_body() {
+    check_pending_fast_response("codex", true, true).await;
+    check_pending_fast_response("codex", true, false).await;
+}
+
+async fn check_pending_fast_response(name: &'static str, compact: bool, stream: bool) {
+    for (status, payload, content_type) in [
+        (
+            StatusCode::UNAUTHORIZED,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"expired"}}"#,
+            "application/json",
+        ),
+        (StatusCode::OK, ORIGINAL_PENDING_SSE, "text/event-stream"),
+    ] {
+        let app = pending_messages_app(
+            name,
+            0,
+            status,
+            payload,
+            MonitorHandle::new(10),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let response = app
+            .oneshot(if compact {
+                pending_compact_request(stream)
+            } else {
+                pending_messages_request()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["content-type"], content_type);
+        assert_eq!(response.headers()["request-id"], "provider-request");
+        assert_eq!(response.headers()["retry-after"], "7");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            payload
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_provider_slow_error_is_typed_sse_and_remains_failed() {
+    check_pending_slow_error("kimi", false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_compact_slow_error_is_typed_sse_and_remains_failed() {
+    check_pending_slow_error("codex", true).await;
+}
+
+async fn check_pending_slow_error(name: &'static str, compact: bool) {
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+    for (status, payload, expected, message) in [
+        (
+            529,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"capacity exhausted","code":"upstream_capacity"}}"#,
+            json!({"type":"error","error":{"type":"overloaded_error","message":"capacity exhausted","code":"upstream_capacity"}}),
+            "capacity exhausted",
+        ),
+        (
+            429,
+            "slow down",
+            json!({"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}),
+            "slow down",
+        ),
+    ] {
+        let monitor = MonitorHandle::new(10);
+        let app = pending_messages_app(
+            name,
+            30,
+            StatusCode::from_u16(status).unwrap(),
+            payload,
+            monitor.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(20),
+            app.oneshot(if compact {
+                pending_compact_request(true)
+            } else {
+                pending_messages_request()
+            }),
+        )
+        .await
+        .expect("delayed errors must already have an SSE response")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let _ping = body.frame().await.unwrap().unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let bytes = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.starts_with("event: error\ndata: "));
+        let value: Value =
+            serde_json::from_str(text.strip_prefix("event: error\ndata: ").unwrap().trim())
+                .unwrap();
+        assert_eq!(value, expected);
+        assert!(!text.contains("message_stop"));
+        assert!(body.frame().await.is_none());
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.recent.len(), 1);
+        assert_eq!(snapshot.recent[0].status, RequestStatus::Failed);
+        assert_eq!(snapshot.recent[0].http_status, Some(status));
+        assert_eq!(snapshot.recent[0].error.as_deref(), Some(message));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_provider_body_drop_cancels_provider_future_and_monitor_once() {
+    check_pending_body_drop("kimi", false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_compact_body_drop_cancels_provider() {
+    check_pending_body_drop("codex", true).await;
+}
+
+async fn check_pending_body_drop(name: &'static str, compact: bool) {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    let monitor = MonitorHandle::new(10);
+    let finished = Arc::new(AtomicUsize::new(0));
+    let app = pending_messages_app(
+        name,
+        400,
+        StatusCode::OK,
+        ORIGINAL_PENDING_SSE,
+        monitor.clone(),
+        finished.clone(),
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(20),
+        app.oneshot(if compact {
+            pending_compact_request(true)
+        } else {
+            pending_messages_request()
+        }),
+    )
+    .await
+    .expect("pending provider must yield a cancellable SSE body")
+    .unwrap();
+    let mut body = response.into_body();
+    let _ping = body.frame().await.unwrap().unwrap();
+    assert_eq!(finished.load(Ordering::SeqCst), 0);
+    drop(body);
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        1,
+        "dropping downstream body must drop the same provider future"
+    );
+    tokio::time::advance(Duration::from_secs(500)).await;
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        1,
+        "cleanup must run exactly once"
+    );
+    let snapshot = monitor.snapshot();
+    assert!(snapshot.active.is_empty());
+    assert_eq!(snapshot.recent.len(), 1);
+    assert_eq!(snapshot.recent[0].status, RequestStatus::Failed);
+    assert_eq!(snapshot.recent[0].http_status, None);
+    assert!(snapshot.recent[0].delivery.body_cancelled_at.is_some());
+}
+
 fn body_string(json: &str) -> Body {
     Body::from(json.to_string())
 }
@@ -960,6 +1434,16 @@ async fn known_model_reaches_codex_provider() {
     );
 }
 
+#[test]
+fn known_codex_models_are_registered() {
+    // Routing is local; sending a generation here could use the developer's auth.
+    let registry = Registry::with_default_alias();
+    for model in ["gpt-5.4", "gpt-6.1-terra", "gpt-6.1-terra-fast"] {
+        let provider = registry.provider_for_model(model, None).unwrap();
+        assert_eq!(provider.name(), "codex", "{model}");
+    }
+}
+
 #[tokio::test]
 async fn count_tokens_routes_to_provider() {
     let app = app(Arc::new(Registry::with_default_alias()));
@@ -1641,6 +2125,9 @@ async fn monitor_records_successful_request_events() {
     let state = monitor.snapshot();
     assert_eq!(state.active.len(), 1);
     assert!(state.recent.is_empty());
+    assert!(state.active[0].delivery.response_ready_at.is_some());
+    assert!(state.active[0].delivery.first_body_yield_at.is_none());
+    assert!(state.active[0].delivery.body_finished_at.is_none());
 
     let _body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -1650,6 +2137,9 @@ async fn monitor_records_successful_request_events() {
     assert_eq!(state.recent.len(), 1);
     assert_eq!(state.recent[0].status, RequestStatus::Completed);
     assert_eq!(state.recent[0].http_status, Some(200));
+    assert!(state.recent[0].delivery.first_body_yield_at.is_some());
+    assert!(state.recent[0].delivery.body_finished_at.is_some());
+    assert!(state.recent[0].delivery.body_cancelled_at.is_none());
     assert_eq!(
         state.recent[0].session_id.as_deref(),
         Some("project-session")
@@ -1754,6 +2244,7 @@ async fn models_endpoint_lists_supported_models() {
     assert!(ids.contains(&"gpt-6.1-sol-fast"));
     assert!(ids.contains(&"gpt-6.1-terra"));
     assert!(ids.contains(&"gpt-6.1-terra-fast"));
+    assert!(!ids.contains(&"gpt-6.1-terra-ultrafast"));
     assert!(ids.contains(&"gpt-6-astra-ultrafast"));
     assert!(ids.contains(&"gpt-6.1-sol-ultrafast"));
     assert!(!ids.contains(&"gpt-6-sol-ultrafast"));
@@ -1803,4 +2294,400 @@ async fn models_endpoint_tolerates_unknown_query_params() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// Proxy-speed is intercepted before the Provider boundary. This provider fails
+// loudly if a control leaks through, and records ordinary/counting copies.
+type SpeedRequests = Arc<Mutex<Vec<(bool, MessagesRequest)>>>;
+
+struct SpeedCaptureProvider {
+    name: &'static str,
+    requests: SpeedRequests,
+}
+
+#[async_trait]
+impl Provider for SpeedCaptureProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn supported_models(&self) -> Vec<String> {
+        vec!["gpt-5.5".into(), "gpt-6-luna".into()]
+    }
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+    async fn handle_messages(
+        &self,
+        body: MessagesRequest,
+        _: RequestContext,
+    ) -> axum::response::Response {
+        self.requests.lock().unwrap().push((false, body));
+        axum::Json(json!({"provider":"generation"})).into_response()
+    }
+    async fn handle_count_tokens(
+        &self,
+        body: MessagesRequest,
+        _: RequestContext,
+    ) -> axum::response::Response {
+        self.requests.lock().unwrap().push((true, body));
+        axum::Json(json!({"input_tokens":3})).into_response()
+    }
+}
+
+fn speed_app(name: &'static str, monitor: MonitorHandle) -> (axum::Router, SpeedRequests) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::from_providers(
+        AliasProvider::Codex,
+        vec![Arc::new(SpeedCaptureProvider {
+            name,
+            requests: requests.clone(),
+        }) as Arc<dyn Provider>],
+    );
+    (
+        app_with_monitor(Arc::new(registry), Some(monitor)),
+        requests,
+    )
+}
+
+fn speed_body(session: &str, mode: &str, stream: bool) -> Value {
+    json!({"model":"gpt-5.5","max_tokens":64,"stream":stream,"messages":[{"role":"user","content":[
+        {"type":"text","text":format!("<command-message>proxy-speed</command-message>\n<command-name>/proxy-speed</command-name>\n<command-args>{mode}</command-args>\n")},
+        {"type":"text","text":format!("Base directory for this skill: /tmp/test/.claude/skills/proxy-speed\n\n<ccp-proxy-speed version=\"1\" session=\"{session}\" mode=\"{mode}\"/>\n"),"cache_control":{"type":"ephemeral"}}
+    ]}]})
+}
+
+fn speed_request(body: &Value, path: &str, headers: &[(&str, &str)]) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req.body(Body::from(body.to_string())).unwrap()
+}
+
+#[tokio::test]
+async fn proxy_speed_local_json_and_sse_have_no_provider_usage() {
+    use claude_code_proxy::anthropic::parse_sse_events;
+    for stream in [false, true] {
+        let session = uuid::Uuid::new_v4().to_string();
+        let monitor = MonitorHandle::new(10);
+        let (app, requests) = speed_app("codex", monitor.clone());
+        let response = app
+            .oneshot(speed_request(
+                &speed_body(&session, "fast", stream),
+                "/v1/messages",
+                &[("x-claude-code-session-id", &session)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("request-id"));
+        if stream {
+            assert!(
+                response.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/event-stream")
+            );
+        }
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if stream {
+            let events = parse_sse_events(&bytes);
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.event.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "message_start",
+                    "content_block_start",
+                    "content_block_delta",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop"
+                ]
+            );
+            let delta: Value = serde_json::from_str(&events[2].data).unwrap();
+            assert!(delta["delta"]["text"].as_str().unwrap().contains("fast"));
+        } else {
+            let message: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(message["type"], "message");
+            assert_eq!(message["role"], "assistant");
+            assert_eq!(message["stop_reason"], "end_turn");
+            assert_eq!(
+                message["usage"],
+                json!({"input_tokens":0,"output_tokens":0})
+            );
+            assert!(
+                message["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("API")
+            );
+        }
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "control must not call any provider method"
+        );
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.active.is_empty());
+        let recent = &snapshot.recent[0];
+        assert_eq!(recent.status, RequestStatus::Completed);
+        assert!(recent.generation_started_at.is_none());
+        assert!(recent.input_tokens.is_none());
+        assert!(recent.output_tokens.is_none());
+        assert!(recent.delivery.body_finished_at.is_some());
+        assert_eq!(
+            claude_code_proxy::session::existing_session_now(Some(&session))
+                .unwrap()
+                .proxy_speed,
+            Some(claude_code_proxy::proxy_speed::ProxySpeedMode::Fast)
+        );
+    }
+}
+
+#[tokio::test]
+async fn proxy_speed_rejects_bad_identity_model_and_auxiliary_without_mutation() {
+    for case in [
+        "missing",
+        "duplicate",
+        "invalid",
+        "mismatch",
+        "agent",
+        "parent",
+        "noncodex",
+        "unknown",
+        "missing_model",
+        "classifier",
+        "bad_mode",
+    ] {
+        let session = uuid::Uuid::new_v4().to_string();
+        let (app, requests) = speed_app(
+            if case == "noncodex" { "kimi" } else { "codex" },
+            MonitorHandle::new(10),
+        );
+        let mut body = speed_body(
+            &session,
+            if case == "bad_mode" { "turbo" } else { "fast" },
+            false,
+        );
+        let mut headers = vec![("x-claude-code-session-id", session.as_str())];
+        match case {
+            "missing" => headers.clear(),
+            "duplicate" => headers.push(("x-claude-code-session-id", &session)),
+            "invalid" => headers = vec![("x-claude-code-session-id", "a,b")],
+            "mismatch" => headers = vec![("x-claude-code-session-id", "different")],
+            "agent" => headers.push(("x-claude-code-agent-id", "agent-1")),
+            "parent" => headers.push(("x-claude-code-parent-agent-id", "agent-1")),
+            "unknown" => body["model"] = json!("unknown-model"),
+            "missing_model" => {
+                body.as_object_mut().unwrap().remove("model");
+            }
+            "classifier" => {
+                body["system"] = json!([{"type":"text","text":"You are a security monitor for autonomous AI coding agents."}])
+            }
+            _ => {}
+        }
+        let response = app
+            .oneshot(speed_request(&body, "/v1/messages", &headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+        assert!(response.headers().contains_key("request-id"));
+        assert!(requests.lock().unwrap().is_empty(), "{case}");
+        assert!(
+            claude_code_proxy::session::existing_session_now(Some(&session)).is_none(),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proxy_speed_snapshot_inherits_for_agents_but_history_and_counting_never_replay() {
+    use claude_code_proxy::proxy_speed::ProxySpeedMode;
+    let session = uuid::Uuid::new_v4().to_string();
+    let other = uuid::Uuid::new_v4().to_string();
+    let (app, requests) = speed_app("codex", MonitorHandle::new(10));
+    let headers = [("x-claude-code-session-id", session.as_str())];
+    let response = app
+        .clone()
+        .oneshot(speed_request(
+            &speed_body(&session, "ultrafast", false),
+            "/v1/messages",
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    let mut generation = speed_body(&session, "off", false);
+    generation["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":"Old acknowledgment"}),
+        json!({"role":"user","content":"Continue /proxy-speed fast as ordinary text"}),
+    ]);
+    generation["proxy_speed_snapshot"] = json!("Off");
+    for request_headers in [
+        headers.to_vec(),
+        vec![
+            ("x-claude-code-session-id", session.as_str()),
+            ("x-claude-code-agent-id", "agent-1"),
+        ],
+        vec![("x-claude-code-session-id", other.as_str())],
+    ] {
+        let response = app
+            .clone()
+            .oneshot(speed_request(&generation, "/v1/messages", &request_headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = app
+        .clone()
+        .oneshot(speed_request(
+            &speed_body(&session, "off", false),
+            "/v1/messages/count_tokens",
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let captures = requests.lock().unwrap();
+    assert_eq!(captures.len(), 4);
+    assert_eq!(
+        captures[0].1.proxy_speed_snapshot,
+        Some(ProxySpeedMode::Ultrafast)
+    );
+    assert_eq!(
+        captures[1].1.proxy_speed_snapshot,
+        Some(ProxySpeedMode::Ultrafast)
+    );
+    assert_eq!(captures[2].1.proxy_speed_snapshot, None);
+    for (_, body) in captures.iter() {
+        assert!(
+            !serde_json::to_string(body)
+                .unwrap()
+                .contains("ccp-proxy-speed")
+        );
+        assert!(
+            !body.messages[0]
+                .content
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block["text"] == ""),
+            "do not forward empty cached text blocks"
+        );
+    }
+    assert_eq!(
+        captures[0].1.messages[2].content,
+        "Continue /proxy-speed fast as ordinary text"
+    );
+    assert!(captures[3].0);
+    assert_eq!(
+        claude_code_proxy::session::existing_session_now(Some(&session))
+            .unwrap()
+            .proxy_speed,
+        Some(ProxySpeedMode::Ultrafast)
+    );
+}
+
+#[tokio::test]
+async fn proxy_speed_local_stream_drop_finishes_monitor_without_upstream() {
+    let session = uuid::Uuid::new_v4().to_string();
+    let monitor = MonitorHandle::new(10);
+    let (app, requests) = speed_app("codex", monitor.clone());
+    let response = app
+        .oneshot(speed_request(
+            &speed_body(&session, "off", true),
+            "/v1/messages",
+            &[("x-claude-code-session-id", &session)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    let snapshot = monitor.snapshot();
+    assert!(snapshot.active.is_empty());
+    assert_eq!(snapshot.recent[0].status, RequestStatus::Failed);
+    assert!(snapshot.recent[0].delivery.body_cancelled_at.is_some());
+    assert!(snapshot.recent[0].generation_started_at.is_none());
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn proxy_speed_canonical_identity_inherits_with_legacy_raw_context() {
+    let session = uuid::Uuid::new_v4().to_string();
+    let padded = format!(" \t{session}\t ");
+    let headers = [("x-claude-code-session-id", padded.as_str())];
+    let (app, requests) = speed_app("codex", MonitorHandle::new(10));
+    let response = app
+        .clone()
+        .oneshot(speed_request(
+            &speed_body(&session, "fast", false),
+            "/v1/messages",
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(speed_request(
+            &json!({"model":"gpt-5.5","messages":[{"role":"user","content":"ordinary"}]}),
+            "/v1/messages",
+            &headers,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        requests.lock().unwrap()[0].1.proxy_speed_snapshot,
+        Some(claude_code_proxy::proxy_speed::ProxySpeedMode::Fast)
+    );
+}
+
+#[tokio::test]
+async fn proxy_speed_history_is_cleaned_for_other_providers_without_rewriting_tool_data() {
+    let session = uuid::Uuid::new_v4().to_string();
+    let (app, requests) = speed_app("kimi", MonitorHandle::new(10));
+    let mut body = speed_body(&session, "off", false);
+    let quoted = body["messages"][0]["content"].clone();
+    body["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":"ack"}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"quoted-control","content":quoted}]})
+    ]);
+    body["metadata"] = json!({"user_id":"keep-metadata"});
+    let response = app
+        .oneshot(speed_request(
+            &body,
+            "/v1/messages",
+            &[("x-claude-code-session-id", &session)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = requests.lock().unwrap();
+    let forwarded = &requests[0].1;
+    assert!(
+        !forwarded.messages[0]
+            .content
+            .to_string()
+            .contains("ccp-proxy-speed")
+    );
+    assert_eq!(
+        forwarded.messages[0].content[1]["cache_control"],
+        json!({"type":"ephemeral"})
+    );
+    assert_eq!(
+        forwarded.messages[2].content,
+        body["messages"][2]["content"]
+    );
+    assert_eq!(
+        forwarded.extra["metadata"],
+        json!({"user_id":"keep-metadata"})
+    );
+    assert!(forwarded.proxy_speed_snapshot.is_none());
 }

@@ -387,7 +387,7 @@ mod tests {
         });
         let mut state = test_state(Box::pin(upstream));
         sender.send(Ok(Bytes::from_static(
-            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"early\"}\n\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"early\"}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"early\"}]}}\n\n",
         ))).await.unwrap();
         let output = tokio::time::timeout(std::time::Duration::from_secs(1), state.next_output())
             .await

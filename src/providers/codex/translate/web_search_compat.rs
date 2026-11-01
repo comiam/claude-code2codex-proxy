@@ -1,3 +1,89 @@
+//! ClaudeCode search UI compatibility using actual calls and source metadata.
+//! These cards carry no Anthropic opaque replay credentials.
+/// Escape Markdown delimiters without harvesting or inventing any source.
+pub(crate) fn markdown_link(title: &str, url: &str) -> String {
+    let title = title
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace(['\n', '\r'], " ");
+    let url = escaped_markdown_url(url);
+    format!("\n[{title}]({url})\n")
+}
+
+fn escaped_markdown_url(url: &str) -> String {
+    url.replace(' ', "%20")
+        .replace('(', "%28")
+        .replace(')', "%29")
+        .replace(['\n', '\r'], "")
+}
+
+/// Match an entire URL token in plain text or Markdown. A different source
+/// whose URL merely starts with this one must not suppress the real citation.
+pub(crate) fn source_url_is_represented(text: &str, url: &str) -> bool {
+    if url.is_empty() {
+        return false;
+    }
+    let boundary = |c: char| {
+        c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | '\'' | '"' | '`')
+    };
+    let represented = |candidate: &str| {
+        !candidate.is_empty()
+            && text.match_indices(candidate).any(|(start, _)| {
+                text[..start].chars().next_back().is_none_or(boundary)
+                    && text[start + candidate.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(boundary)
+            })
+    };
+    if represented(url) {
+        return true;
+    }
+    // Compare the same representation emitted by markdown_link as well as
+    // the raw source, without decoding or otherwise normalizing source URLs.
+    let emitted = escaped_markdown_url(url);
+    emitted != url && represented(&emitted)
+}
+
+/// A completed OpenAI search projected for ClaudeCode's search counter/cards.
+/// Native Anthropic replay is unavailable; encrypted fields are never invented.
+#[derive(Debug, Clone)]
+pub(crate) struct SearchCard {
+    pub id: String,
+    pub input: serde_json::Value,
+    pub results: Vec<WebSearchResult>,
+}
+
+impl SearchCard {
+    pub(crate) fn blocks(&self) -> [serde_json::Value; 2] {
+        use serde_json::json;
+        [
+            json!({"type":"server_tool_use", "id":self.id, "name":"web_search", "input":self.input}),
+            json!({"type":"web_search_tool_result", "tool_use_id":self.id,
+                "content": self.results.iter().map(|result| json!({"type":"web_search_result", "title":result.title, "url":result.url})).collect::<Vec<_>>() }),
+        ]
+    }
+}
+
+impl WebSearchResult {
+    pub(crate) fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let url = value["url"]
+            .as_str()
+            .filter(|url| url.starts_with("https://") || url.starts_with("http://"))?;
+        Some(Self {
+            title: value["title"]
+                .as_str()
+                .filter(|title| !title.is_empty())
+                .unwrap_or(url)
+                .to_owned(),
+            url: url.to_owned(),
+        })
+    }
+}
+
+// Legacy public facade: OpenAI search lacks Anthropic's required opaque replay.
+// Keep source compatibility while declining to fabricate native result cards.
 use serde_json::Value;
 
 pub struct WebSearchCompatBlock {
@@ -17,7 +103,7 @@ pub enum WebSearchCompatContent {
     },
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct WebSearchResult {
     pub title: String,
     pub url: String,
@@ -37,169 +123,9 @@ pub fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
     format!("srvtoolu_{suffix}")
 }
 
-fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchResult> {
-    let mut results: Vec<WebSearchResult> = Vec::new();
-    let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Match markdown links [title](url)
-    let re = regex_lite::Regex::new(r#"\[([^\]\n]+)\]\((https?://[^)\s]+)\)"#).unwrap();
-    for cap in re.captures_iter(text) {
-        let title = clean_title(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
-        let url = clean_url(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
-        if url.is_empty() || seen_urls.contains(&url) {
-            continue;
-        }
-        seen_urls.insert(url.clone());
-        let display_title = if title.is_empty() {
-            fallback_title(&url)
-        } else {
-            title
-        };
-        results.push(WebSearchResult {
-            title: display_title,
-            url,
-        });
-    }
-
-    // Match bare URLs
-    let re2 = regex_lite::Regex::new(r"https?://[^\s<>()|]+").unwrap();
-    for cap in re2.captures_iter(text) {
-        let raw_url = cap.get(0).map(|m| m.as_str()).unwrap_or("");
-        let url = clean_url(raw_url);
-        if url.is_empty() || seen_urls.contains(&url) {
-            continue;
-        }
-        seen_urls.insert(url.clone());
-        results.push(WebSearchResult {
-            title: fallback_title(&url),
-            url,
-        });
-    }
-
-    results
-}
-
 pub fn build_web_search_compat_blocks(
-    searches: &[super::reducer::ReducerEvent],
-    text: &str,
+    _searches: &[super::reducer::ReducerEvent],
+    _text: &str,
 ) -> Vec<WebSearchCompatBlock> {
-    let results = extract_web_search_results_from_text(text);
-    let mut blocks = Vec::new();
-
-    for event in searches {
-        if let super::reducer::ReducerEvent::WebSearch {
-            index,
-            result_index,
-            id,
-            query,
-        } = event
-        {
-            blocks.push(WebSearchCompatBlock {
-                index: *index,
-                content: WebSearchCompatContent::ServerToolUse {
-                    id: id.clone(),
-                    name: "web_search".to_string(),
-                    input: serde_json::json!({"query": query}),
-                },
-            });
-            blocks.push(WebSearchCompatBlock {
-                index: *result_index,
-                content: WebSearchCompatContent::WebSearchToolResult {
-                    tool_use_id: id.clone(),
-                    content: results.clone(),
-                },
-            });
-        }
-    }
-
-    blocks
-}
-
-fn clean_url(value: &str) -> String {
-    let mut out = value.trim().to_string();
-    while out.ends_with('.')
-        || out.ends_with(',')
-        || out.ends_with(';')
-        || out.ends_with(':')
-        || out.ends_with('!')
-        || out.ends_with('?')
-    {
-        out.pop();
-    }
-    out
-}
-
-fn clean_title(value: &str) -> String {
-    let no_markers = value
-        .trim_start()
-        .trim_start_matches(|c: char| c == '-' || c == '*' || c == '+' || c.is_ascii_digit())
-        .trim_start_matches(['.', ')', ' '])
-        .replace("**", "")
-        .replace('`', "")
-        .trim()
-        .to_string();
-    // Take text before dash or em-dash
-    if let Some(pos) = no_markers.find(" - ") {
-        no_markers[..pos].trim().to_string()
-    } else if let Some(find_pos) = no_markers.find(" \u{2013} ") {
-        no_markers[..find_pos].trim().to_string()
-    } else {
-        no_markers
-    }
-}
-
-fn fallback_title(url: &str) -> String {
-    url.trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or(url)
-        .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn server_tool_use_id_format() {
-        let id = server_tool_use_id_from_codex_web_search_id("ws_123");
-        assert_eq!(id, "srvtoolu_ws_123");
-    }
-
-    #[test]
-    fn extract_results_from_text() {
-        let text = "Check [Example](https://example.com) and https://other.com/page.";
-        let results = extract_web_search_results_from_text(text);
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().any(|r| r.url == "https://example.com"));
-        assert!(results.iter().any(|r| r.url == "https://other.com/page"));
-    }
-
-    #[test]
-    fn build_compat_blocks() {
-        let searches = vec![super::super::reducer::ReducerEvent::WebSearch {
-            index: 0,
-            result_index: 1,
-            id: "ws_1".to_string(),
-            query: "test".to_string(),
-        }];
-        let text = "See [Result](https://result.com)";
-        let blocks = build_web_search_compat_blocks(&searches, text);
-        assert_eq!(blocks.len(), 2);
-        match &blocks[0].content {
-            WebSearchCompatContent::ServerToolUse { name, input, .. } => {
-                assert_eq!(name, "web_search");
-                assert_eq!(input.get("query").and_then(|v| v.as_str()), Some("test"));
-            }
-            _ => panic!("expected ServerToolUse"),
-        }
-        match &blocks[1].content {
-            WebSearchCompatContent::WebSearchToolResult { content, .. } => {
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].url, "https://result.com");
-            }
-            _ => panic!("expected WebSearchToolResult"),
-        }
-    }
+    Vec::new()
 }

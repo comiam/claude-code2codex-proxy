@@ -11,6 +11,7 @@ use crate::providers::translate_shared::{
     read_effort,
 };
 
+use super::event::{SkipDiagnostics, SkippedEvent};
 use super::model_allowlist::service_tier_for_model;
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
@@ -46,6 +47,7 @@ impl std::fmt::Display for Effort {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
+    Fast,
     Priority,
     Ultrafast,
     Flex,
@@ -103,6 +105,101 @@ pub struct ResponsesRequest {
     pub reasoning: Option<ResponsesReasoning>,
 }
 
+/// Borrowed projection shared by continuation signatures and wire shaping.
+/// The exhaustive destructure below forces new request fields to be considered.
+#[derive(Serialize)]
+pub(crate) struct NonInputRequest<'a> {
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [ResponsesTool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a ResponsesToolChoice>,
+    store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_metadata: Option<&'a std::collections::HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'a ServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
+    text: &'a ResponsesText,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<&'a ResponsesReasoning>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct WireRequest<'a> {
+    #[serde(flatten)]
+    parameters: NonInputRequest<'a>,
+    input: &'a [ResponsesInputItem],
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<&'a str>,
+}
+
+impl ResponsesRequest {
+    pub(crate) fn non_input(&self) -> NonInputRequest<'_> {
+        let Self {
+            model,
+            instructions,
+            input: _,
+            tools,
+            tool_choice,
+            store,
+            stream,
+            parallel_tool_calls,
+            include,
+            client_metadata,
+            service_tier,
+            prompt_cache_key,
+            text,
+            reasoning,
+        } = self;
+        NonInputRequest {
+            model,
+            instructions: instructions.as_deref(),
+            tools: tools.as_deref(),
+            tool_choice: tool_choice.as_ref(),
+            store: *store,
+            stream: Some(*stream),
+            parallel_tool_calls: *parallel_tool_calls,
+            include: include.as_deref(),
+            client_metadata: client_metadata.as_ref(),
+            service_tier: service_tier.as_ref(),
+            prompt_cache_key: prompt_cache_key.as_deref(),
+            text,
+            reasoning: reasoning.as_ref(),
+        }
+    }
+
+    pub(crate) fn wire<'a>(
+        &'a self,
+        input: &'a [ResponsesInputItem],
+        http: bool,
+        previous_response_id: Option<&'a str>,
+    ) -> WireRequest<'a> {
+        let mut parameters = self.non_input();
+        if !http {
+            parameters.stream = None;
+        }
+        WireRequest {
+            parameters,
+            input,
+            kind: (!http).then_some("response.create"),
+            previous_response_id,
+        }
+    }
+}
+
+pub(crate) use crate::bounded_json_size;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesReasoning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,7 +232,7 @@ pub enum ResponsesTextFormat {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponsesInputItem {
     #[serde(rename = "additional_tools")]
@@ -175,7 +272,7 @@ pub enum ResponsesInputItem {
     CompactionTrigger,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ResponsesFunctionCallOutput {
     Text(String),
@@ -192,7 +289,7 @@ impl ResponsesFunctionCallOutput {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesFunctionCallOutputContentPart {
     InputText {
@@ -205,7 +302,7 @@ pub enum ResponsesFunctionCallOutputContentPart {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponsesContentPart {
     #[serde(rename = "input_text")]
@@ -329,23 +426,23 @@ const COMPACT_MESSAGE_TASK: &str =
     "Your task is to create a detailed summary of the conversation so far";
 
 pub(crate) fn is_compact_request(instructions: Option<&str>) -> bool {
-    instructions.is_some_and(|text| text.contains(COMPACT_SYSTEM_MARKER))
+    instructions.is_some_and(|text| text.trim_start().starts_with(COMPACT_SYSTEM_MARKER))
 }
 
 pub(crate) fn is_compact_message_text(text: &str) -> bool {
-    text.contains(COMPACT_MESSAGE_PREFIX) && text.contains(COMPACT_MESSAGE_TASK)
+    text.trim_start().starts_with(COMPACT_MESSAGE_PREFIX) && text.contains(COMPACT_MESSAGE_TASK)
 }
 
 fn is_compact_message_content(content: &Value) -> bool {
     match content {
         Value::String(text) => is_compact_message_text(text),
-        Value::Array(blocks) => blocks.iter().any(|block| {
-            block.get("type").and_then(Value::as_str) == Some("text")
-                && block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_compact_message_text)
-        }),
+        // The first text instruction sets the mode; a later block may quote a prompt.
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .find(|text| !text.trim().is_empty())
+            .is_some_and(is_compact_message_text),
         _ => false,
     }
 }
@@ -357,21 +454,12 @@ pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
         })
 }
 
-/// Reasoning-effort cap applied to compaction requests, or None when the
-/// fast path is disabled. Summarization is extraction, not problem solving:
-/// native Claude Code compacts without extended thinking, so burning
-/// medium/high reasoning on a 200k-token summary only adds latency. The cap
-/// never raises effort — a request already below it is left alone.
-///
-/// A request naming no effort at all also takes the cap. Left unset it would
-/// run at the upstream default, which is the effort level the cap exists to
-/// avoid.
+/// Compaction effort cap, or None when disabled. Missing effort takes the cap
+/// instead of the upstream default; explicit effort below the cap is preserved.
 fn compact_effort_cap() -> Option<Effort> {
-    compact_effort_cap_from(std::env::var("CCP_COMPACT_EFFORT").ok().as_deref())
+    compact_effort_cap_from(config::codex_compact_effort().as_deref())
 }
 
-/// Applies the cap to a request's resolved effort. A missing effort takes
-/// the cap; an explicit effort at or below it is preserved.
 fn apply_compact_effort_cap(resolved: Option<Effort>, cap: Option<Effort>) -> Option<Effort> {
     match (resolved, cap) {
         (resolved, None) => resolved,
@@ -463,7 +551,16 @@ pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    translate_request_inner(req, opts, true)
+    translate_request_with_request_id(req, opts, None)
+}
+
+/// Production input skips use the same request identity as output diagnostics.
+pub(crate) fn translate_request_with_request_id(
+    req: &MessagesRequest,
+    opts: TranslateOptions,
+    req_id: Option<&str>,
+) -> Result<ResponsesRequest, anyhow::Error> {
+    translate_request_inner(req, opts, true, req_id)
 }
 
 pub fn translate_openai_compatible_request(
@@ -480,6 +577,7 @@ pub fn translate_openai_compatible_request(
             use_responses_lite: false,
         },
         false,
+        None,
     )
 }
 
@@ -487,12 +585,22 @@ fn translate_request_inner(
     req: &MessagesRequest,
     opts: TranslateOptions,
     apply_codex_config: bool,
+    req_id: Option<&str>,
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
-    let tools = read_tools(req)?;
-    let tool_choice = map_tool_choice(req)?;
+    let mut diagnostics = SkipDiagnostics::default();
+    if let Some(req_id) = req_id {
+        diagnostics.set_request_id(req_id);
+    }
+    let input = build_input(req, &mut diagnostics);
+    // Claude Code compact is a text generation; historical calls stay in input.
+    let text_only_compact = apply_codex_config && is_compact;
+    let (tools, tool_choice) = if text_only_compact {
+        (None, None)
+    } else {
+        (read_tools(req)?, map_tool_choice(req)?)
+    };
     let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
 
     let mut text = ResponsesText {
@@ -581,10 +689,14 @@ fn translate_request_inner(
     }
 
     if apply_codex_config {
-        let service_tier = resolve_service_tier(opts.service_tier, &out.model)?;
-        if let Some(ref tier) = service_tier {
-            out.service_tier = Some(tier.clone());
-        }
+        // Full and Lite requests use the session tier; compaction uses its own tier policy.
+        out.service_tier = match req.proxy_speed_snapshot {
+            Some(crate::proxy_speed::ProxySpeedMode::Off) => None,
+            Some(_) if is_compact => resolve_service_tier(opts.service_tier, &out.model)?,
+            Some(crate::proxy_speed::ProxySpeedMode::Fast) => Some(ServiceTier::Fast),
+            Some(crate::proxy_speed::ProxySpeedMode::Ultrafast) => Some(ServiceTier::Ultrafast),
+            None => resolve_service_tier(opts.service_tier, &out.model)?,
+        };
     }
 
     let effort = read_effort(req)?;
@@ -648,6 +760,14 @@ fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
     }
 }
 
+/// The standalone search route skips Responses translation, but declaration
+/// errors must still be local before either upstream route is called.
+pub(crate) fn validate_tool_registration(req: &MessagesRequest) -> Result<(), anyhow::Error> {
+    read_tools(req)?;
+    map_tool_choice(req)?;
+    Ok(())
+}
+
 fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
     let Some(tools) = req.extra.get("tools") else {
         return Ok(None);
@@ -692,11 +812,23 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 filters: if has_filters { Some(filters) } else { None },
             }));
         } else {
+            // Versioned Anthropic built-ins are not client functions. Unknown
+            // custom types remain valid when the client supplies a JSON schema.
+            if is_unsupported_server_tool_type(tool_type)
+                || (tool_type != "function"
+                    && tool_type != "custom"
+                    && !tool.get("input_schema").is_some_and(Value::is_object))
+            {
+                anyhow::bail!("Unsupported server tool type: {tool_type}");
+            }
             let name = tool
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if name == "ToolSearch" {
+                continue;
+            }
             let description = tool
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -721,6 +853,24 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     } else {
         Ok(Some(out))
     }
+}
+
+fn is_unsupported_server_tool_type(kind: &str) -> bool {
+    kind == "server_tool"
+        || [
+            "web_search_",
+            "web_fetch_",
+            "code_execution_",
+            "tool_search_",
+            "computer_",
+            "bash_",
+            "text_editor_",
+        ]
+        .iter()
+        .any(|prefix| kind.starts_with(prefix))
+            && kind.rsplit('_').next().is_some_and(|version| {
+                version.len() == 8 && version.bytes().all(|byte| byte.is_ascii_digit())
+            })
 }
 
 fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
@@ -857,6 +1007,11 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
                     tools: vec![serde_json::json!({"type": "web_search"})],
                 }))
             } else {
+                if name == "ToolSearch" {
+                    anyhow::bail!(
+                        "ToolSearch is excluded; choose an available client function instead"
+                    );
+                }
                 Ok(Some(ResponsesToolChoice::Function {
                     r#type: "function".to_string(),
                     name: name.to_string(),
@@ -867,12 +1022,15 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
     }
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+fn build_input(
+    req: &MessagesRequest,
+    diagnostics: &mut SkipDiagnostics,
+) -> Vec<ResponsesInputItem> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
 
     for msg in &req.messages {
-        let blocks = normalize_content(&msg.content, Value::Null);
+        let blocks = normalize_codex_content(&msg.content, diagnostics);
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
@@ -898,7 +1056,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                     content: std::mem::take(&mut parts),
                                 });
                             }
-                            let mut rendered = render_tool_result(content);
+                            let mut rendered = render_tool_result(content, diagnostics);
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
@@ -998,6 +1156,104 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
         }
     }
 
+    out
+}
+
+/// Preserve only the plain fields actually present in old search history.
+/// Projection happens before shared normalization, in the original block order.
+/// No native search item, encrypted field, or synthetic function result is replayed.
+fn normalize_codex_content(
+    content: &Value,
+    diagnostics: &mut SkipDiagnostics,
+) -> Vec<ContentBlock> {
+    let Some(blocks) = content.as_array() else {
+        return normalize_content(content, Value::Null);
+    };
+    let mut has_search = false;
+    for block in blocks {
+        match block["type"].as_str().unwrap_or("") {
+            "web_search_tool_result" => has_search = true,
+            "server_tool_use" if block["name"] == "web_search" => has_search = true,
+            "text" | "image" | "tool_use" | "tool_result" | "thinking" => {}
+            _ => diagnostics.record(&SkippedEvent::new(block, "unsupported_input_block")),
+        }
+    }
+    if !has_search {
+        return normalize_content(content, Value::Null);
+    }
+    let mut visible_text = blocks
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    for block in blocks {
+        let kind = block["type"].as_str().unwrap_or("");
+        let search = kind == "web_search_tool_result"
+            || (kind == "server_tool_use" && block["name"] == "web_search");
+        if search {
+            diagnostics.record(&SkippedEvent::new(block, "legacy_search_context_only"));
+            let mut text = String::new();
+            if kind == "server_tool_use" {
+                if let Some(query) = block.pointer("/input/query").and_then(Value::as_str) {
+                    let query_line = format!("Web search query: {query}");
+                    if !query.is_empty()
+                        && !visible_text
+                            .lines()
+                            .any(|line| line == query || line == query_line)
+                    {
+                        text.push_str(&query_line);
+                    }
+                }
+            } else if let Some(results) = block["content"].as_array() {
+                for result in results {
+                    if result["type"] != "web_search_result" {
+                        diagnostics.record(&SkippedEvent::new(
+                            result,
+                            "unsupported_search_history_child",
+                        ));
+                        continue;
+                    }
+                    let title = result["title"].as_str().unwrap_or("");
+                    let url = result["url"].as_str().unwrap_or("");
+                    if !url.is_empty()
+                        && !super::web_search_compat::source_url_is_represented(&visible_text, url)
+                    {
+                        let link = super::web_search_compat::markdown_link(
+                            if title.is_empty() { url } else { title },
+                            url,
+                        );
+                        text.push_str(&link);
+                        visible_text.push_str(&link);
+                    } else if !title.is_empty() && !visible_text.contains(title) {
+                        text.push_str(&format!("\nWeb search source: {title}\n"));
+                    }
+                    for field in ["text", "content"] {
+                        if let Some(value) = result[field].as_str()
+                            && !value.is_empty()
+                            && !visible_text.contains(value)
+                        {
+                            text.push('\n');
+                            text.push_str(value);
+                            visible_text.push('\n');
+                            visible_text.push_str(value);
+                        }
+                    }
+                }
+            }
+            if !text.is_empty() {
+                visible_text.push('\n');
+                visible_text.push_str(&text);
+                out.push(ContentBlock::Text { text });
+            }
+        } else {
+            out.extend(normalize_content(
+                &Value::Array(vec![block.clone()]),
+                Value::Null,
+            ));
+        }
+    }
     out
 }
 
@@ -1103,30 +1359,53 @@ impl RenderedToolResult {
     }
 }
 
-fn render_tool_result(content: &Value) -> RenderedToolResult {
+fn render_tool_result(content: &Value, diagnostics: &mut SkipDiagnostics) -> RenderedToolResult {
     let parts = match content {
         Value::String(text) => vec![RenderedToolResultPart::Text(text.clone())],
-        Value::Array(blocks) => blocks.iter().map(render_tool_result_block).collect(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| render_tool_result_block(block, diagnostics))
+            .collect(),
         _ => Vec::new(),
     };
     RenderedToolResult { parts }
 }
 
-fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
-    match block.get("type").and_then(Value::as_str) {
+fn render_tool_result_block(
+    block: &Value,
+    diagnostics: &mut SkipDiagnostics,
+) -> Option<RenderedToolResultPart> {
+    let part = match block.get("type").and_then(Value::as_str) {
         Some("text") => block
             .get("text")
             .and_then(Value::as_str)
             .map(|text| RenderedToolResultPart::Text(text.to_string()))
             .unwrap_or_else(|| {
+                diagnostics.record(&SkippedEvent::new(block, "malformed_tool_result_child"));
                 RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
             }),
-        Some("image") => render_tool_result_image(block),
-        Some(other) => {
-            RenderedToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
+        Some("image") => {
+            let part = render_tool_result_image(block);
+            if matches!(part, RenderedToolResultPart::Text(_)) {
+                diagnostics.record(&SkippedEvent::new(block, "unsupported_tool_result_image"));
+            }
+            part
         }
-        None => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block)),
-    }
+        Some(kind) => {
+            let reason = if kind == "tool_reference" {
+                "legacy_tool_reference"
+            } else {
+                "unsupported_tool_result_child"
+            };
+            diagnostics.record(&SkippedEvent::new(block, reason));
+            return None;
+        }
+        None => {
+            diagnostics.record(&SkippedEvent::new(block, "malformed_tool_result_child"));
+            RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
+        }
+    };
+    Some(part)
 }
 
 fn render_tool_result_image(block: &Value) -> RenderedToolResultPart {
@@ -1211,6 +1490,70 @@ fn unsupported_tool_result_block_to_string(block: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_json_counter_stops_and_preserves_serialization_errors() {
+        struct Many<'a>(&'a std::cell::Cell<usize>);
+        impl serde::Serialize for Many<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(10_000))?;
+                for _ in 0..10_000 {
+                    self.0.set(self.0.get() + 1);
+                    seq.serialize_element("ten-bytes!")?;
+                }
+                seq.end()
+            }
+        }
+        struct Broken;
+        impl serde::Serialize for Broken {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("fixture serialization failure"))
+            }
+        }
+        let visits = std::cell::Cell::new(0);
+        assert_eq!(super::bounded_json_size(&Many(&visits), 64).unwrap(), None);
+        assert!(visits.get() < 10);
+        assert_eq!(super::bounded_json_size(&vec!["é"], 6).unwrap(), Some(6));
+        assert_eq!(super::bounded_json_size(&vec!["é"], 5).unwrap(), None);
+        assert!(
+            super::bounded_json_size(&Broken, 64)
+                .unwrap_err()
+                .to_string()
+                .contains("fixture serialization failure")
+        );
+    }
+
+    #[test]
+    fn borrowed_request_projection_preserves_every_non_input_field() {
+        let request: super::ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model":"gpt-6-sol", "instructions":"instruction", "input":[{"type":"reasoning","id":"r","summary":[],"encrypted_content":"opaque"}],
+            "tools":[{"type":"function","name":"f","parameters":{"type":"object"},"strict":true}],
+            "tool_choice":"auto", "store":false, "stream":true, "parallel_tool_calls":false,
+            "include":["reasoning.encrypted_content"], "client_metadata":{"z":"last","a":"first"},
+            "service_tier":"priority", "prompt_cache_key":"cache", "text":{"verbosity":"low","format":{"type":"json_object"}},
+            "reasoning":{"effort":"high","summary":"auto","context":"compact"}
+        })).unwrap();
+        let mut reference = serde_json::to_value(&request).unwrap();
+        reference.as_object_mut().unwrap().remove("input");
+        assert_eq!(
+            serde_json::to_value(request.non_input()).unwrap(),
+            reference
+        );
+        let wire = serde_json::to_value(request.wire(&[], false, Some("resp_before"))).unwrap();
+        assert_eq!(wire["input"], serde_json::json!([]));
+        assert_eq!(wire["type"], "response.create");
+        assert_eq!(wire["previous_response_id"], "resp_before");
+        assert!(wire.get("stream").is_none());
+        let mut expected = reference;
+        expected.as_object_mut().unwrap().remove("stream");
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&wire[key], value, "field {key}");
+        }
+        assert_eq!(
+            serde_json::to_value(request.wire(&request.input, true, None)).unwrap(),
+            serde_json::to_value(&request).unwrap()
+        );
+    }
     use super::*;
     use serde_json::json;
 
@@ -1223,6 +1566,155 @@ mod tests {
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
         }
+    }
+
+    #[tokio::test]
+    async fn service_tier_session_snapshot_overrides_legacy_policy_literally() {
+        use crate::proxy_speed::ProxySpeedMode::{Fast, Off, Ultrafast};
+        for (snapshot, global, suffix, expected) in [
+            (None, None, None, None),
+            (None, Some("fast"), None, Some("priority")),
+            (None, None, Some(ServiceTier::Ultrafast), Some("priority")),
+            (
+                Some(Fast),
+                Some("ultrafast"),
+                Some(ServiceTier::Ultrafast),
+                Some("fast"),
+            ),
+            (
+                Some(Ultrafast),
+                Some("flex"),
+                Some(ServiceTier::Priority),
+                Some("ultrafast"),
+            ),
+            (
+                Some(Off),
+                Some("ultrafast"),
+                Some(ServiceTier::Priority),
+                None,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut env = std::collections::HashMap::from([
+                ("HOME".into(), dir.path().display().to_string()),
+                ("CCP_CONFIG_DIR".into(), dir.path().display().to_string()),
+            ]);
+            if let Some(global) = global {
+                env.insert("CCP_CODEX_SERVICE_TIER".into(), global.into());
+            }
+            config::CodexRequestSettings::for_env(env)
+                .scope(async {
+                    let mut req: MessagesRequest = serde_json::from_value(json!({
+                        "model":"gpt-5.5-fast", "messages":[{"role":"user","content":"hello"}],
+                        "output_config":{"effort":"high"}
+                    }))
+                    .unwrap();
+                    req.proxy_speed_snapshot = snapshot;
+                    let translated = translate_request(
+                        &req,
+                        TranslateOptions {
+                            service_tier: suffix,
+                            ..opts()
+                        },
+                    )
+                    .unwrap();
+                    let wire = serde_json::to_value(&translated).unwrap();
+                    assert_eq!(
+                        wire.get("service_tier").and_then(Value::as_str),
+                        expected,
+                        "{snapshot:?} {global:?}"
+                    );
+                    assert_eq!(wire["model"], "gpt-5.5");
+                    assert_eq!(wire["reasoning"]["effort"], "high");
+                })
+                .await;
+        }
+    }
+
+    #[test]
+    fn service_tier_snapshot_cannot_be_injected_through_json() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.5", "messages":[], "proxy_speed_snapshot":"Ultrafast"
+        }))
+        .unwrap();
+        assert_eq!(req.proxy_speed_snapshot, None);
+        let mut req = req;
+        req.proxy_speed_snapshot = Some(crate::proxy_speed::ProxySpeedMode::Fast);
+        assert!(
+            serde_json::to_value(&req)
+                .unwrap()
+                .get("proxy_speed_snapshot")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn service_tier_session_lite_preserves_literal_tier_on_http_and_websocket() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = config::CodexRequestSettings::for_env(std::collections::HashMap::from([
+            ("HOME".into(), dir.path().display().to_string()),
+            ("CCP_CONFIG_DIR".into(), dir.path().display().to_string()),
+        ]));
+        settings
+            .scope(async {
+                for (mode, expected) in [
+                    (crate::proxy_speed::ProxySpeedMode::Fast, "fast"),
+                    (crate::proxy_speed::ProxySpeedMode::Ultrafast, "ultrafast"),
+                ] {
+                    let mut req: MessagesRequest = serde_json::from_value(json!({
+                        "model":"gpt-6.1-sol",
+                        "messages":[{"role":"user","content":"hello"}],
+                        "output_config":{"effort":"xhigh"}
+                    })).unwrap();
+                    req.proxy_speed_snapshot = Some(mode);
+                    let translated = translate_request(
+                        &req,
+                        TranslateOptions {
+                            model: "gpt-6.1-sol".into(),
+                            use_responses_lite: true,
+                            ..opts()
+                        },
+                    ).unwrap();
+                    for http in [true, false] {
+                        let wire = serde_json::to_value(
+                            translated.wire(&translated.input, http, None)
+                        ).unwrap();
+                        assert_eq!(wire["service_tier"], expected);
+                        assert_eq!(wire["model"], "gpt-6.1-sol");
+                        assert_eq!(wire["reasoning"]["effort"], "xhigh");
+                        assert_eq!(wire["reasoning"]["context"], "all_turns");
+                        assert_eq!(wire["parallel_tool_calls"], false);
+                        assert_eq!(wire["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"], "true");
+                    }
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn service_tier_session_keeps_compact_and_native_legacy_policy_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        config::CodexRequestSettings::for_env(std::collections::HashMap::from([
+            ("CCP_CONFIG_DIR".into(), dir.path().display().to_string()),
+            ("CCP_CODEX_SERVICE_TIER".into(), "priority".into()),
+        ])).scope(async {
+            for mode in [crate::proxy_speed::ProxySpeedMode::Fast, crate::proxy_speed::ProxySpeedMode::Ultrafast] {
+                for (compact, lite) in [(true, false), (false, true), (true, true)] {
+                    let mut req: MessagesRequest = serde_json::from_value(json!({
+                        "messages":[{"role":"user","content":"Summarize the conversation"}],
+                        "system":if compact {"You are a helpful AI assistant tasked with summarizing conversations."} else {"Ordinary request"}
+                    })).unwrap();
+                    req.proxy_speed_snapshot = Some(mode);
+                    let wire = serde_json::to_value(translate_request(&req, TranslateOptions { use_responses_lite: lite, ..opts() }).unwrap()).unwrap();
+                    let expected = if compact { "priority" } else { mode.as_str() };
+                    assert_eq!(wire["service_tier"], expected);
+                }
+                let mut req: MessagesRequest = serde_json::from_value(json!({"messages":[]})).unwrap();
+                req.proxy_speed_snapshot = Some(mode);
+                let wire = serde_json::to_value(translate_openai_compatible_request(&req, "gpt-5.5".into(), None).unwrap()).unwrap();
+                assert!(wire.get("service_tier").is_none());
+            }
+        }).await;
     }
 
     #[test]
@@ -1974,6 +2466,84 @@ mod tests {
     }
 
     #[test]
+    fn quoted_compact_user_instructions_remain_ordinary() {
+        let prompt = concat!(
+            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+            "Your task is to create a detailed summary of the conversation so far."
+        );
+        for text in [
+            format!(
+                "Explain this compact prompt: \"{prompt}\" Then inspect src/main.rs with Read."
+            ),
+            format!("\"{prompt}\""),
+            format!("```text\n{prompt}\n```"),
+            format!("> {prompt}"),
+        ] {
+            assert!(
+                !is_compact_message_text(&text),
+                "quoted user prompt: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_compact_system_instructions_remain_ordinary() {
+        for text in [
+            "You are Claude Code. Example prompt to discuss, not execute: \"You are a helpful AI assistant tasked with summarizing conversations.\"",
+            "```text\nYou are a helpful AI assistant tasked with summarizing conversations.\n```",
+        ] {
+            assert!(
+                !is_compact_request(Some(text)),
+                "quoted system prompt: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_compact_multiblock_instructions_remain_ordinary() {
+        let prompt = concat!(
+            "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+            "Your task is to create a detailed summary of the conversation so far."
+        );
+        for (system, content) in [
+            (
+                json!("You are Claude Code."),
+                json!([
+                    {"type":"text", "text":"Explain this quoted compact prompt, then inspect src/main.rs with Read:"},
+                    {"type":"text", "text":prompt}
+                ]),
+            ),
+            (
+                json!([
+                    {"type":"text", "text":"You are Claude Code. Discuss the following example prompt:"},
+                    {"type":"text", "text":"You are a helpful AI assistant tasked with summarizing conversations."}
+                ]),
+                json!("Inspect src/main.rs with Read."),
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol", "system":system,
+                "messages":[{"role":"user", "content":content}]
+            }))
+            .unwrap();
+            assert!(!is_compact_messages_request(&req));
+        }
+    }
+
+    #[test]
+    fn compact_instruction_prefixes_allow_whitespace_and_cli_bullets() {
+        assert!(is_compact_request(Some(
+            " \nYou are a helpful AI assistant tasked with summarizing conversations. Keep the focus."
+        )));
+        assert!(is_compact_message_text(concat!(
+            " \nCRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+            "- Do NOT use Read, Bash, or ANY other tool.\n",
+            "- Your entire response must be plain text.\n\n",
+            "Your task is to create a detailed summary of the conversation so far. Focus on migration."
+        )));
+    }
+
+    #[test]
     fn compact_effort_cap_parses_env_values() {
         assert!(matches!(compact_effort_cap_from(None), Some(Effort::Low)));
         assert!(matches!(
@@ -2190,6 +2760,269 @@ mod tests {
         }
     }
 
+    // These fixtures catch loss of history IDs/data, unsafe generic server-tool
+    // fallback, and deferred tooling leaking into the Responses registration.
+    #[test]
+    fn task4_toolsearch_excluded_full_mcp_schema_and_paired_history_survive() {
+        let schema = json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false});
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "tools":[
+                {"name":"ToolSearch","input_schema":{"type":"object"}},
+                {"name":"mcp__fixture__ToolSearch","defer_loading":true,"input_schema":schema},
+                {"name":"SearchNotes","type":"custom","input_schema":{"type":"object"}}
+            ],
+            "tool_choice":{"type":"tool","name":"mcp__fixture__ToolSearch"},
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Before"},
+                    {"type":"tool_use","id":"old_discovery","name":"ToolSearch","input":{}},
+                    {"type":"tool_use","id":"mcp_call","name":"mcp__fixture__ToolSearch","input":{"query":"fixture"}},
+                    {"type":"text","text":"Between"},
+                    {"type":"tool_use","id":"notes_call","name":"SearchNotes","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"old_discovery","content":[{"type":"tool_reference","tool_name":"mcp__fixture__ToolSearch"}]},
+                    {"type":"tool_result","tool_use_id":"mcp_call","content":[
+                        {"type":"text","text":"before"},
+                        {"type":"tool_reference","tool_name":"not_registered"},
+                        {"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG_BASE64}},
+                        {"type":"future_typed_child","payload":"DO_NOT_COPY"},
+                        {"type":"text","text":"after"}
+                    ]},
+                    {"type":"tool_result","tool_use_id":"notes_call","content":"notes result"},
+                    {"type":"text","text":"Continue"}
+                ]}
+            ]
+        })).unwrap();
+        for lite in [false, true] {
+            let mut options = opts();
+            options.use_responses_lite = lite;
+            let out = translate_request(&req, options).unwrap();
+            let wire = serde_json::to_value(&out).unwrap();
+            let tools = if lite {
+                &wire["input"][0]["tools"]
+            } else {
+                &wire["tools"]
+            };
+            assert_eq!(tools.as_array().unwrap().len(), 2);
+            assert_eq!(tools[0]["name"], "mcp__fixture__ToolSearch");
+            assert_eq!(tools[0]["parameters"], schema);
+            assert_eq!(tools[1]["name"], "SearchNotes");
+            assert_eq!(
+                wire["tool_choice"],
+                json!({"type":"function","name":"mcp__fixture__ToolSearch"})
+            );
+            let input = &wire["input"].as_array().unwrap()[usize::from(lite)..];
+            assert_eq!(
+                input[1],
+                json!({"type":"function_call","call_id":"old_discovery","name":"ToolSearch","arguments":"{}"})
+            );
+            assert_eq!(
+                input[2],
+                json!({"type":"function_call","call_id":"mcp_call","name":"mcp__fixture__ToolSearch","arguments":"{\"query\":\"fixture\"}"})
+            );
+            assert_eq!(input[4]["call_id"], "notes_call");
+            assert_eq!(
+                input[5],
+                json!({"type":"function_call_output","call_id":"old_discovery","output":""})
+            );
+            assert_eq!(
+                input[6],
+                json!({"type":"function_call_output","call_id":"mcp_call","output":[
+                    {"type":"input_text","text":"before"},
+                    {"type":"input_image","image_url":format!("data:image/png;base64,{PNG_BASE64}")},
+                    {"type":"input_text","text":"after"}
+                ]})
+            );
+            assert_eq!(
+                input[7],
+                json!({"type":"function_call_output","call_id":"notes_call","output":"notes result"})
+            );
+            assert_eq!(input[8]["content"][0]["text"], "Continue");
+            let serialized = wire.to_string();
+            for forbidden in [
+                "tool_reference",
+                "future_typed_child",
+                "DO_NOT_COPY",
+                "defer_loading",
+                "reqId",
+                "skip_diagnostics",
+                "sequence_number",
+            ] {
+                assert!(!serialized.contains(forbidden), "{forbidden}: {wire}");
+            }
+        }
+        let mut forced = req;
+        forced.extra.insert(
+            "tool_choice".into(),
+            json!({"type":"tool","name":"ToolSearch"}),
+        );
+        assert!(
+            translate_request(&forced, opts())
+                .unwrap_err()
+                .to_string()
+                .contains("ToolSearch")
+        );
+    }
+
+    #[test]
+    fn task4_rejects_explicit_server_tools_but_preserves_custom_schema_tools() {
+        for kind in [
+            "web_search_20260209",
+            "web_fetch_20250910",
+            "code_execution_20250825",
+            "tool_search_tool_regex_20251119",
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "tools":[{"type":kind,"name":"native"}],"messages":[]
+            }))
+            .unwrap();
+            assert!(translate_request(&req, opts()).is_err(), "{kind}");
+        }
+        // Compact removes registrations/choice before validating executable tools.
+        let compact: MessagesRequest = serde_json::from_value(json!({
+            "system":"You are a helpful AI assistant tasked with summarizing conversations.",
+            "tools":[{"type":"web_fetch_20250910","name":"native"},{"name":"ToolSearch"}],
+            "tool_choice":{"type":"tool","name":"ToolSearch"}, "messages":[]
+        }))
+        .unwrap();
+        let compact = translate_request(&compact, opts()).unwrap();
+        assert!(compact.tools.is_none() && compact.tool_choice.is_none());
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "tools":[{"type":"fixture_schema_tool","name":"NativeSearch","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}],"messages":[]
+        })).unwrap();
+        let out = serde_json::to_value(translate_request(&req, opts()).unwrap()).unwrap();
+        assert_eq!(out["tools"][0]["name"], "NativeSearch");
+        assert_eq!(
+            out["tools"][0]["parameters"]["properties"]["q"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn task4_input_skip_diagnostics_are_bounded_and_keep_request_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = config::CodexRequestSettings::for_env(std::collections::HashMap::from([
+            ("CCP_CONFIG_DIR".into(), temp.path().display().to_string()),
+            ("XDG_STATE_HOME".into(), temp.path().display().to_string()),
+        ]));
+        let log_path = settings.clone().sync_scope(crate::logging::log_file);
+        settings.sync_scope(|| {
+            let mut children = vec![json!({"type":"text","text":"supported neighbor"})];
+            for _ in 0..100 {
+                children.push(json!({"type":"tool_reference","tool_name":"DO_NOT_LOG"}));
+            }
+            for i in 0..24 {
+                children.push(json!({"type":format!("future_child_{i}"),"payload":"DO_NOT_LOG"}));
+            }
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"paired","name":"mcp__fixture__read","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"paired","content":children}]}]
+            })).unwrap();
+            let wire = serde_json::to_value(translate_request_with_request_id(&req, opts(), Some("task4-input-fixture")).unwrap()).unwrap();
+            assert_eq!(wire["input"][1], json!({"type":"function_call_output","call_id":"paired","output":"supported neighbor"}));
+        });
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
+        let log = std::fs::read_to_string(log_path).expect("input skip diagnostics");
+        assert!(!log.contains("DO_NOT_LOG"));
+        let records = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["fields"]["reqId"] == "task4-input-fixture")
+            .collect::<Vec<_>>();
+        let initial = records
+            .iter()
+            .filter(|r| r["msg"] == "codex_event_skipped")
+            .collect::<Vec<_>>();
+        assert_eq!(initial.len(), 16, "{records:?}");
+        assert!(
+            initial
+                .iter()
+                .any(|r| r["fields"]["event_type"] == "tool_reference"
+                    && r["fields"]["reason"] == "legacy_tool_reference")
+        );
+        assert!(
+            initial
+                .iter()
+                .any(|r| r["fields"]["event_type"] == "future_child_0"
+                    && r["fields"]["reason"] == "unsupported_tool_result_child")
+        );
+        let summaries = records
+            .iter()
+            .filter(|r| r["msg"] == "codex_event_skipped_summary")
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["fields"]["counts"]["tool_reference"], 100);
+        assert_eq!(summaries[0]["fields"]["suppressed_count"], 9);
+    }
+
+    #[test]
+    fn task4_legacy_search_history_projects_only_available_context_in_order() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "messages":[{"role":"assistant","content":[
+                {"type":"text","text":"Before search https://example.test/source-long"},
+                {"type":"server_tool_use","id":"native_search","name":"web_search","input":{"query":"fixture query"}},
+                {"type":"web_search_tool_result","tool_use_id":"native_search","content":[
+                    {"type":"web_search_result","title":"Fixture title","url":"https://example.test/source","text":"Available source text","encrypted_content":"DO_NOT_COPY"},
+                    {"type":"web_search_result","title":"Already linked","url":"https://example.test/already","encrypted_index":"DO_NOT_COPY"},
+                    {"type":"web_search_result","title":"Article","url":"https://en.wikipedia.org/wiki/Article_(topic)","encrypted_index":"DO_NOT_COPY"}
+                ]},
+                {"type":"text","text":"Answer [Already linked](https://example.test/already) [Article](https://en.wikipedia.org/wiki/Article_%28topic%29)"}
+            ]},{"role":"user","content":"Continue"}]
+        })).unwrap();
+        let wire = serde_json::to_value(translate_request(&req, opts()).unwrap()).unwrap();
+        let parts = wire["input"][0]["content"].as_array().unwrap();
+        let text = parts
+            .iter()
+            .map(|p| p["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.find("Before search").unwrap()
+                < text.find("fixture query").expect("available query")
+        );
+        assert!(
+            text.find("fixture query").unwrap()
+                < text.find("Fixture title").expect("available title")
+        );
+        assert!(
+            text.find("Available source text").expect("available text")
+                < text.find("Answer").unwrap()
+        );
+        assert!(
+            text.contains("[Fixture title](https://example.test/source)"),
+            "{text}"
+        );
+        assert_eq!(text.matches("https://example.test/already").count(), 1);
+        assert_eq!(
+            text.matches("[Article](https://en.wikipedia.org/wiki/Article_%28topic%29)")
+                .count(),
+            1,
+            "{text}"
+        );
+        for item in wire["input"].as_array().unwrap() {
+            assert_eq!(item["type"], "message");
+            for part in item["content"].as_array().unwrap() {
+                assert!(matches!(
+                    part["type"].as_str(),
+                    Some("input_text" | "output_text")
+                ));
+                assert_eq!(part.as_object().unwrap().len(), 2);
+            }
+        }
+        for forbidden in [
+            "server_tool_use",
+            "web_search_tool_result",
+            "encrypted",
+            "DO_NOT_COPY",
+            "function_call_output",
+        ] {
+            assert!(!wire.to_string().contains(forbidden), "{wire}");
+        }
+    }
+
     #[test]
     fn translate_tool_result_content() {
         let req: MessagesRequest = serde_json::from_value(json!({
@@ -2381,14 +3214,17 @@ mod tests {
 
     #[test]
     fn translate_tool_result_preserves_image_then_text_order() {
-        let rendered = render_tool_result(&json!([
-            {"type": "image", "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": PNG_BASE64
-            }},
-            {"type": "text", "text": "caption"}
-        ]));
+        let rendered = render_tool_result(
+            &json!([
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": PNG_BASE64
+                }},
+                {"type": "text", "text": "caption"}
+            ]),
+            &mut SkipDiagnostics::default(),
+        );
 
         assert_eq!(
             serde_json::to_value(function_call_output(rendered)).unwrap(),
@@ -2401,24 +3237,27 @@ mod tests {
 
     #[test]
     fn unsupported_tool_result_images_become_in_place_text_placeholders() {
-        let rendered = render_tool_result(&json!([
-            {"type": "text", "text": "before"},
-            {"type": "image", "source": {
-                "type": "url",
-                "url": "https://example.invalid/a.png"
-            }},
-            {"type": "image", "source": {
-                "type": "base64",
-                "media_type": "text/plain",
-                "data": "aGVsbG8="
-            }},
-            {"type": "image", "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": "not base64"
-            }},
-            {"type": "text", "text": "after"}
-        ]));
+        let rendered = render_tool_result(
+            &json!([
+                {"type": "text", "text": "before"},
+                {"type": "image", "source": {
+                    "type": "url",
+                    "url": "https://example.invalid/a.png"
+                }},
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "text/plain",
+                    "data": "aGVsbG8="
+                }},
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "not base64"
+                }},
+                {"type": "text", "text": "after"}
+            ]),
+            &mut SkipDiagnostics::default(),
+        );
 
         assert_eq!(
             serde_json::to_value(function_call_output(rendered)).unwrap(),
@@ -2442,10 +3281,13 @@ mod tests {
 
     #[test]
     fn text_only_tool_result_keeps_string_wire_format() {
-        let rendered = render_tool_result(&json!([
-            {"type": "text", "text": "first"},
-            {"type": "text", "text": "second"}
-        ]));
+        let rendered = render_tool_result(
+            &json!([
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ]),
+            &mut SkipDiagnostics::default(),
+        );
 
         assert_eq!(
             serde_json::to_value(function_call_output(rendered)).unwrap(),
@@ -2482,11 +3324,14 @@ mod tests {
 
     #[test]
     fn malformed_tool_result_blocks_still_become_text_placeholders() {
-        let rendered = render_tool_result(&json!([
-            {"type": "text"},
-            {"type": "image"},
-            {}
-        ]));
+        let rendered = render_tool_result(
+            &json!([
+                {"type": "text"},
+                {"type": "image"},
+                {}
+            ]),
+            &mut SkipDiagnostics::default(),
+        );
 
         assert_eq!(
             rendered.joined_text(),

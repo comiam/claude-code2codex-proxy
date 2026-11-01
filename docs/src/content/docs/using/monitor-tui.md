@@ -19,7 +19,7 @@ Use `claude-code-proxy monitor --url http://127.0.0.1:19999` for a different por
 
 In an attached dashboard, `q` and `Ctrl-C` detach immediately and leave the service running. Multiple dashboards can attach independently. If the service becomes unavailable, the dashboard marks its last snapshot as stale and reconnects automatically. Network polling runs outside the terminal event loop.
 
-![claude-code-proxy monitor showing sessions, active requests, recent requests, and events](/monitor-tui.webp)
+![claude-code-proxy monitor showing sessions, active requests, recent requests, and events](../../../../public/monitor-tui.webp)
 
 ## What the monitor shows
 
@@ -70,13 +70,7 @@ The deterministic simulation covers active, successful, and failed requests acro
 
 ## Background service
 
-A Homebrew installation can run at login:
-
-```sh
-brew services start claude-code-proxy
-```
-
-Service output lives in `~/.local/state/claude-code-proxy/service.log` on macOS and Linux. The structured `proxy.log` shares the state directory. Provider login remains an interactive one-time command.
+Run `claude-code-proxy serve --no-monitor` under a service manager of your choice. Configure its output and lifecycle in that service manager. The structured `proxy.log` is stored in the proxy state directory. Provider login remains an interactive command.
 
 Run `claude-code-proxy monitor` to inspect that service. The monitor endpoint only accepts loopback connections, even if the inference listener binds a LAN address. For a service on another machine, forward its port with SSH and point `monitor --url` at the local end of the tunnel.
 

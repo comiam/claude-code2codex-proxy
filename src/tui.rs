@@ -687,7 +687,7 @@ fn rate_cell(value: String) -> Cell<'static> {
         DIM_WHITE
     };
     Cell::from(
-        Line::from(Span::styled(value, Style::default().fg(color))).alignment(Alignment::Right),
+        Line::from(Span::styled(value, Style::default().fg(color))).alignment(Alignment::Left),
     )
 }
 
@@ -737,6 +737,10 @@ fn compact_tokens(tokens: u64) -> String {
 
 fn token_value(value: Option<u64>) -> String {
     value.map(compact_tokens).unwrap_or_else(|| "-".to_string())
+}
+
+fn cached_token_value(value: Option<u64>) -> String {
+    value.map(compact_tokens).unwrap_or_else(|| "—".to_string())
 }
 
 fn spinner(tick: usize) -> &'static str {
@@ -834,6 +838,7 @@ enum SessionColumn {
     Target,
     Effort,
     Input,
+    Cached,
     Output,
     Rate,
     Activity,
@@ -854,22 +859,34 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Cached, "Cached", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::flex(C::Activity, "Tokens/10s · 4k", Alignment::Left, 1),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
         ],
         (LayoutTier::Expanded | LayoutTier::Wide, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
+            ColumnSpec::fixed(
+                C::Project,
+                "Project",
+                Alignment::Left,
+                PROJECT_MEDIUM_WIDTH - 1,
+            ),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
-            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_NARROW_WIDTH),
+            ColumnSpec::fixed(
+                C::Model,
+                "Model",
+                Alignment::Left,
+                MODEL_NARROW_WIDTH - TOKEN_WIDTH,
+            ),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Cached, "Cached", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::flex(C::Activity, "Tokens/10s", Alignment::Left, 1),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
         ],
@@ -880,7 +897,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Activity, "Tok/10s", Alignment::Left, 8),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
         ],
@@ -890,7 +907,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, 10),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Activity, "Trend", Alignment::Left, 6),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
         ],
@@ -955,11 +972,14 @@ fn render_sessions(
                     }
                     SessionColumn::Effort => text_cell(session.effort.as_deref().unwrap_or("-")),
                     SessionColumn::Input => number_cell(compact_tokens(session.input_tokens)),
+                    SessionColumn::Cached => {
+                        number_cell(cached_token_value(session.cached_input_tokens))
+                    }
                     SessionColumn::Output => number_cell(compact_tokens(session.output_tokens)),
                     SessionColumn::Rate => rate_cell(session.rate().label()),
                     SessionColumn::Activity => Cell::from(token_sparkline_line(
                         &session.output_token_samples,
-                        width,
+                        width.saturating_sub(1), // Extra gutter before Status.
                         snapshot_at,
                     )),
                     SessionColumn::Status => status_cell(&session.last_status),
@@ -991,6 +1011,7 @@ enum ActiveColumn {
     Effort,
     Endpoint,
     Input,
+    Cached,
     Output,
     Rate,
     Elapsed,
@@ -1009,8 +1030,9 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::flex(C::Endpoint, "Endpoint", Alignment::Left, 1),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Cached, "Cached", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
         LayoutTier::Expanded => vec![
@@ -1022,7 +1044,7 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
         LayoutTier::Medium => vec![
@@ -1032,7 +1054,7 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
         LayoutTier::Narrow => vec![
@@ -1041,7 +1063,7 @@ fn active_columns(tier: LayoutTier) -> Vec<ColumnSpec<ActiveColumn>> {
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Elapsed, "Elapsed", Alignment::Right, DURATION_WIDTH),
         ],
         LayoutTier::Emergency => vec![
@@ -1097,6 +1119,9 @@ fn render_active(
                     ActiveColumn::Effort => text_cell(request.effort.as_deref().unwrap_or("-")),
                     ActiveColumn::Endpoint => muted_cell(request.endpoint.label()),
                     ActiveColumn::Input => number_cell(token_value(request.input_tokens)),
+                    ActiveColumn::Cached => {
+                        number_cell(cached_token_value(request.usage.cached_input_tokens))
+                    }
                     ActiveColumn::Output => number_cell(token_value(request.output_tokens)),
                     ActiveColumn::Rate => rate_cell(request.rate().label()),
                     ActiveColumn::Elapsed => number_cell(format_duration(request.elapsed())),
@@ -1125,6 +1150,7 @@ enum RecentColumn {
     Latency,
     Rate,
     Input,
+    Cached,
     Output,
     Details,
     Error,
@@ -1143,8 +1169,9 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Cached, "Cached", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::flex(C::Details, "Details", Alignment::Left, 1),
         ],
@@ -1157,8 +1184,9 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Cached, "Cached", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
@@ -1169,8 +1197,9 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Cached, "Cached", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
@@ -1180,8 +1209,9 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
-            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Left, RATE_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Cached, "Cached", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
         ],
@@ -1252,6 +1282,9 @@ fn render_recent(
                     RecentColumn::Latency => number_cell(format_duration(request.latency)),
                     RecentColumn::Rate => rate_cell(request.rate().label()),
                     RecentColumn::Input => number_cell(token_value(request.input_tokens)),
+                    RecentColumn::Cached => {
+                        number_cell(cached_token_value(request.usage.cached_input_tokens))
+                    }
                     RecentColumn::Output => number_cell(token_value(request.output_tokens)),
                     RecentColumn::Details => detail_cell(request.error.as_deref().unwrap_or("")),
                     RecentColumn::Error => detail_cell(error_indicator(request)),
@@ -1387,21 +1420,26 @@ fn render_session_detail(
             detail_line("project", session.project.as_deref().unwrap_or("-"), TEAL),
             detail_line("active requests", session.active_count.to_string(), YELLOW),
             detail_line(
-                "total requests",
+                "requests (window)",
                 session.request_count.to_string(),
                 DIM_WHITE,
             ),
-            detail_line("failures", session.failure_count.to_string(), RED),
+            detail_line("failures (window)", session.failure_count.to_string(), RED),
             detail_line("provider", session.provider.as_deref().unwrap_or("-"), TEAL),
             detail_line("model", session.model.as_deref().unwrap_or("-"), DIM_WHITE),
             detail_line("effort", session.effort.as_deref().unwrap_or("-"), YELLOW),
             detail_line(
-                "input tokens",
+                "In (lifetime)",
                 compact_tokens(session.input_tokens),
                 DIM_WHITE,
             ),
             detail_line(
-                "output tokens",
+                "Cached (reported)",
+                cached_token_value(session.cached_input_tokens),
+                DIM_WHITE,
+            ),
+            detail_line(
+                "Out (lifetime)",
                 compact_tokens(session.output_tokens),
                 DIM_WHITE,
             ),
@@ -1414,11 +1452,23 @@ fn render_session_detail(
                 ),
                 DIM_WHITE,
             ),
-            detail_line("rate", session.rate().label(), TEAL),
+            detail_line("rate", session.rate().label_with_basis(), TEAL),
             detail_line(
                 "last status",
                 session.last_status.as_str(),
                 status_color(&session.last_status),
+            ),
+            Line::styled(
+                "  In includes Cached. Token totals cover the session lifetime.",
+                Style::default().fg(DIM),
+            ),
+            Line::styled(
+                "  Cached sums reported counts only; — means unknown.",
+                Style::default().fg(DIM),
+            ),
+            Line::styled(
+                "  Requests count active + retained recent requests (up to 200).",
+                Style::default().fg(DIM),
             ),
         ]
     } else {
@@ -1481,8 +1531,16 @@ fn render_request_detail(
             detail_line("model", request.model.as_deref().unwrap_or("-"), DIM_WHITE),
             detail_line("effort", request.effort.as_deref().unwrap_or("-"), YELLOW),
             detail_line("latency", format_duration(request.latency), DIM_WHITE),
-            detail_line("rate", request.rate().label(), TEAL),
-            detail_line("input tokens", token_value(request.input_tokens), DIM_WHITE),
+            detail_line("rate", request.rate().label_with_basis(), TEAL),
+            detail_line(
+                "input / cached",
+                format!(
+                    "{} / {}",
+                    token_value(request.input_tokens),
+                    cached_token_value(request.usage.cached_input_tokens)
+                ),
+                DIM_WHITE,
+            ),
             detail_line(
                 "output tokens",
                 token_value(request.output_tokens),
@@ -2012,6 +2070,86 @@ mod tests {
     }
 
     #[test]
+    fn cached_column_renders_provider_count_zero_and_unknown_in_wide_tables() {
+        use crate::monitor::{MonitorHandle, UsageObservation};
+        let monitor = MonitorHandle::default();
+        for (id, cached) in [
+            ("cached", Some(782848)),
+            ("zero", Some(0)),
+            ("unknown", None),
+        ] {
+            monitor.request_started(id, Some(id.into()), None, EndpointKind::Messages);
+            monitor.typed_progress(
+                id,
+                0,
+                0,
+                serde_json::from_value::<UsageObservation>(
+                    serde_json::json!({"cached_input_tokens": cached}),
+                )
+                .unwrap(),
+            );
+        }
+        let state: MonitorSnapshot = monitor.snapshot().into();
+        let assert_cached = |text: String| {
+            let header = text.lines().nth(1).unwrap();
+            let column = header
+                .chars()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .position(|chars| chars == ['C', 'a', 'c', 'h', 'e', 'd'])
+                .unwrap_or_else(|| panic!("missing Cached header: {text}"))
+                - 1;
+            assert!(
+                header.find("In").unwrap() < header.find("Cached").unwrap(),
+                "{text}"
+            );
+            assert!(
+                header.find("Cached").unwrap() < header.find("Out").unwrap(),
+                "{text}"
+            );
+            let mut values = text
+                .lines()
+                .skip(2)
+                .take(3)
+                .map(|line| {
+                    line.chars()
+                        .skip(column)
+                        .take(7)
+                        .collect::<String>()
+                        .trim()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            values.sort();
+            assert_eq!(values, ["0", "782.8k", "—"], "{text}");
+        };
+        assert_cached(buffer_text(&draw(200, 8, |frame| {
+            render_active(frame, frame.area(), &state.active, 0)
+        })));
+        for width in [120, 200] {
+            assert_cached(buffer_text(&draw(width, 8, |frame| {
+                render_sessions(
+                    frame,
+                    frame.area(),
+                    &state.sessions,
+                    0,
+                    false,
+                    state.snapshot_at,
+                )
+            })));
+        }
+        for id in ["cached", "zero", "unknown"] {
+            monitor.request_completed(id, 200, None, None);
+        }
+        let state: MonitorSnapshot = monitor.snapshot().into();
+        for width in [78, 90, 120, 200] {
+            assert_cached(buffer_text(&draw(width, 8, |frame| {
+                render_recent(frame, frame.area(), &state.recent, 0, false)
+            })));
+        }
+    }
+
+    #[test]
     fn each_schema_has_one_meaningful_flexible_column() {
         for tier in [
             LayoutTier::Emergency,
@@ -2043,15 +2181,15 @@ mod tests {
     }
 
     #[test]
-    fn metric_columns_are_right_aligned() {
+    fn count_and_duration_headers_are_right_aligned() {
         let sessions = session_columns(LayoutTier::Wide, true);
         for key in [
             SessionColumn::Active,
             SessionColumn::Requests,
             SessionColumn::Failures,
             SessionColumn::Input,
+            SessionColumn::Cached,
             SessionColumn::Output,
-            SessionColumn::Rate,
         ] {
             assert_eq!(alignment(&sessions, key), Some(Alignment::Right));
         }
@@ -2059,8 +2197,8 @@ mod tests {
         let active = active_columns(LayoutTier::Wide);
         for key in [
             ActiveColumn::Input,
+            ActiveColumn::Cached,
             ActiveColumn::Output,
-            ActiveColumn::Rate,
             ActiveColumn::Elapsed,
         ] {
             assert_eq!(alignment(&active, key), Some(Alignment::Right));
@@ -2070,8 +2208,8 @@ mod tests {
         for key in [
             RecentColumn::Code,
             RecentColumn::Latency,
-            RecentColumn::Rate,
             RecentColumn::Input,
+            RecentColumn::Cached,
             RecentColumn::Output,
         ] {
             assert_eq!(alignment(&recent, key), Some(Alignment::Right));
@@ -2257,6 +2395,47 @@ mod tests {
         assert_eq!(line.spans[0].style.fg, Some(BLUE));
         assert_eq!(line.spans[1].content, "█");
         assert_eq!(line.spans[1].style.fg, Some(DIM));
+    }
+
+    #[test]
+    fn session_rate_and_graph_have_aligned_headers_and_status_gutter() {
+        let mut state: MonitorSnapshot = mock_state().into();
+        let session = &mut state.sessions[0];
+        session.last_status = "upstream".to_string();
+        session.output_token_samples = (0..255)
+            .map(|bucket| {
+                (
+                    state.snapshot_at - Duration::from_secs(bucket * SESSION_TOKEN_BUCKET_SECS),
+                    SESSION_SPARKLINE_MAX_TOKENS,
+                )
+            })
+            .collect();
+        let rate = session.rate().label();
+        assert!(rate.len() > "Rate".len(), "fixture needs a rate with units");
+
+        for width in [120, 170, 255] {
+            let buffer = draw(width, 5, |frame| {
+                render_sessions(
+                    frame,
+                    frame.area(),
+                    &state.sessions[..1],
+                    0,
+                    true,
+                    state.snapshot_at,
+                )
+            });
+            let text = buffer_text(&buffer);
+            let rate_header = placeholder_position(&buffer, "Rate").unwrap();
+            let rate_value = placeholder_position(&buffer, &rate).unwrap();
+            assert_eq!(rate_header.0, rate_value.0, "{text}");
+            let graph_header = placeholder_position(&buffer, "Tokens/10s").unwrap();
+            let bars = (0..width)
+                .filter(|x| buffer[(*x, 2)].symbol() == "█")
+                .collect::<Vec<_>>();
+            assert_eq!(graph_header.0, *bars.first().unwrap(), "{text}");
+            let status = placeholder_position(&buffer, "upstream").unwrap();
+            assert!(status.0 - bars.last().unwrap() >= 3, "{text}");
+        }
     }
 
     #[test]

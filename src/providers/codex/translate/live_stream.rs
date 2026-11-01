@@ -1,1202 +1,712 @@
-use std::collections::HashMap;
-
+use super::IncompleteResponsePolicy;
+use super::event::TranslationEvent;
+use super::finish::FinishMetadata;
+use super::reducer::map_codex_usage_to_anthropic;
+#[cfg(test)]
+use super::state::LiveBlock;
+use super::state::ResponseState;
+pub use super::state::TranslationError as LiveStreamError;
 use crate::anthropic::sse::encode_sse_event;
-use crate::providers::codex::events::{
-    classify_event_failure, is_standard_max_output_tokens_incomplete,
-};
+use crate::monitor::{TokenObservation, UsageObservation};
 use crate::traffic::TrafficCapture;
 
-use super::IncompleteResponsePolicy;
-use super::read_rewrite::sanitize_read_args;
-use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
-use super::reducer::{
-    CodexRateLimits, CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE,
-    map_codex_usage_to_anthropic, parse_codex_rate_limits,
-};
-
-const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
-const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
-
-enum LiveBlock {
-    Text {
-        index: usize,
-        text: String,
-        deferred: bool,
-    },
-    Tool {
-        index: usize,
-        call_id: String,
-        name: String,
-        args_accum: String,
-        had_delta: bool,
-        buffer_until_done: bool,
-        emitted_args: bool,
-    },
-}
-
-struct LiveWebSearch {
-    index: usize,
-    result_index: usize,
-    id: String,
-    query: String,
-}
-
-#[derive(Clone)]
-struct LiveWebSearchResult {
-    title: String,
-    url: String,
-}
-
-#[derive(Clone, Copy)]
-struct LiveThinking {
-    output_index: usize,
-    anthropic_index: usize,
-}
-
 pub struct LiveStreamTranslator {
+    state: ResponseState,
     message_id: String,
     model: String,
-    message_started: bool,
-    blocks_by_output_index: HashMap<usize, LiveBlock>,
-    item_id_to_output_index: HashMap<String, usize>,
-    anthropic_index: usize,
-    thinking: Option<LiveThinking>,
-    reasoning_by_output_index: HashMap<usize, PendingReasoning>,
-    saw_tool_use: bool,
-    web_search_requests: usize,
-    web_searches: Vec<LiveWebSearch>,
-    web_search_results: Vec<LiveWebSearchResult>,
-    deferred_text: Vec<(usize, String)>,
-    semantic_output_started: bool,
-    // Seeds Claude Code's live subagent counter until the provider returns
-    // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
-    incomplete_response_policy: IncompleteResponsePolicy,
-    finished: bool,
-    // Latest `codex.rate_limits` event seen on this stream; handed to the
-    // usage mapper at finish so the terminal usage block carries the meter.
-    rate_limits: Option<CodexRateLimits>,
+    message_started: bool,
+    progress: EmissionProgress,
+    capture_staged: bool,
 }
 
 impl LiveStreamTranslator {
     pub fn new(message_id: impl Into<String>, model: impl Into<String>) -> Self {
         Self::with_estimated_input_tokens(message_id, model, 0)
     }
-
     pub fn with_estimated_input_tokens(
         message_id: impl Into<String>,
         model: impl Into<String>,
         estimated_input_tokens: u64,
     ) -> Self {
         Self {
+            state: ResponseState::new(),
             message_id: message_id.into(),
             model: model.into(),
-            message_started: false,
-            blocks_by_output_index: HashMap::new(),
-            item_id_to_output_index: HashMap::new(),
-            anthropic_index: 0,
-            thinking: None,
-            reasoning_by_output_index: HashMap::new(),
-            saw_tool_use: false,
-            web_search_requests: 0,
-            web_searches: Vec::new(),
-            web_search_results: Vec::new(),
-            deferred_text: Vec::new(),
-            semantic_output_started: false,
             estimated_input_tokens,
-            incomplete_response_policy: IncompleteResponsePolicy::Error,
-            finished: false,
-            rate_limits: None,
+            message_started: false,
+            progress: EmissionProgress::default(),
+            capture_staged: false,
         }
     }
-
+    pub(crate) fn with_early_reasoning(mut self) -> Self {
+        self.state = self.state.with_early_reasoning();
+        self
+    }
+    pub(crate) fn with_replay_budget(mut self, budget: Option<usize>) -> Self {
+        self.state = self.state.with_replay_budget(budget);
+        self
+    }
     pub(crate) fn with_incomplete_response_policy(
         mut self,
         policy: IncompleteResponsePolicy,
     ) -> Self {
-        self.incomplete_response_policy = policy;
+        self.state = self.state.with_incomplete_response_policy(policy);
         self
     }
-
+    pub fn stage_capture(&mut self, enabled: bool) {
+        self.capture_staged = enabled;
+    }
+    pub fn take_progress(&mut self) -> EmissionProgress {
+        std::mem::take(&mut self.progress)
+    }
+    pub(crate) fn set_request_id(&mut self, req_id: &str) {
+        self.state.set_request_id(req_id);
+    }
+    pub(crate) fn had_compatibility_skips(&self) -> bool {
+        self.state.had_compatibility_skips()
+    }
+    pub fn finish_metadata(&self) -> Option<&FinishMetadata> {
+        self.state.finish_metadata()
+    }
+    pub fn is_finished(&self) -> bool {
+        self.state.is_finished()
+    }
+    pub fn has_semantic_output(&self) -> bool {
+        self.state.has_semantic_output()
+    }
     pub fn accept(
         &mut self,
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
-    ) -> Result<Vec<u8>, String> {
-        if self.finished {
-            return Ok(Vec::new());
+    ) -> Result<Vec<u8>, LiveStreamError> {
+        let result = self.state.accept(payload);
+        self.progress.append(EmissionProgress {
+            usage: std::mem::take(&mut self.state.usage),
+            ..Default::default()
+        });
+        match result {
+            Ok(events) => Ok(self.render_events(&events, traffic)),
+            Err(error) => {
+                self.progress.failed = Some(error.as_str().to_string());
+                Err(error)
+            }
         }
-
-        let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let mut out = Vec::new();
-
-        let allowed_incomplete = self.incomplete_response_policy
-            == IncompleteResponsePolicy::AllowMaxOutputTokens
-            && is_standard_max_output_tokens_incomplete(payload);
-        if !allowed_incomplete && let Some(failure) = classify_event_failure(payload) {
-            return Err(failure.message);
-        }
-
-        match kind {
-            "codex.rate_limits" => {
-                self.rate_limits = parse_codex_rate_limits(payload).or(self.rate_limits.take());
-                self.emit_ping(traffic, &mut out);
-            }
-            "keepalive" | "response.created" | "response.in_progress" => {
-                self.emit_ping(traffic, &mut out);
-            }
-            "response.web_search_call.in_progress"
-            | "response.web_search_call.searching"
-            | "response.web_search_call.completed" => {}
-            "response.output_item.added" => {
-                self.output_item_added(payload, traffic, &mut out);
-            }
-            "response.reasoning_summary_part.added" => {
-                let output_index = output_index(payload);
-                if let Some(thinking) = self
-                    .thinking
-                    .filter(|thinking| thinking.output_index == output_index)
-                {
-                    self.emit(
-                        traffic,
-                        &mut out,
-                        "content_block_delta",
-                        &serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": thinking.anthropic_index,
-                            "delta": {"type": "thinking_delta", "thinking": "\n\n"}
-                        }),
-                    );
-                }
-            }
-            "response.reasoning_summary_text.delta" => {
-                self.reasoning_delta(payload, traffic, &mut out);
-            }
-            "response.output_text.delta" => {
-                self.text_delta(payload, traffic, &mut out);
-            }
-            "response.output_text.annotation.added" => {
-                self.web_search_annotation(payload);
-            }
-            "response.function_call_arguments.delta" => {
-                self.tool_delta(payload, traffic, &mut out)?;
-            }
-            "response.function_call_arguments.done" => {
-                self.tool_arguments_done(payload);
-            }
-            "response.output_item.done" => {
-                self.output_item_done(payload, traffic, &mut out);
-            }
-            "response.completed" | "response.incomplete" | "response.done" => {
-                self.finish(payload, traffic, &mut out);
-            }
-            _ => {}
-        }
-
-        Ok(out)
     }
-
-    pub fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    pub fn has_semantic_output(&self) -> bool {
-        self.semantic_output_started
-    }
-
     pub fn ping_chunk(&mut self, traffic: Option<&TrafficCapture>) -> Vec<u8> {
-        let mut out = Vec::new();
-        if !self.finished {
-            self.emit_ping(traffic, &mut out);
+        if self.is_finished() {
+            return Vec::new();
         }
-        out
+        self.render_events(
+            &[TranslationEvent::Progress {
+                output_index: None,
+                item_id: None,
+            }],
+            traffic,
+        )
     }
-
-    pub fn finish_after_closed_completed_tool_call(
-        &mut self,
-        traffic: Option<&TrafficCapture>,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.finished || !self.saw_tool_use || !self.blocks_by_output_index.is_empty() {
-            return out;
-        }
-        self.close_thinking(traffic, &mut out);
-        self.ensure_message_start(traffic, &mut out);
-        self.emit_finish(STOP_TOOL_USE, None, traffic, &mut out);
-        out
-    }
-
     pub fn error_chunk(
         &mut self,
         message: &str,
         error_type: &str,
         traffic: Option<&TrafficCapture>,
     ) -> Vec<u8> {
-        let mut out = Vec::new();
-        if self.finished {
-            return out;
+        if self.is_finished() {
+            return Vec::new();
         }
-        self.close_open_blocks(traffic, &mut out);
+        let events = self.state.abort();
+        let mut out = self.render_events(&events, traffic);
         self.ensure_message_start(traffic, &mut out);
         self.emit(
             traffic,
             &mut out,
             "error",
-            &serde_json::json!({
-                "type": "error",
-                "error": {
-                    "type": error_type,
-                    "message": message,
-                }
-            }),
+            serde_json::json!({"type":"error","error":{"type":error_type,"message":message}}),
         );
-        self.finished = true;
+        self.progress.failed = Some(message.to_string());
         out
     }
-
     fn ensure_message_start(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         if self.message_started {
             return;
         }
         self.message_started = true;
-        self.emit(
-            traffic,
-            out,
-            "message_start",
-            &serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": self.message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": self.model,
-                    "content": [],
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {
-                        "input_tokens": self.estimated_input_tokens,
-                        "output_tokens": 0
-                    }
-                }
-            }),
-        );
+        if self.progress.usage.input_tokens.is_none() {
+            self.progress.usage.input_tokens =
+                Some(TokenObservation::estimated(self.estimated_input_tokens));
+        }
+        self.emit(traffic, out, "message_start", serde_json::json!({"type":"message_start","message":{"id":self.message_id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":self.estimated_input_tokens,"output_tokens":0}}}));
     }
-
-    fn emit_ping(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
-        self.ensure_message_start(traffic, out);
-        self.emit(traffic, out, "ping", &serde_json::json!({"type": "ping"}));
-    }
-
     fn emit(
-        &self,
+        &mut self,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
         event: &str,
-        data: &serde_json::Value,
+        data: serde_json::Value,
     ) {
+        self.progress.events += 1;
+        self.progress.thinking_started |= event == "content_block_start"
+            && data
+                .pointer("/content_block/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("thinking");
+        if self.capture_staged && traffic.is_none() {
+            self.progress
+                .captured_events
+                .push(serde_json::json!({"event":event,"data":data}));
+        }
         if let Some(traffic) = traffic {
             traffic.write_json_event(
                 "050-downstream-event",
-                &serde_json::json!({
-                    "event": event,
-                    "data": data,
-                }),
+                &serde_json::json!({"event":event,"data":data}),
             );
         }
-        out.extend_from_slice(&encode_sse_event(Some(event), &data.to_string()));
+        out.extend(encode_sse_event(Some(event), &data.to_string()));
     }
-
-    fn output_item_added(
+    pub(crate) fn render_events(
         &mut self,
-        payload: &serde_json::Value,
+        events: &[TranslationEvent],
         traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) {
-        let Some(item) = payload.get("item") else {
-            return;
-        };
-        let output_index = output_index(payload);
-        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        match item_type {
-            "reasoning" => {
-                self.reasoning_by_output_index
-                    .entry(output_index)
-                    .or_default()
-                    .capture(item);
-            }
-            "message" => {
-                self.close_thinking(traffic, out);
-                let index = self.anthropic_index;
-                self.anthropic_index += 1;
-                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    self.item_id_to_output_index
-                        .insert(id.to_string(), output_index);
-                }
-                let deferred = !self.web_searches.is_empty();
-                self.blocks_by_output_index.insert(
-                    output_index,
-                    LiveBlock::Text {
-                        index,
-                        text: String::new(),
-                        deferred,
-                    },
-                );
-                if !deferred {
-                    self.ensure_message_start(traffic, out);
-                    self.emit(
-                        traffic,
-                        out,
-                        "content_block_start",
-                        &serde_json::json!({
-                            "type": "content_block_start",
-                            "index": index,
-                            "content_block": {"type": "text", "text": ""}
-                        }),
-                    );
-                }
-            }
-            "function_call" => {
-                self.close_thinking(traffic, out);
-                self.saw_tool_use = true;
-                let index = self.anthropic_index;
-                self.anthropic_index += 1;
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                self.blocks_by_output_index.insert(
-                    output_index,
-                    LiveBlock::Tool {
-                        index,
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        args_accum: String::new(),
-                        had_delta: false,
-                        buffer_until_done: name == "Read",
-                        emitted_args: false,
-                    },
-                );
-                self.ensure_message_start(traffic, out);
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_start",
-                    &serde_json::json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": call_id,
-                            "name": name,
-                            "input": {}
-                        }
-                    }),
-                );
-            }
-            "web_search_call" => {
-                self.web_search_requests += 1;
-            }
-            _ => {}
-        }
-    }
-
-    fn reasoning_delta(
-        &mut self,
-        payload: &serde_json::Value,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) {
-        let output_index = output_index(payload);
-        let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-        if delta.is_empty() {
-            return;
-        }
-        self.semantic_output_started = true;
-        if self.thinking.map(|thinking| thinking.output_index) != Some(output_index) {
-            self.close_thinking(traffic, out);
-            let index = self.anthropic_index;
-            self.anthropic_index += 1;
-            self.thinking = Some(LiveThinking {
-                output_index,
-                anthropic_index: index,
-            });
-            self.ensure_message_start(traffic, out);
-            self.emit(
-                traffic,
-                out,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                }),
-            );
-        }
-        let index = self
-            .thinking
-            .expect("thinking block was started")
-            .anthropic_index;
-        self.emit(
-            traffic,
-            out,
-            "content_block_delta",
-            &serde_json::json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "thinking_delta", "thinking": delta}
-            }),
-        );
-    }
-
-    fn text_delta(
-        &mut self,
-        payload: &serde_json::Value,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) {
-        self.close_thinking(traffic, out);
-        let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-        if delta.is_empty() {
-            return;
-        }
-        self.semantic_output_started = true;
-
-        let output_index = payload
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .or_else(|| {
-                payload
-                    .get("item_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|id| self.item_id_to_output_index.get(id).copied())
-            })
-            .unwrap_or(0);
-
-        if !self.blocks_by_output_index.contains_key(&output_index) {
-            let index = self.anthropic_index;
-            self.anthropic_index += 1;
-            let deferred = !self.web_searches.is_empty();
-            self.blocks_by_output_index.insert(
-                output_index,
-                LiveBlock::Text {
-                    index,
-                    text: String::new(),
-                    deferred,
-                },
-            );
-            if !deferred {
-                self.ensure_message_start(traffic, out);
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_start",
-                    &serde_json::json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
-                );
-            }
-        }
-
-        let Some(LiveBlock::Text {
-            index,
-            text,
-            deferred,
-        }) = self.blocks_by_output_index.get_mut(&output_index)
-        else {
-            return;
-        };
-        text.push_str(delta);
-        if *deferred {
-            return;
-        }
-        let index = *index;
-        self.emit(
-            traffic,
-            out,
-            "content_block_delta",
-            &serde_json::json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "text_delta", "text": delta}
-            }),
-        );
-    }
-
-    fn tool_delta(
-        &mut self,
-        payload: &serde_json::Value,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) -> Result<(), String> {
-        let Some(output_index) = payload
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-        else {
-            return Ok(());
-        };
-        let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-        if delta.is_empty() {
-            return Ok(());
-        }
-        self.semantic_output_started = true;
-        let mut repaired_read: Option<(usize, String)> = None;
-        let Some(LiveBlock::Tool {
-            index,
-            call_id,
-            name,
-            args_accum,
-            had_delta,
-            buffer_until_done,
-            emitted_args,
-            ..
-        }) = self.blocks_by_output_index.get_mut(&output_index)
-        else {
-            return Ok(());
-        };
-        args_accum.push_str(delta);
-        *had_delta = true;
-        if *buffer_until_done {
-            if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
-                return Err(format!(
-                    "Buffered {name} tool arguments exceeded safe limits"
-                ));
-            }
-            if let Some(repaired) =
-                repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
-            {
-                *args_accum = repaired.clone();
-                *emitted_args = true;
-                repaired_read = Some((*index, repaired));
-            }
-        } else {
-            *emitted_args = true;
-            let index = *index;
-            self.semantic_output_started = true;
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": delta
-                    }
-                }),
-            );
-            return Ok(());
-        }
-        if let Some((index, repaired)) = repaired_read {
-            self.blocks_by_output_index.remove(&output_index);
-            self.semantic_output_started = true;
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": repaired
-                    }
-                }),
-            );
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
-            self.ensure_message_start(traffic, out);
-            self.emit_finish(STOP_TOOL_USE, None, traffic, out);
-        }
-        Ok(())
-    }
-
-    fn tool_arguments_done(&mut self, payload: &serde_json::Value) {
-        let Some(output_index) = payload
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-        else {
-            return;
-        };
-        let Some(args) = payload.get("arguments").and_then(|v| v.as_str()) else {
-            return;
-        };
-        let Some(LiveBlock::Tool { args_accum, .. }) =
-            self.blocks_by_output_index.get_mut(&output_index)
-        else {
-            return;
-        };
-        if args_accum.is_empty() {
-            *args_accum = args.to_string();
-        }
-    }
-
-    fn output_item_done(
-        &mut self,
-        payload: &serde_json::Value,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) {
-        let output_index = output_index(payload);
-        if let Some(item) = payload
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(|v| v.as_str())
-            .filter(|item_type| *item_type == "reasoning")
-            .and_then(|_| payload.get("item"))
-        {
-            self.reasoning_by_output_index
-                .entry(output_index)
-                .or_default()
-                .capture(item);
-            let had_active_summary = self
-                .thinking
-                .is_some_and(|thinking| thinking.output_index == output_index);
-            self.close_thinking(traffic, out);
-            if !had_active_summary {
-                self.emit_signature_only_reasoning(output_index, traffic, out);
-            }
-            return;
-        }
-
-        if payload
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(|v| v.as_str())
-            == Some("web_search_call")
-        {
-            self.close_thinking(traffic, out);
-            self.semantic_output_started = true;
-            let item = &payload["item"];
-            let index = self.anthropic_index;
-            self.anthropic_index += 1;
-            let result_index = self.anthropic_index;
-            self.anthropic_index += 1;
-            let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            self.web_searches.push(LiveWebSearch {
-                index,
-                result_index,
-                id: super::web_search_compat::server_tool_use_id_from_codex_web_search_id(raw_id),
-                query: web_search_query(item),
-            });
-            return;
-        }
-
-        let Some(mut state) = self.blocks_by_output_index.remove(&output_index) else {
-            return;
-        };
-
-        match &mut state {
-            LiveBlock::Text {
-                index,
-                text,
-                deferred,
-            } => {
-                if *deferred {
-                    self.deferred_text.push((*index, std::mem::take(text)));
-                } else {
-                    self.emit(
-                        traffic,
-                        out,
-                        "content_block_stop",
-                        &serde_json::json!({
-                            "type": "content_block_stop",
-                            "index": index,
-                        }),
-                    );
-                }
-            }
-            LiveBlock::Tool {
-                index,
-                name,
-                call_id,
-                args_accum,
-                had_delta,
-                buffer_until_done,
-                emitted_args,
-                ..
-            } => {
-                self.semantic_output_started = true;
-                if let Some(final_args) = payload
-                    .get("item")
-                    .and_then(|item| item.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    && (args_accum.is_empty() || (!*had_delta && !*emitted_args))
-                {
-                    *args_accum = final_args.to_string();
-                }
-                if !args_accum.is_empty() {
-                    *args_accum = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
-                    if *buffer_until_done || !*emitted_args {
-                        *emitted_args = true;
-                        self.emit(
-                            traffic,
-                            out,
-                            "content_block_delta",
-                            &serde_json::json!({
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": args_accum
-                                }
-                            }),
-                        );
-                    }
-                }
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_stop",
-                    &serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": index,
-                    }),
-                );
-            }
-        }
-    }
-
-    fn web_search_annotation(&mut self, payload: &serde_json::Value) {
-        let Some(annotation) = payload.get("annotation") else {
-            return;
-        };
-        if annotation.get("type").and_then(|v| v.as_str()) != Some("url_citation") {
-            return;
-        }
-        let Some(url) = annotation.get("url").and_then(|v| v.as_str()) else {
-            return;
-        };
-        if self
-            .web_search_results
-            .iter()
-            .any(|result| result.url == url)
-        {
-            return;
-        }
-        let title = annotation
-            .get("title")
-            .and_then(|v| v.as_str())
-            .filter(|title| !title.is_empty())
-            .unwrap_or(url);
-        self.web_search_results.push(LiveWebSearchResult {
-            title: title.to_string(),
-            url: url.to_string(),
-        });
-    }
-
-    fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
-        let searches = std::mem::take(&mut self.web_searches);
-        for search in searches {
-            self.ensure_message_start(traffic, out);
-            self.emit(
-                traffic,
-                out,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": search.index,
-                    "content_block": {
-                        "type": "server_tool_use",
-                        "id": search.id,
-                        "name": "web_search",
-                        "input": {}
-                    }
-                }),
-            );
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": search.index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": serde_json::to_string(&serde_json::json!({"query": search.query})).unwrap_or_default()
-                    }
-                }),
-            );
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({"type": "content_block_stop", "index": search.index}),
-            );
-            let results: Vec<_> = self
-                .web_search_results
-                .iter()
-                .map(|result| {
-                    serde_json::json!({
-                        "type": "web_search_result",
-                        "title": result.title,
-                        "url": result.url,
-                    })
-                })
-                .collect();
-            self.emit(
-                traffic,
-                out,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": search.result_index,
-                    "content_block": {
-                        "type": "web_search_tool_result",
-                        "tool_use_id": search.id,
-                        "content": results
-                    }
-                }),
-            );
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({"type": "content_block_stop", "index": search.result_index}),
-            );
-        }
-
-        for (index, text) in std::mem::take(&mut self.deferred_text) {
-            self.emit(
-                traffic,
-                out,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""}
-                }),
-            );
-            if !text.is_empty() {
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_delta",
-                    &serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "text_delta", "text": text}
-                    }),
-                );
-            }
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({"type": "content_block_stop", "index": index}),
-            );
-        }
-    }
-
-    fn finish(
-        &mut self,
-        payload: &serde_json::Value,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) {
-        self.close_thinking(traffic, out);
-        self.close_open_blocks(traffic, out);
-        self.emit_web_searches(traffic, out);
-        self.ensure_message_start(traffic, out);
-        let mut usage = payload.get("response").map(parse_codex_usage);
-        if let Some(usage) = usage.as_mut() {
-            usage.rate_limits = self.rate_limits.clone().map(Box::new);
-        }
-        let stop_reason = if self.incomplete_response_policy
-            == IncompleteResponsePolicy::AllowMaxOutputTokens
-            && is_standard_max_output_tokens_incomplete(payload)
-        {
-            STOP_MAX_TOKENS
-        } else if self.saw_tool_use {
-            STOP_TOOL_USE
-        } else {
-            STOP_END_TURN
-        };
-        self.emit_finish(stop_reason, usage, traffic, out);
-    }
-
-    fn emit_finish(
-        &mut self,
-        stop_reason: &str,
-        usage: Option<CodexUsage>,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) {
-        let mapped = map_codex_usage_to_anthropic(&usage, Some(self.web_search_requests));
-        self.emit(
-            traffic,
-            out,
-            "message_delta",
-            &serde_json::json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": stop_reason,
-                    "stop_sequence": null
-                },
-                "usage": mapped,
-            }),
-        );
-        self.emit(
-            traffic,
-            out,
-            "message_stop",
-            &serde_json::json!({"type": "message_stop"}),
-        );
-        self.finished = true;
-    }
-
-    fn close_open_blocks(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
-        self.close_thinking(traffic, out);
-        let open: Vec<usize> = self.blocks_by_output_index.keys().copied().collect();
-        for output_index in open {
-            let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
+    ) -> Vec<u8> {
+        use TranslationEvent::*;
+        let mut out = Vec::new();
+        for event in events {
+            if matches!(event, TranslationEvent::Skipped(_)) {
                 continue;
-            };
-            let index = match state {
-                LiveBlock::Text {
-                    index,
-                    text,
-                    deferred: true,
-                } => {
-                    self.deferred_text.push((index, text));
-                    continue;
+            }
+            self.ensure_message_start(traffic, &mut out);
+            match event {
+                TextStart { index } => self.emit(traffic, &mut out, "content_block_start", serde_json::json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}})),
+                ThinkingStart { index } => self.emit(traffic, &mut out, "content_block_start", serde_json::json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":"","signature":""}})),
+                ToolStart { index, id, name } => self.emit(traffic, &mut out, "content_block_start", serde_json::json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}})),
+                TextDelta { index, text } => self.emit(traffic, &mut out, "content_block_delta", serde_json::json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}})),
+                ThinkingDelta { index, text } => self.emit(traffic, &mut out, "content_block_delta", serde_json::json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":text}})),
+                ThinkingSignature { index, signature } => self.emit(traffic, &mut out, "content_block_delta", serde_json::json!({"type":"content_block_delta","index":index,"delta":{"type":"signature_delta","signature":signature}})),
+                ToolDelta { index, partial_json } => self.emit(traffic, &mut out, "content_block_delta", serde_json::json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":partial_json}})),
+                TextStop { index } | ThinkingStop { index } | ToolStop { index } => self.emit(traffic, &mut out, "content_block_stop", serde_json::json!({"type":"content_block_stop","index":index})),
+                SearchComplete { index, card } => {
+                    for (offset, block) in card.blocks().into_iter().enumerate() {
+                        let index = index + offset;
+                        self.emit(traffic, &mut out, "content_block_start", serde_json::json!({"type":"content_block_start","index":index,"content_block":block}));
+                        self.emit(traffic, &mut out, "content_block_stop", serde_json::json!({"type":"content_block_stop","index":index}));
+                    }
                 }
-                LiveBlock::Text { index, .. } => index,
-                LiveBlock::Tool { index, .. } => index,
-            };
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
+                Progress { .. } => self.emit(traffic, &mut out, "ping", serde_json::json!({"type":"ping"})),
+                Skipped(_) => {},
+                Finish { stop_reason, usage, web_search_requests, .. } => {
+                    self.emit(traffic, &mut out, "message_delta", serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":map_codex_usage_to_anthropic(usage, Some(*web_search_requests))}));
+                    self.emit(traffic, &mut out, "message_stop", serde_json::json!({"type":"message_stop"}));
+                }
+            }
         }
+        out
     }
+}
 
-    fn emit_signature_only_reasoning(
-        &mut self,
-        output_index: usize,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) {
-        let Some(replay) = self
-            .reasoning_by_output_index
-            .remove(&output_index)
-            .and_then(|pending| pending.replay())
-        else {
-            return;
-        };
-        let Some(signature) = encode_reasoning_signature(&replay) else {
-            return;
-        };
-        self.semantic_output_started = true;
-        let index = self.anthropic_index;
-        self.anthropic_index += 1;
-        self.ensure_message_start(traffic, out);
-        self.emit(
-            traffic,
-            out,
-            "content_block_start",
-            &serde_json::json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-            }),
-        );
-        self.emit(
-            traffic,
-            out,
-            "content_block_delta",
-            &serde_json::json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "signature_delta", "signature": signature}
-            }),
-        );
-        self.emit(
-            traffic,
-            out,
-            "content_block_stop",
-            &serde_json::json!({
-                "type": "content_block_stop",
-                "index": index,
-            }),
-        );
-    }
+/// Metadata for exactly the bytes returned since the last drain. Structural
+/// staging carries this alongside its bytes; discarded retry output is uncounted.
+#[derive(Default)]
+pub struct EmissionProgress {
+    pub events: u64,
+    pub usage: UsageObservation,
+    pub failed: Option<String>,
+    pub captured_events: Vec<serde_json::Value>,
+    /// A real thinking block start is contained in this emission's bytes.
+    pub thinking_started: bool,
+}
 
-    fn close_thinking(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
-        let Some(thinking) = self.thinking.take() else {
-            return;
-        };
-        if let Some(signature) = self
-            .reasoning_by_output_index
-            .remove(&thinking.output_index)
-            .and_then(|pending| pending.replay())
-            .and_then(|replay| encode_reasoning_signature(&replay))
-        {
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": thinking.anthropic_index,
-                    "delta": {"type": "signature_delta", "signature": signature}
-                }),
-            );
+impl EmissionProgress {
+    pub fn append(&mut self, next: Self) {
+        self.events += next.events;
+        self.thinking_started |= next.thinking_started;
+        if next.usage.input_tokens.is_some() {
+            self.usage.input_tokens = next.usage.input_tokens;
         }
-        self.emit(
-            traffic,
-            out,
-            "content_block_stop",
-            &serde_json::json!({
-                "type": "content_block_stop",
-                "index": thinking.anthropic_index,
-            }),
-        );
-    }
-}
-
-fn web_search_query(item: &serde_json::Value) -> String {
-    let Some(action) = item.get("action") else {
-        return String::new();
-    };
-    action
-        .get("query")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            action
-                .get("queries")
-                .and_then(|v| v.as_array())
-                .and_then(|queries| queries.iter().find_map(|query| query.as_str()))
-        })
-        .unwrap_or("")
-        .to_string()
-}
-
-fn output_index(payload: &serde_json::Value) -> usize {
-    payload
-        .get("output_index")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize
-}
-
-fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
-    let usage = match response.get("usage") {
-        Some(u) => u,
-        None => return CodexUsage::default(),
-    };
-    CodexUsage {
-        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
-        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
-        input_tokens_details_cached: usage
-            .get("input_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_u64()),
-        output_tokens_details_reasoning: usage
-            .get("output_tokens_details")
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(|v| v.as_u64()),
-        rate_limits: None,
-    }
-}
-
-fn repair_whitespace_stalled_read_args(
-    name: &str,
-    args: &str,
-    call_id: Option<&str>,
-) -> Option<String> {
-    if name != "Read" {
-        return None;
-    }
-    let trimmed = args.trim_end();
-    let trailing_whitespace = args.len().saturating_sub(trimmed.len());
-    if trailing_whitespace < BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES {
-        return None;
-    }
-    parse_read_args_candidate(trimmed, call_id).or_else(|| {
-        let with_brace = format!("{trimmed}}}");
-        parse_read_args_candidate(&with_brace, call_id)
-    })
-}
-
-fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
-    if !is_valid_read_args(&parsed) {
-        return None;
-    }
-    Some(sanitize_read_args(
-        "Read",
-        &serde_json::to_string(&parsed).ok()?,
-        call_id,
-    ))
-}
-
-fn is_valid_read_args(value: &serde_json::Value) -> bool {
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    for key in obj.keys() {
-        if !matches!(key.as_str(), "file_path" | "offset" | "limit" | "pages") {
-            return false;
+        if next.usage.cached_input_tokens.is_some() {
+            self.usage.cached_input_tokens = next.usage.cached_input_tokens;
         }
+        if next.usage.output_tokens.is_some() {
+            self.usage.output_tokens = next.usage.output_tokens;
+        }
+        if next.usage.reasoning_tokens.is_some() {
+            self.usage.reasoning_tokens = next.usage.reasoning_tokens;
+        }
+        self.failed = next.failed.or(self.failed.take());
+        self.captured_events.extend(next.captured_events);
     }
-    let Some(file_path) = obj.get("file_path").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    if file_path.is_empty() {
-        return false;
-    }
-    if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64())
-        && offset < 0
-    {
-        return false;
-    }
-    if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64())
-        && limit <= 0
-    {
-        return false;
-    }
-    if obj.get("offset").is_some_and(|v| !v.is_i64()) {
-        return false;
-    }
-    if obj.get("limit").is_some_and(|v| !v.is_i64()) {
-        return false;
-    }
-    if obj.get("pages").is_some_and(|v| !v.is_string()) {
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task3_search_answer_streams_before_terminal_and_keeps_real_links() {
+        use serde_json::json;
+        let mut t = LiveStreamTranslator::new("m", "model");
+        let mut events = vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"s"}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"s","action":{"query":"q","sources":[{"title":"Hosted source","url":"https://example.test/hosted"}]}}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m"}}),
+        ];
+        let mut all = Vec::new();
+        for event in &events {
+            all.extend(t.accept(event, None).unwrap());
+        }
+        let answer = format!(
+            "{}[Existing](https://example.test/existing) [Longer source](https://example.test/source-long) [Article](https://en.wikipedia.org/wiki/Article_%28topic%29)",
+            "Long answer ".repeat(1024)
+        );
+        let early = t
+            .accept(
+                &json!({"type":"response.output_text.delta","output_index":1,"delta":answer}),
+                None,
+            )
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&early).contains("Long answer"),
+            "answer must cross the consumer barrier before terminal"
+        );
+        all.extend(early);
+        events.push(json!({"type":"response.output_text.delta","output_index":1,"delta":answer}));
+        let tail = [
+            json!({"type":"response.output_text.annotation.added","output_index":1,"content_index":0,"annotation":{"type":"url_citation","title":"Source","url":"https://example.test/source"}}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"m","content":[{"type":"output_text","text":answer,"annotations":[{"type":"url_citation","title":"Source","url":"https://example.test/source"},{"type":"url_citation","title":"Existing","url":"https://example.test/existing"},{"type":"url_citation","title":"Snapshot source","url":"https://example.test/snapshot"},{"type":"url_citation","title":"Article","url":"https://en.wikipedia.org/wiki/Article_(topic)"}]}]}}),
+            json!({"type":"response.completed","response":{"status":"completed"}}),
+        ];
+        for event in &tail {
+            all.extend(t.accept(event, None).unwrap());
+        }
+        events.extend(tail);
+        let raw = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let buffered =
+            super::super::accumulate::accumulate_response(raw.as_bytes(), "m", "model").unwrap();
+        let content = buffered["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<String>();
+        for url in [
+            "https://example.test/source",
+            "https://example.test/existing",
+            "https://example.test/snapshot",
+            "https://example.test/hosted",
+        ] {
+            assert_eq!(
+                content.matches(&format!("({url})")).count(),
+                1,
+                "genuine sources must appear once: {url}"
+            );
+        }
+        assert_eq!(
+            content
+                .matches("[Article](https://en.wikipedia.org/wiki/Article_%28topic%29)")
+                .count(),
+            1,
+            "encoded source must appear once"
+        );
+        let all = String::from_utf8(all).unwrap();
+        assert!(all.contains("[Source](https://example.test/source)"));
+        assert!(all.contains("web_search_tool_result"));
+        assert!(all.contains(r#""type":"server_tool_use""#));
+        assert!(!t.finish_metadata().unwrap().continuation_eligible);
+    }
+
+    #[test]
+    fn task3_unsupported_item_does_not_hide_unfinished_supported_call() {
+        use serde_json::json;
+        let mut t = LiveStreamTranslator::new("m", "model");
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"f","call_id":"c","name":"Bash"}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{}"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"f","call_id":"c","name":"Bash","arguments":"{}"}}),
+            json!({"type":"response.future.progress","sequence_number":9}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"mcp_call","id":"skip"}}),
+            json!({"type":"response.mcp_call.failed","output_index":1,"item_id":"skip","error":{"message":"tool-local error"}}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"mcp_call","id":"skip"}}),
+            json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"f2","call_id":"c2","name":"Bash"}}),
+            json!({"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"f2","call_id":"c2","name":"Bash","arguments":"{}"}}),
+            json!({"type":"response.completed","response":{"status":"completed"}}),
+        ] {
+            t.accept(&event, None).unwrap();
+        }
+        assert!(t.is_finished());
+        assert!(!t.finish_metadata().unwrap().continuation_eligible);
+        let mut unfinished = LiveStreamTranslator::new("m", "model");
+        unfinished.accept(&json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"f","call_id":"c","name":"Bash"}}),None).unwrap();
+        unfinished
+            .accept(&json!({"type":"response.future.progress"}), None)
+            .unwrap();
+        assert!(
+            unfinished
+                .accept(
+                    &json!({"type":"response.completed","response":{"status":"completed"}}),
+                    None
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn interleaved_calls_and_message_parts_share_live_buffered_decisions() {
+        use serde_json::json;
+        let events = vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"f0","call_id":"call_a","name":"Bash"}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"f1","call_id":"call_b","name":"mcp__fixture__lookup"}}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"f1","delta":"{\"q\":"}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"cmd\":"}),
+            json!({"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"q\":\"x\"}"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"f1","call_id":"call_b","name":"mcp__fixture__lookup","arguments":"{\"q\":\"x\"}"}}),
+            json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"cmd\":\"ls\"}"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"f0","call_id":"call_a","name":"Bash","arguments":"{\"cmd\":\"ls\"}"}}),
+            json!({"type":"response.output_item.added","output_index":2,"item":{"type":"message","id":"m"}}),
+            json!({"type":"response.content_part.added","item_id":"m","content_index":0,"part":{"type":"output_text","text":""}}),
+            json!({"type":"response.output_text.delta","item_id":"m","content_index":0,"delta":"First"}),
+            json!({"type":"response.content_part.done","item_id":"m","content_index":0,"part":{"type":"output_text","text":"First part"}}),
+            json!({"type":"response.content_part.added","item_id":"m","content_index":1,"part":{"type":"refusal","refusal":""}}),
+            json!({"type":"response.refusal.delta","item_id":"m","content_index":1,"delta":"Cannot"}),
+            json!({"type":"response.refusal.done","item_id":"m","content_index":1,"refusal":"Cannot comply"}),
+            json!({"type":"response.output_item.done","output_index":2,"item":{"type":"message","id":"m","content":[{"type":"output_text","text":"First part"},{"type":"refusal","refusal":"Cannot comply"}]}}),
+            json!({"type":"response.completed","response":{"id":"r","status":"completed"}}),
+        ];
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        let mut live = Vec::new();
+        for event in &events {
+            let bytes = translator.accept(event, None).unwrap();
+            if event["type"] != "response.completed" {
+                assert!(!String::from_utf8_lossy(&bytes).contains("message_stop"));
+            }
+            live.extend(bytes);
+        }
+        let raw = events
+            .iter()
+            .map(|e| format!("data: {e}\n\n"))
+            .collect::<String>();
+        let buffered =
+            super::super::accumulate::accumulate_response(raw.as_bytes(), "msg", "model").unwrap();
+        assert_eq!(buffered["content"][0]["id"], "call_a");
+        assert_eq!(buffered["content"][0]["input"], json!({"cmd":"ls"}));
+        assert_eq!(buffered["content"][1]["id"], "call_b");
+        assert_eq!(buffered["content"][1]["input"], json!({"q":"x"}));
+        assert_eq!(buffered["content"][2]["text"], "First part");
+        assert_eq!(buffered["content"][3]["text"], "Cannot comply");
+        assert_eq!(buffered["stop_reason"], "tool_use");
+        let frames: Vec<serde_json::Value> = crate::anthropic::sse::parse_sse_events(&live)
+            .into_iter()
+            .map(|e| serde_json::from_str(&e.data).unwrap())
+            .collect();
+        for (index, expected) in [(0, "{\"cmd\":\"ls\"}"), (1, "{\"q\":\"x\"}")] {
+            let args: String = frames
+                .iter()
+                .filter(|e| e["index"] == index)
+                .filter_map(|e| {
+                    e.pointer("/delta/partial_json")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .collect();
+            assert_eq!(args, expected);
+        }
+    }
+
+    #[test]
+    fn cached_input_is_reported_by_terminal_progress_and_preserved_when_staged() {
+        use super::*;
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        translator
+            .accept(
+                &serde_json::json!({
+                    "type": "response.completed", "response": {"status": "completed", "usage": {
+                        "input_tokens": 790845, "input_tokens_details": {"cached_tokens": 782848}
+                    }}
+                }),
+                None,
+            )
+            .unwrap();
+        let mut staged = EmissionProgress::default();
+        staged.append(translator.take_progress());
+        staged.append(EmissionProgress::default());
+        let value = serde_json::to_value(&staged.usage).unwrap();
+        assert_eq!(value["cached_input_tokens"], 782848);
+        let zero = serde_json::from_value(serde_json::json!({"cached_input_tokens": 0})).unwrap();
+        staged.append(EmissionProgress {
+            usage: zero,
+            ..Default::default()
+        });
+        staged.append(EmissionProgress::default());
+        assert_eq!(
+            serde_json::to_value(&staged.usage).unwrap()["cached_input_tokens"],
+            0
+        );
+    }
+
+    #[test]
+    fn emission_progress_counts_generated_events_and_retains_failed_terminal_usage() {
+        use super::*;
+        let mut translator = LiveStreamTranslator::with_estimated_input_tokens("msg", "model", 321);
+        translator.stage_capture(true);
+        assert!(!translator.ping_chunk(None).is_empty());
+        let initial = translator.take_progress();
+        assert_eq!(initial.events, 2);
+        assert_eq!(initial.captured_events.len(), 2);
+        assert_eq!(
+            initial.usage.input_tokens,
+            Some(TokenObservation::estimated(321))
+        );
+        assert_eq!(initial.usage.output_tokens, None);
+        assert!(!translator.ping_chunk(None).is_empty());
+        let heartbeat = translator.take_progress();
+        assert_eq!(heartbeat.events, 1);
+        assert_eq!(heartbeat.captured_events.len(), 1);
+        assert_eq!(heartbeat.usage, UsageObservation::default());
+        translator.accept(&serde_json::json!({"type":"response.output_item.added", "output_index":0,"item":{"type":"message","id":"i"}}), None).unwrap();
+        translator.take_progress();
+        let result = translator.accept(&serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{"output_tokens":300,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":20}}}}), None);
+        assert!(result.is_err());
+        let error = translator.error_chunk("local rejection", "api_error", None);
+        assert!(!error.is_empty());
+        let progress = translator.take_progress();
+        assert_eq!(progress.usage.input_tokens, None);
+        assert_eq!(progress.usage.cached_input_tokens, Some(0));
+        assert_eq!(
+            progress.usage.output_tokens,
+            Some(TokenObservation::provider(300))
+        );
+        assert_eq!(progress.usage.reasoning_tokens, Some(20));
+        assert!(progress.failed.is_some());
+        assert_eq!(progress.events, progress.captured_events.len() as u64);
+        assert_eq!(progress.captured_events.last().unwrap()["event"], "error");
+        assert!(
+            translator
+                .error_chunk("duplicate", "api_error", None)
+                .is_empty()
+        );
+        assert_eq!(translator.take_progress().events, 0);
+    }
+
+    #[test]
+    fn terminal_emission_preserves_provider_total_including_reasoning_on_wire() {
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        let bytes = translator.accept(&serde_json::json!({"type":"response.completed", "response":{"status":"completed","usage":{"output_tokens":300,"output_tokens_details":{"reasoning_tokens":20}}}}), None).unwrap();
+        let progress = translator.take_progress();
+        assert_eq!(
+            progress.usage.output_tokens,
+            Some(TokenObservation::provider(300))
+        );
+        assert_eq!(progress.usage.reasoning_tokens, Some(20));
+        assert_eq!(progress.events, 3);
+        let delta = parse_sse_events(&bytes)
+            .into_iter()
+            .find(|event| event.event.as_deref() == Some("message_delta"))
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&delta.data).unwrap();
+        assert_eq!(data["usage"]["output_tokens"], 300);
+        assert!(translator.ping_chunk(None).is_empty());
+        assert_eq!(translator.take_progress().events, 0);
+    }
     use super::*;
     use crate::anthropic::sse::parse_sse_events;
     use serde_json::json;
+
+    #[test]
+    fn ordinary_live_deltas_do_not_retain_forwarded_answer() {
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        let delta = json!({"type":"response.output_text.delta","output_index":0,"delta":"abcdefghijklmnop"});
+        for count in [100_000, 200_000] {
+            for _ in 0..100_000 {
+                let bytes = translator.accept(&delta, None).unwrap();
+                assert!(!bytes.is_empty());
+            }
+            let retained: usize = translator
+                .state
+                .blocks_by_output_index
+                .values()
+                .map(|block| match block {
+                    LiveBlock::Text { text, .. } => text.capacity(),
+                    LiveBlock::Tool { args_accum, .. } => args_accum.capacity(),
+                })
+                .sum();
+            assert!(
+                retained < 1024,
+                "retained {retained} bytes after {count} deltas"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_live_replay_is_ordered_and_snapshots_do_not_duplicate() {
+        let mut translator =
+            LiveStreamTranslator::new("msg", "model").with_replay_budget(Some(4096));
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs"}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m"}}),
+            json!({"type":"response.output_text.delta","output_index":1,"delta":"hello"}),
+            json!({"type":"response.output_text.done","output_index":1,"text":"hello world"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"hello world"}]}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs","encrypted_content":"complete:opaque"}}),
+            json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","name":"Bash","call_id":"call"}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"cmd\":"}),
+            json!({"type":"response.function_call_arguments.done","output_index":2,"arguments":"{\"cmd\":\"ls\"}"}),
+            json!({"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","arguments":"{\"cmd\":\"ls\"}"}}),
+            json!({"type":"response.completed","response":{"id":"resp","usage":{"input_tokens":12,"output_tokens":3}}}),
+        ] {
+            translator.accept(&event, None).unwrap();
+        }
+        let finish = translator.finish_metadata().unwrap();
+        assert!(finish.stream_success && finish.continuation_eligible);
+        assert_eq!(finish.response_id.as_deref(), Some("resp"));
+        assert_eq!(finish.usage.as_ref().unwrap().output_tokens, Some(3));
+        assert_eq!(
+            serde_json::to_value(&finish.output_items).unwrap(),
+            json!([
+                {"type":"reasoning","id":"rs","summary":[],"encrypted_content":"complete:opaque"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello world"}]},
+                {"type":"function_call","call_id":"call","name":"Bash","arguments":"{\"cmd\":\"ls\"}"}
+            ])
+        );
+    }
+
+    #[test]
+    fn replay_overflow_drops_optional_answer_but_preserves_stream_success() {
+        let mut translator =
+            LiveStreamTranslator::new("msg", "model").with_replay_budget(Some(300));
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}),
+            json!({"type":"response.output_text.delta","output_index":0,"delta":"a".repeat(1024)}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}),
+            json!({"type":"response.completed","response":{"id":"r"}}),
+        ] {
+            translator.accept(&event, None).unwrap();
+        }
+        let finish = translator.finish_metadata().unwrap();
+        assert!(finish.stream_success);
+        assert!(!finish.replay_available && !finish.continuation_eligible);
+        assert!(finish.output_items.is_empty());
+    }
+
+    #[test]
+    fn unresolved_or_unsupported_items_never_publish_replay() {
+        for item in [json!({"type":"message"}), json!({"type":"unknown"})] {
+            let mut translator =
+                LiveStreamTranslator::new("msg", "model").with_replay_budget(Some(4096));
+            translator
+                .accept(
+                    &json!({"type":"response.output_item.added","output_index":0,"item":item}),
+                    None,
+                )
+                .unwrap();
+            let terminal = translator.accept(
+                &json!({"type":"response.completed","response":{"id":"r"}}),
+                None,
+            );
+            if item["type"] == "message" {
+                assert!(terminal.is_err());
+                assert!(translator.finish_metadata().is_none());
+                assert!(!translator.is_finished());
+            } else {
+                terminal.unwrap();
+                let finish = translator.finish_metadata().unwrap();
+                assert!(finish.stream_success);
+                assert!(!finish.continuation_eligible && !finish.replay_available);
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_message_content_preserves_success_without_native_replay() {
+        let mut translator =
+            LiveStreamTranslator::new("msg", "model").with_replay_budget(Some(4096));
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}),
+            json!({"type":"response.output_text.delta","output_index":0,"delta":"visible"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_audio","audio":"unsupported"}]}}),
+        ] {
+            translator.accept(&event, None).unwrap();
+        }
+        translator
+            .accept(
+                &json!({"type":"response.completed","response":{"id":"r"}}),
+                None,
+            )
+            .unwrap();
+        let finish = translator.finish_metadata().unwrap();
+        assert!(finish.stream_success);
+        assert!(!finish.continuation_eligible && !finish.replay_available);
+    }
+
+    #[test]
+    fn conflicting_snapshots_fail_without_replay() {
+        let mut translator =
+            LiveStreamTranslator::new("msg", "model").with_replay_budget(Some(4096));
+        translator
+            .accept(
+                &json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"}),
+                None,
+            )
+            .unwrap();
+        assert!(
+            translator
+                .accept(
+                    &json!({"type":"response.output_text.done","output_index":0,"text":"world"}),
+                    None
+                )
+                .is_err()
+        );
+        assert!(translator.finish_metadata().is_none());
+    }
+
+    #[test]
+    fn read_done_snapshot_preserves_buffer_until_item_done() {
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        translator.accept(&json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"Read","call_id":"c"}}), None).unwrap();
+        let bytes = translator.accept(&json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":format!("{{\"file_path\":\"/tmp/a\"}}{}", " ".repeat(1024))}), None).unwrap();
+        assert!(
+            !translator.is_finished(),
+            "a done snapshot must not take the delta-only repair exit"
+        );
+        assert!(
+            bytes.is_empty(),
+            "Read arguments remain buffered until output_item.done"
+        );
+    }
+
+    #[test]
+    fn ordinary_non_read_arguments_are_not_retained() {
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        translator.accept(&json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"Bash","call_id":"c"}}), None).unwrap();
+        let delta = json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"x".repeat(1024)});
+        for _ in 0..10_000 {
+            translator.accept(&delta, None).unwrap();
+        }
+        let LiveBlock::Tool { args_accum, .. } = &translator.state.blocks_by_output_index[&(0, 0)]
+        else {
+            panic!()
+        };
+        assert_eq!(args_accum.capacity(), 0);
+    }
+
+    #[test]
+    fn live_done_snapshot_emits_only_missing_suffix() {
+        let rendered = render(vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m"}}),
+            json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"}),
+            json!({"type":"response.output_text.done","output_index":0,"text":"hello world"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"hello world"}]}}),
+            json!({"type":"response.completed","response":{"id":"r","status":"completed"}}),
+        ]);
+        let text: String = parse_sse_events(rendered.as_bytes())
+            .into_iter()
+            .filter_map(|event| {
+                let value: serde_json::Value = serde_json::from_str(&event.data).ok()?;
+                value
+                    .pointer("/delta/text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(text, "hello world");
+    }
 
     fn render(events: Vec<serde_json::Value>) -> String {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
@@ -1205,6 +715,67 @@ mod tests {
             out.extend(translator.accept(&event, None).unwrap());
         }
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn read_whitespace_does_not_bypass_missing_completed_reasoning() {
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        let prefix = format!("{{\"file_path\":\"/tmp/a\"{}", " ".repeat(1024));
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs","encrypted_content":"early"}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs"}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"c","name":"Read"}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":prefix}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","arguments":format!("{prefix}}}")}}),
+        ] {
+            translator.accept(&event, None).unwrap();
+            assert!(!translator.is_finished());
+        }
+        let error = translator
+            .accept(
+                &json!({"type":"response.completed","response":{"status":"completed"}}),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .as_str()
+                .contains("completed reasoning replay unavailable")
+        );
+    }
+
+    #[test]
+    fn orphan_function_done_is_explicit_failure() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-6.1-sol");
+        let error = translator.accept(&json!({"type":"response.output_item.done","output_index":1,
+            "item":{"type":"function_call","call_id":"call_orphan","name":"Read","arguments":"{}"}}),None).unwrap_err();
+        assert!(error.as_str().contains("unsupported Codex sequence"));
+        assert!(!translator.has_semantic_output());
+    }
+
+    #[test]
+    fn missing_completed_reasoning_prevents_tool_success() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-6.1-sol");
+        for event in [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"early"}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":""}}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"}}),
+        ] {
+            let chunk = String::from_utf8(translator.accept(&event, None).unwrap()).unwrap();
+            assert!(!chunk.contains("signature_delta"));
+        }
+        let error = translator
+            .accept(
+                &json!({"type":"response.completed","response":{"status":"completed"}}),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .as_str()
+                .contains("completed reasoning replay unavailable")
+        );
     }
 
     #[test]
@@ -1255,6 +826,11 @@ mod tests {
             started.pointer("/message/usage/input_tokens"),
             Some(&json!(321))
         );
+
+        translator.accept(&json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "message", "content": [{"type": "output_text", "text": "abcdefgh"}]}
+        }), None).unwrap();
 
         let finished = translator
             .accept(
@@ -1342,13 +918,14 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert!(error.contains("max_output_tokens"));
+        assert!(error.as_str().contains("max_output_tokens"));
     }
 
     #[test]
     fn standard_responses_policy_maps_max_output_tokens_to_message_stop() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-luna")
-            .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens);
+            .with_incomplete_response_policy(IncompleteResponsePolicy::AllowMaxOutputTokens)
+            .with_replay_budget(Some(4096));
         let out = translator
             .accept(
                 &json!({
@@ -1368,6 +945,8 @@ mod tests {
         assert!(out.contains(r#""output_tokens":8"#));
         assert!(out.contains("event: message_stop"));
         assert!(translator.is_finished());
+        let metadata = translator.finish_metadata().unwrap();
+        assert!(!metadata.stream_success && !metadata.continuation_eligible);
     }
 
     #[test]
@@ -1394,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_tool_start_is_not_semantic_until_arguments_arrive() {
+    fn visible_tool_start_commits_before_arguments_arrive() {
         let mut tool = LiveStreamTranslator::new("msg_tool", "gpt-5.5");
         tool.accept(
             &json!({
@@ -1405,7 +984,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!tool.has_semantic_output());
+        assert!(tool.has_semantic_output());
         tool.accept(
             &json!({
                 "type": "response.function_call_arguments.delta",
@@ -1456,7 +1035,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(web_search.has_semantic_output());
+        assert!(!web_search.has_semantic_output());
+        assert!(web_search.had_compatibility_skips());
     }
 
     #[test]
@@ -1494,42 +1074,31 @@ mod tests {
     }
 
     #[test]
-    fn repairs_whitespace_stalled_read_args_as_tool_use_finish() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let mut out = Vec::new();
-        out.extend(
-            translator
-                .accept(
-                    &json!({
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {"type":"function_call","call_id":"call_1","name":"Read"}
-                    }),
-                    None,
-                )
-                .unwrap(),
+    fn read_whitespace_waits_for_authoritative_completion() {
+        let mut translator = LiveStreamTranslator::new("msg", "model");
+        translator.accept(&json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","name":"Read"}}), None).unwrap();
+        let prefix = format!(
+            "{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}",
+            " ".repeat(1024)
         );
-        out.extend(
-            translator
-                .accept(
-                    &json!({
-                        "type": "response.function_call_arguments.delta",
-                        "output_index": 0,
-                        "delta": format!("{{\"file_path\":\"/tmp/a\",\"pages\":\"\"{}", " ".repeat(1024))
-                    }),
-                    None,
-                )
-                .unwrap(),
-        );
-        let rendered = String::from_utf8(out).unwrap();
+        let bytes = translator.accept(&json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":prefix}), None).unwrap();
+        assert!(bytes.is_empty(), "unfinished Read must remain buffered");
+        assert!(!translator.is_finished());
+        let bytes = translator.accept(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","arguments":format!("{prefix}}}")}}), None).unwrap();
+        let rendered = String::from_utf8(bytes).unwrap();
         assert!(rendered.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#));
-        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
-        assert!(rendered.contains("message_stop"));
-        assert!(translator.is_finished());
+        assert!(!rendered.contains("message_stop"));
+        assert!(!translator.is_finished());
+        let ending = translator.error_chunk("Missing response terminal", "api_error", None);
+        assert!(String::from_utf8(ending).unwrap().contains("event: error"));
+        assert!(
+            translator.finish_metadata().is_none(),
+            "EOF compatibility cannot publish continuation"
+        );
     }
 
     #[test]
-    fn websocket_compat_can_finish_after_closed_completed_tool_call() {
+    fn closed_tool_requires_response_terminal() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();
         for event in [
@@ -1556,17 +1125,16 @@ mod tests {
         ] {
             out.extend(translator.accept(&event, None).unwrap());
         }
-        out.extend(translator.finish_after_closed_completed_tool_call(None));
+        out.extend(translator.error_chunk("Missing response terminal", "api_error", None));
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("content_block_start"));
         assert!(rendered.contains("input_json_delta"));
-        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
-        assert!(rendered.contains("message_stop"));
-        assert!(!rendered.contains("event: error"));
+        assert!(!rendered.contains("message_stop"));
+        assert!(rendered.contains("event: error"));
     }
 
     #[test]
-    fn emits_web_search_results_from_citations_before_deferred_text() {
+    fn emits_real_citation_links_and_completed_claudecode_search_pair() {
         let out = render(vec![
             json!({
                 "type": "response.output_item.added",
@@ -1594,6 +1162,7 @@ mod tests {
             }),
             json!({
                 "type": "response.output_text.annotation.added",
+                "output_index": 1,
                 "annotation": {
                     "type": "url_citation",
                     "title": "Reasoning",
@@ -1611,11 +1180,13 @@ mod tests {
             }),
         ]);
 
-        let tool = out.find("server_tool_use").unwrap();
-        let result = out.find("web_search_tool_result").unwrap();
+        assert!(out.contains(r#""type":"server_tool_use""#));
+        assert!(out.contains("web_search_tool_result"));
         let text = out.find("See the official docs.").unwrap();
-        assert!(tool < result && result < text);
-        assert!(out.contains("https://docs.x.ai/docs/guides/reasoning"));
+        let link = out
+            .find("[Reasoning](https://docs.x.ai/docs/guides/reasoning)")
+            .unwrap();
+        assert!(text < link);
         assert!(out.contains(r#""web_search_requests":1"#));
     }
 
@@ -1684,7 +1255,7 @@ mod tests {
             json!({
                 "type":"response.output_item.done",
                 "output_index":0,
-                "item":{"type":"reasoning","id":"rs_1"}
+                "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
             }),
             json!({
                 "type":"response.completed",
@@ -1703,6 +1274,114 @@ mod tests {
     }
 
     #[test]
+    fn early_reasoning_reuses_one_block_before_rejecting_thinking_only() {
+        use crate::anthropic::sse::parse_sse_events;
+        for summary in [false, true] {
+            let added = json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"r"}});
+            let mut default = LiveStreamTranslator::new("m", "model");
+            assert!(default.accept(&added, None).unwrap().is_empty());
+            assert!(!default.has_semantic_output());
+            let mut early = LiveStreamTranslator::new("m", "model").with_early_reasoning();
+            let mut wire = early.accept(&added, None).unwrap();
+            assert!(
+                early.has_semantic_output(),
+                "published reasoning start must commit output"
+            );
+            let initial = parse_sse_events(&wire);
+            assert_eq!(
+                initial
+                    .iter()
+                    .filter(|e| e.event.as_deref() == Some("content_block_start"))
+                    .count(),
+                1
+            );
+            assert!(!String::from_utf8_lossy(&wire).contains("thinking_delta"));
+            if summary {
+                wire.extend(early.accept(&json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"Real summary"}),None).unwrap());
+            }
+            wire.extend(early.accept(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r","encrypted_content":"opaque"}}),None).unwrap());
+            let error = early.accept(&json!({"type":"response.completed","response":{"id":"resp","status":"completed"}}),None).expect_err("thinking alone cannot finish successfully");
+            assert!(early.finish_metadata().is_none());
+            wire.extend(early.error_chunk(error.as_str(), "api_error", None));
+            let events = parse_sse_events(&wire);
+            for (name, count) in [
+                ("message_start", 1),
+                ("content_block_start", 1),
+                ("content_block_stop", 1),
+                ("message_stop", 0),
+                ("error", 1),
+            ] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e.event.as_deref() == Some(name))
+                        .count(),
+                    count,
+                    "{name}"
+                );
+            }
+            let deltas: Vec<serde_json::Value> = events
+                .iter()
+                .filter(|e| e.event.as_deref() == Some("content_block_delta"))
+                .map(|e| serde_json::from_str(&e.data).unwrap())
+                .collect();
+            assert!(deltas.iter().all(|e| e["index"] == 0));
+            assert_eq!(
+                deltas
+                    .iter()
+                    .filter(|e| e["delta"]["type"] == "signature_delta")
+                    .count(),
+                1
+            );
+            assert!(String::from_utf8_lossy(&wire).contains("ccp:codex:v1:"));
+        }
+    }
+
+    #[test]
+    fn early_reasoning_summary_without_answer_cannot_finish_successfully() {
+        for summary in [false, true] {
+            let mut t = LiveStreamTranslator::new("m", "model").with_early_reasoning();
+            let mut wire = t.accept(&json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"r"}}), None).unwrap();
+            if summary {
+                wire.extend(t.accept(&json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Real summary"}), None).unwrap());
+            }
+            wire.extend(t.accept(&json!({"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r","summary":[]}}), None).unwrap());
+            let terminal = t.accept(
+                &json!({"type":"response.completed","response":{"id":"resp","status":"completed"}}),
+                None,
+            );
+            let error = terminal.expect_err("thinking alone is not an answer");
+            assert!(
+                t.finish_metadata().is_none(),
+                "thinking cannot authorize success"
+            );
+            assert!(
+                t.has_semantic_output(),
+                "failed completion must not reopen retry"
+            );
+            wire.extend(t.error_chunk(error.as_str(), "api_error", None));
+            let wire = String::from_utf8(wire).unwrap();
+            assert_eq!(wire.matches("event: content_block_start").count(), 1);
+            assert_eq!(wire.matches("event: content_block_stop").count(), 1);
+            assert!(!wire.contains("signature_delta"));
+            assert!(wire.contains("event: error"));
+            assert!(!wire.contains("message_stop"));
+        }
+    }
+
+    #[test]
+    fn early_reasoning_abort_closes_empty_block_without_success_or_fake_signature() {
+        let mut t = LiveStreamTranslator::new("m", "model").with_early_reasoning();
+        let mut wire=t.accept(&json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"r"}}),None).unwrap();
+        wire.extend(t.error_chunk("upstream failed", "api_error", None));
+        let wire = String::from_utf8(wire).unwrap();
+        assert_eq!(wire.matches("event: content_block_stop").count(), 1);
+        assert!(wire.contains("event: error"));
+        assert!(!wire.contains("signature_delta"));
+        assert!(!wire.contains("message_stop"));
+    }
+
+    #[test]
     fn signature_only_reasoning_is_semantic_output() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();
@@ -1715,7 +1394,7 @@ mod tests {
             json!({
                 "type":"response.output_item.done",
                 "output_index":0,
-                "item":{"type":"reasoning","id":"rs_1"}
+                "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
             }),
         ] {
             out.extend(translator.accept(&event, None).unwrap());

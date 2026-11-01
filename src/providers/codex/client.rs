@@ -1,3 +1,4 @@
+use super::StreamSenderExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIG
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
 pub use super::events::{CodexLimitWindow, CodexUsageLimit};
+use super::performance;
 use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
 
@@ -38,6 +40,15 @@ pub enum CodexErrorOrigin {
     Auth,
     BufferedHttp,
     BufferedWebSocket,
+    /// A local guard rejected upstream structure; 502 without transparent retry.
+    HttpProtocol,
+    WebSocketProtocol,
+}
+
+impl CodexErrorOrigin {
+    pub(crate) fn is_protocol_rejection(self) -> bool {
+        matches!(self, Self::HttpProtocol | Self::WebSocketProtocol)
+    }
 }
 
 impl CodexError {
@@ -313,30 +324,13 @@ pub fn build_websocket_request(
     body: &ResponsesRequest,
     continuation: Option<&super::continuation::ContinuationCandidate>,
 ) -> serde_json::Value {
-    let mut payload = serde_json::to_value(body).unwrap_or_default();
-    let obj = payload.as_object_mut().expect("request must be an object");
-
-    // Omit the stream field for WebSocket transport
-    obj.remove("stream");
-    obj.insert("type".to_string(), serde_json::json!("response.create"));
-
-    // Apply continuation if available
-    if let Some(candidate) = continuation {
-        if let Some(ref prev_id) = candidate.previous_response_id {
-            obj.insert(
-                "previous_response_id".to_string(),
-                serde_json::json!(prev_id),
-            );
-        }
-        if let Some(ref delta) = candidate.input_delta {
-            obj.insert(
-                "input".to_string(),
-                serde_json::to_value(delta).unwrap_or_default(),
-            );
-        }
-    }
-
-    payload
+    let input = continuation
+        .and_then(|candidate| candidate.input_delta.as_deref())
+        .unwrap_or(&body.input);
+    let previous_response_id =
+        continuation.and_then(|candidate| candidate.previous_response_id.as_deref());
+    serde_json::to_value(body.wire(input, false, previous_response_id))
+        .expect("wire request serializes")
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +360,7 @@ struct HttpSseDecoder {
     frame: Vec<u8>,
     line_start: usize,
     skip_lf: bool,
+    pending_error: Option<CodexError>,
 }
 
 struct DecodedHttpSseEvent {
@@ -394,13 +389,23 @@ impl HttpSseDecoder {
                     continue;
                 }
             }
-            match byte {
-                b'\n' => self.end_line(&mut events)?,
+            let result = match byte {
+                b'\n' => self.end_line(&mut events),
                 b'\r' => {
-                    self.end_line(&mut events)?;
+                    let result = self.end_line(&mut events);
                     self.skip_lf = true;
+                    result
                 }
-                _ => self.push_byte(byte)?,
+                _ => self.push_byte(byte),
+            };
+            if let Err(error) = result {
+                if events.is_empty() {
+                    return Err(error);
+                }
+                // Preserve event order across a network chunk: deliver the
+                // decoded semantic prefix before its subsequent decode error.
+                self.pending_error = Some(error);
+                break;
             }
         }
         Ok(events)
@@ -490,6 +495,7 @@ fn http_sse_error(message: &str) -> CodexError {
 pub(crate) struct OwnerAwareCodexResponse {
     response: CodexResponse,
     pub(crate) socket_id: Option<u64>,
+    pub(crate) had_intervening_failure: bool,
 }
 
 impl OwnerAwareCodexResponse {
@@ -497,7 +503,13 @@ impl OwnerAwareCodexResponse {
         Self {
             response,
             socket_id,
+            had_intervening_failure: false,
         }
+    }
+
+    pub(crate) fn with_intervening_failure(mut self, failure: bool) -> Self {
+        self.had_intervening_failure |= failure;
+        self
     }
 
     fn into_response(self) -> CodexResponse {
@@ -510,6 +522,20 @@ impl std::ops::Deref for OwnerAwareCodexResponse {
 
     fn deref(&self) -> &Self::Target {
         &self.response
+    }
+}
+
+/// Internal classification survives retry decisions without changing the
+/// public CodexError construction surface.
+struct CodexRequestFailure {
+    error: CodexError,
+    retryable: bool,
+}
+
+impl From<CodexError> for CodexRequestFailure {
+    fn from(error: CodexError) -> Self {
+        let retryable = retryable_http_stream_error(&error);
+        Self { error, retryable }
     }
 }
 
@@ -693,6 +719,8 @@ pub struct CodexHttpClient {
     websocket_client: reqwest::Client,
     websocket_proxy_config: super::websocket::WebSocketProxyConfig,
     auto_http_fallback_enabled: bool,
+    websocket_reuse: bool,
+    early_reasoning: bool,
     auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
     base_url: String,
     header_timeout_ms: u64,
@@ -706,6 +734,13 @@ impl Default for CodexHttpClient {
 }
 
 impl CodexHttpClient {
+    /// Messages can publish a thinking block before its summary; that start
+    /// closes the same retry window as a visible tool start. Raw APIs opt out.
+    pub(crate) fn with_early_reasoning(mut self) -> Self {
+        self.early_reasoning = true;
+        self
+    }
+
     pub fn new() -> Self {
         let timeout_ms = config::codex_header_timeout_ms();
         let proxy_environment = ProxyEnvironment::from_env();
@@ -718,6 +753,8 @@ impl CodexHttpClient {
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
             auto_http_fallback_enabled: true,
+            websocket_reuse: config::codex_websocket_reuse(),
+            early_reasoning: false,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
@@ -739,6 +776,8 @@ impl CodexHttpClient {
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config,
             auto_http_fallback_enabled,
+            websocket_reuse: config::codex_websocket_reuse(),
+            early_reasoning: false,
             client,
             auth_manager,
             base_url,
@@ -759,12 +798,18 @@ impl CodexHttpClient {
             websocket_client: test_websocket_http_client(),
             websocket_proxy_config: super::websocket::WebSocketProxyConfig::direct(),
             auto_http_fallback_enabled: true,
+            websocket_reuse: config::codex_websocket_reuse(),
+            early_reasoning: false,
             client,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
             header_timeout_ms,
             body_idle_timeout_ms,
         }
+    }
+
+    pub(crate) fn websocket_reuse(&self) -> bool {
+        self.websocket_reuse
     }
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
@@ -1110,7 +1155,11 @@ impl CodexHttpClient {
                     .map_err(auth_refresh_error)?;
                 continue;
             }
-            if should_retry_codex_status(response.status)
+            if normalized_response_failure(&response)
+                .as_ref()
+                .is_some_and(super::events::CodexEventFailure::retryable)
+                && super::events::usage_limit_from_response(&response.body, &response.headers)
+                    .is_none()
                 && retries < MAX_BUFFERED_TRANSPORT_RETRIES
             {
                 let retry_after = response
@@ -1145,6 +1194,19 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
+        self.stream_codex_http_events_for_owner(body, ctx)
+            .await
+            .map(super::websocket::CodexWebSocketEventStream::into_receiver)
+    }
+
+    pub(crate) async fn stream_codex_http_events_for_owner(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        performance::record(|m, elapsed| {
+            m.preparation_start.get_or_insert(elapsed);
+        });
         let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -1161,6 +1223,10 @@ impl CodexHttpClient {
             usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
+        performance::record(|m, elapsed| {
+            m.preparation_end = Some(elapsed);
+            m.serialized_bytes += body_json.len() as u64;
+        });
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
         let mut retries = 0_u32;
@@ -1176,7 +1242,8 @@ impl CodexHttpClient {
                 .await
             {
                 Ok(attempt) => break attempt,
-                Err(error) if retryable_http_stream_error(&error) => {
+                Err(failure) if failure.retryable => {
+                    let error = failure.error;
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
                         return Err(error);
                     }
@@ -1187,7 +1254,7 @@ impl CodexHttpClient {
                     retries += 1;
                     sleep(delay.wait_ms).await;
                 }
-                Err(error) => return Err(error),
+                Err(failure) => return Err(failure.error),
             }
         };
 
@@ -1206,16 +1273,6 @@ impl CodexHttpClient {
         ))
     }
 
-    pub(crate) async fn stream_codex_http_events_for_owner(
-        self: &Arc<Self>,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let receiver = self.stream_codex_http_events(body, ctx).await?;
-        let (stream, _) = super::websocket::CodexWebSocketEventStream::pending(receiver);
-        Ok(stream)
-    }
-
     async fn start_http_event_attempt(
         &self,
         auth: &mut StoredAuth,
@@ -1223,7 +1280,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         use_responses_lite: bool,
         auth_refresh_attempted: &mut bool,
-    ) -> Result<(reqwest::Response, Vec<(String, String)>, Instant), CodexError> {
+    ) -> Result<(reqwest::Response, Vec<(String, String)>, Instant), CodexRequestFailure> {
         loop {
             let (resp, started_at) = self
                 .start_post_http(auth, body_json, ctx, use_responses_lite)
@@ -1241,9 +1298,12 @@ impl CodexHttpClient {
 
             if !resp.status().is_success() {
                 let response = self.collect_http_response(resp, started_at, ctx).await?;
-                let mut error = codex_status_error(response);
-                error.origin = CodexErrorOrigin::Http;
-                return Err(error);
+                if let Some(traffic) = ctx.traffic.as_deref() {
+                    write_buffered_failure_diagnostics(traffic, &ctx.req_id, &response);
+                }
+                let mut failure = codex_status_failure(response);
+                failure.error.origin = CodexErrorOrigin::Http;
+                return Err(failure);
             }
 
             let status = resp.status().as_u16();
@@ -1279,21 +1339,38 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        self.stream_codex_auto_events_shared_for_owner(Arc::new(body.clone()), ctx, continuation)
+            .await
+    }
+
+    pub(crate) async fn stream_codex_auto_events_shared_for_owner(
+        self: &Arc<Self>,
+        body: Arc<ResponsesRequest>,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let mut websocket = self
-            .stream_codex_websocket_events_for_owner(body, ctx, continuation)
+            .stream_codex_websocket_events_shared_for_owner(Arc::clone(&body), ctx, continuation)
             .await?;
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
-                self.stream_codex_http_events_for_owner(body, ctx).await
+                let http = self.stream_codex_http_events_for_owner(&body, ctx).await?;
+                if websocket.had_intervening_failure() {
+                    http.mark_intervening_failure();
+                }
+                Ok(http)
             }
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
                 let receiver = websocket.replace_receiver(rx);
-                tokio::spawn(async move {
-                    if tx.send(item).await.is_ok() {
-                        forward_codex_events(receiver, tx).await;
+                let delivery_aborted = websocket.abort_signal();
+                tokio::spawn(crate::config::inherit_request_scope(async move {
+                    if tx.send_bounded(item).await.is_err()
+                        || !forward_codex_events(receiver, tx).await
+                    {
+                        delivery_aborted.store(true, std::sync::atomic::Ordering::Release);
                     }
-                });
+                }));
                 Ok(websocket)
             }
             None => Err(CodexError {
@@ -1311,7 +1388,7 @@ impl CodexHttpClient {
         self: &Arc<Self>,
         state: HttpEventStreamState,
         ctx: RequestContext,
-    ) -> CodexHttpEventReceiver {
+    ) -> super::websocket::CodexWebSocketEventStream {
         let HttpEventStreamState {
             mut resp,
             mut response_headers,
@@ -1327,19 +1404,27 @@ impl CodexHttpClient {
         let req_id = ctx.req_id.clone();
         let traffic = ctx.traffic.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (rx, publisher) = super::websocket::CodexWebSocketEventStream::pending(rx);
+        if retries > 0 || auth_refresh_attempted {
+            publisher.mark_intervening_failure();
+        }
+        let tx = publisher.sender(tx);
 
-        tokio::spawn(async move {
+        let observation = performance::current();
+        let reader = performance::in_scope(observation, async move {
+            let _finalization = performance::ReaderFinalization;
             let log = create_logger("codex");
             let mut semantic_output_forwarded = false;
 
             if tx
-                .send(Ok(serde_json::json!({
+                .send_bounded(Ok(serde_json::json!({
                     "type": "keepalive",
                     "_ccp_synthetic": true
                 })))
                 .await
                 .is_err()
             {
+                performance::record(|m, elapsed| m.body_cancel = Some(elapsed));
                 return;
             }
 
@@ -1348,11 +1433,16 @@ impl CodexHttpClient {
                 let mut body_bytes = 0_u64;
                 let mut body_chunks = 0_u64;
                 let mut event_count = 0_u64;
-                let mut pending_events = Vec::new();
+                let mut pending_terminal: Option<serde_json::Value> = None;
+                let mut pending_events = super::events::PendingStructuralEvents::default();
+                if client.early_reasoning {
+                    pending_events = pending_events.with_early_reasoning();
+                }
 
                 let mut retry_error = 'read_attempt: loop {
                     let chunk = tokio::select! {
                         _ = tx.closed() => {
+                            performance::record(|m, elapsed| m.body_cancel = Some(elapsed));
                             log_http_stream_end(
                                 &log,
                                 "codex_http_stream_dropped",
@@ -1361,6 +1451,7 @@ impl CodexHttpClient {
                                 body_bytes,
                                 body_chunks,
                                 event_count,
+                                None,
                                 None,
                             );
                             return;
@@ -1374,7 +1465,44 @@ impl CodexHttpClient {
                     let chunk = match chunk {
                         Ok(Ok(Some(chunk))) => chunk,
                         Ok(Ok(None)) => {
-                            let error = match decoder.finish() {
+                            let finished = decoder.finish();
+                            if finished.is_ok()
+                                && let Some(payload) = pending_terminal.take()
+                            {
+                                let outcome = super::events::terminal_outcome(&payload);
+                                let ready = match pending_events
+                                    .stage(payload, &mut semantic_output_forwarded)
+                                {
+                                    Ok(ready) => ready,
+                                    Err(()) => {
+                                        let _ = tx
+                                            .send_bounded(Err(presemantic_limit_error(
+                                                CodexErrorOrigin::Http,
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                };
+                                for event in ready {
+                                    if tx.send_bounded(Ok(event)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                performance::record(|m, elapsed| m.body_complete = Some(elapsed));
+                                log_http_stream_end(
+                                    &log,
+                                    "codex_http_stream_completed",
+                                    &req_id,
+                                    started_at,
+                                    body_bytes,
+                                    body_chunks,
+                                    event_count,
+                                    None,
+                                    outcome,
+                                );
+                                return;
+                            }
+                            let error = match finished {
                                 Ok(()) => http_sse_error(
                                     "Codex SSE stream ended before a terminal response event",
                                 ),
@@ -1389,11 +1517,12 @@ impl CodexHttpClient {
                                 body_chunks,
                                 event_count,
                                 Some(&error.message),
+                                None,
                             );
                             if !semantic_output_forwarded && retryable_http_stream_error(&error) {
                                 break 'read_attempt error;
                             }
-                            let _ = tx.send(Err(error)).await;
+                            let _ = tx.send_bounded(Err(error)).await;
                             return;
                         }
                         Ok(Err(err)) => {
@@ -1416,11 +1545,12 @@ impl CodexHttpClient {
                                 body_chunks,
                                 event_count,
                                 Some(&error.message),
+                                None,
                             );
                             if !semantic_output_forwarded {
                                 break 'read_attempt error;
                             }
-                            let _ = tx.send(Err(error)).await;
+                            let _ = tx.send_bounded(Err(error)).await;
                             return;
                         }
                         Err(_) => {
@@ -1443,11 +1573,12 @@ impl CodexHttpClient {
                                 body_chunks,
                                 event_count,
                                 Some(&error.message),
+                                None,
                             );
                             if !semantic_output_forwarded {
                                 break 'read_attempt error;
                             }
-                            let _ = tx.send(Err(error)).await;
+                            let _ = tx.send_bounded(Err(error)).await;
                             return;
                         }
                     };
@@ -1466,11 +1597,12 @@ impl CodexHttpClient {
                                 body_chunks,
                                 event_count,
                                 Some(&error.message),
+                                None,
                             );
                             if !semantic_output_forwarded && retryable_http_stream_error(&error) {
                                 break 'read_attempt error;
                             }
-                            let _ = tx.send(Err(error)).await;
+                            let _ = tx.send_bounded(Err(error)).await;
                             return;
                         }
                     };
@@ -1479,6 +1611,23 @@ impl CodexHttpClient {
                         let Some(payload) = event.payload else {
                             continue;
                         };
+                        performance::record(|m, elapsed| {
+                            m.first_upstream_event.get_or_insert(elapsed);
+                            if payload.get("type").and_then(serde_json::Value::as_str)
+                                == Some("response.output_text.delta")
+                                && payload
+                                    .get("delta")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
+                            {
+                                m.first_upstream_text.get_or_insert(elapsed);
+                            }
+                            if super::events::classify_stream_event(&payload)
+                                == super::events::CodexStreamEventKind::Semantic
+                            {
+                                m.first_semantic.get_or_insert(elapsed);
+                            }
+                        });
                         event_count = event_count.saturating_add(1);
                         if let Some(traffic) = traffic.as_deref() {
                             write_codex_http_sse_event_capture(
@@ -1488,8 +1637,46 @@ impl CodexHttpClient {
                             );
                         }
 
-                        let event_kind = super::events::classify_stream_event(&payload);
+                        if pending_terminal.is_some() {
+                            if payload["type"] == "ping" {
+                                continue;
+                            }
+                            let message = if super::events::event_is_terminal(&payload) {
+                                "Codex SSE stream contained multiple terminal response events"
+                            } else {
+                                "Codex SSE stream contained a JSON event after its terminal response event"
+                            };
+                            let error = http_sse_error(message);
+                            log_http_stream_end(
+                                &log,
+                                "codex_http_stream_failed",
+                                &req_id,
+                                started_at,
+                                body_bytes,
+                                body_chunks,
+                                event_count,
+                                Some(&error.message),
+                                None,
+                            );
+                            let _ = tx.send_bounded(Err(error)).await;
+                            return;
+                        }
+
                         let failure = super::events::classify_event_failure(&payload);
+                        if let (Some(failure), Some(traffic)) =
+                            (failure.as_ref(), traffic.as_deref())
+                        {
+                            traffic.write_json(
+                                "060-codex-event-error",
+                                &failure.diagnostics(
+                                    "http_ingress",
+                                    "event_failure",
+                                    Some(&req_id),
+                                    payload.get("type").and_then(serde_json::Value::as_str),
+                                    semantic_output_forwarded,
+                                ),
+                            );
+                        }
                         if !semantic_output_forwarded {
                             if let Some(limit) = super::events::usage_limit_from_event_with_headers(
                                 &payload,
@@ -1497,7 +1684,7 @@ impl CodexHttpClient {
                             ) {
                                 pending_events.clear();
                                 let _ = tx
-                                    .send(Err(codex_usage_limit_error(
+                                    .send_bounded(Err(codex_usage_limit_error(
                                         limit,
                                         CodexErrorOrigin::Http,
                                     )))
@@ -1512,79 +1699,57 @@ impl CodexHttpClient {
                             }
                         }
 
-                        let terminal = super::events::event_is_terminal(&payload);
-                        match event_kind {
-                            super::events::CodexStreamEventKind::TerminalFailure => {
-                                if !semantic_output_forwarded {
-                                    pending_events.clear();
-                                }
-                                if tx.send(Ok(payload)).await.is_err() {
+                        if super::events::terminal_outcome(&payload).is_some() {
+                            pending_terminal = Some(payload);
+                            continue;
+                        }
+                        let ready =
+                            match pending_events.stage(payload, &mut semantic_output_forwarded) {
+                                Ok(ready) => ready,
+                                Err(()) => {
+                                    let _ = tx
+                                        .send_bounded(Err(presemantic_limit_error(
+                                            CodexErrorOrigin::Http,
+                                        )))
+                                        .await;
                                     return;
                                 }
-                            }
-                            super::events::CodexStreamEventKind::TerminalSuccess => {
-                                for pending in pending_events.drain(..) {
-                                    if tx.send(Ok(pending)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                if tx.send(Ok(payload)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            super::events::CodexStreamEventKind::Semantic => {
-                                if !semantic_output_forwarded {
-                                    semantic_output_forwarded = true;
-                                    for pending in pending_events.drain(..) {
-                                        if tx.send(Ok(pending)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                                if tx.send(Ok(payload)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            super::events::CodexStreamEventKind::Control => {
-                                if tx.send(Ok(payload)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            super::events::CodexStreamEventKind::Structural => {
-                                if semantic_output_forwarded {
-                                    if tx.send(Ok(payload)).await.is_err() {
-                                        return;
-                                    }
-                                } else {
-                                    pending_events.push(payload);
-                                }
+                            };
+                        for event in ready {
+                            if tx.send_bounded(Ok(event)).await.is_err() {
+                                return;
                             }
                         }
-
-                        if terminal {
-                            log_http_stream_end(
-                                &log,
-                                "codex_http_stream_completed",
-                                &req_id,
-                                started_at,
-                                body_bytes,
-                                body_chunks,
-                                event_count,
-                                None,
-                            );
-                            return;
+                    }
+                    if let Some(error) = decoder.pending_error.take() {
+                        log_http_stream_end(
+                            &log,
+                            "codex_http_stream_failed",
+                            &req_id,
+                            started_at,
+                            body_bytes,
+                            body_chunks,
+                            event_count,
+                            Some(&error.message),
+                            None,
+                        );
+                        if !semantic_output_forwarded && retryable_http_stream_error(&error) {
+                            break 'read_attempt error;
                         }
+                        let _ = tx.send_bounded(Err(error)).await;
+                        return;
                     }
                 };
 
+                publisher.mark_intervening_failure();
                 loop {
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let _ = tx.send(Err(retry_error)).await;
+                        let _ = tx.send_bounded(Err(retry_error)).await;
                         return;
                     }
                     let delay = compute_backoff_delay(retries, retry_error.retry_after.as_deref());
                     if delay.exceeds_budget {
-                        let _ = tx.send(Err(retry_error)).await;
+                        let _ = tx.send_bounded(Err(retry_error)).await;
                         return;
                     }
                     retries += 1;
@@ -1610,17 +1775,18 @@ impl CodexHttpClient {
                             started_at = next_started_at;
                             continue 'attempts;
                         }
-                        Err(error) if retryable_http_stream_error(&error) => {
-                            retry_error = error;
+                        Err(failure) if failure.retryable => {
+                            retry_error = failure.error;
                         }
-                        Err(error) => {
-                            let _ = tx.send(Err(error)).await;
+                        Err(failure) => {
+                            let _ = tx.send_bounded(Err(failure.error)).await;
                             return;
                         }
                     }
                 }
             }
         });
+        tokio::spawn(crate::config::inherit_request_scope(reader));
 
         rx
     }
@@ -1643,19 +1809,10 @@ impl CodexHttpClient {
             origin: CodexErrorOrigin::Auth,
         })?;
 
-        let initial_pool_owner = websocket_pool_owner(continuation).cloned();
-        if should_reset_websocket_pool(continuation)
-            && let Some(owner) = initial_pool_owner.as_ref()
-        {
-            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(
-                owner,
-                continuation.and_then(super::continuation::ContinuationReservation::turn_id),
-            );
-        }
-
         let mut active_continuation = continuation.cloned();
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
+        let mut intervening_failure = false;
         loop {
             let result = match transport {
                 CodexTransport::Http => {
@@ -1675,53 +1832,53 @@ impl CodexHttpClient {
                     let ws_headers =
                         build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(
-                        body,
-                        active_continuation
-                            .as_ref()
-                            .map(super::continuation::ContinuationReservation::candidate),
-                    );
-
-                    super::websocket::codex_websocket_request(
+                    match super::websocket::codex_websocket_responses_stream(
                         &self.websocket_client,
                         &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
-                        &ws_body,
+                        body,
                         ctx,
-                        ctx.traffic.as_deref(),
-                        super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                        super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
                     )
                     .await
+                    {
+                        Ok(events) => {
+                            super::websocket::collect_codex_websocket_response(
+                                events,
+                                ctx.traffic.as_deref(),
+                                std::time::Instant::now(),
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 CodexTransport::Auto => {
                     let ws_headers =
                         build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(
-                        body,
-                        active_continuation
-                            .as_ref()
-                            .map(super::continuation::ContinuationReservation::candidate),
-                    );
-
-                    // Try WebSocket first
-                    let ws_result = super::websocket::codex_websocket_request(
+                    let ws_result = match super::websocket::codex_websocket_responses_stream(
                         &self.websocket_client,
                         &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
-                        &ws_body,
+                        body,
                         ctx,
-                        ctx.traffic.as_deref(),
-                        super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                        super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
                     )
-                    .await;
-
+                    .await
+                    {
+                        Ok(events) => {
+                            super::websocket::collect_codex_websocket_response(
+                                events,
+                                ctx.traffic.as_deref(),
+                                std::time::Instant::now(),
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
                     match ws_result {
                         Ok(response) => Ok(response),
                         Err(err)
@@ -1784,6 +1941,10 @@ impl CodexHttpClient {
                 }
             }
 
+            if let (Ok(response), Some(traffic)) = (&result, ctx.traffic.as_deref()) {
+                write_buffered_failure_diagnostics(traffic, &ctx.req_id, response);
+            }
+
             if let Ok(response) = &result
                 && let Some(limit) =
                     super::events::usage_limit_from_response(&response.body, &response.headers)
@@ -1796,175 +1957,60 @@ impl CodexHttpClient {
             }
 
             if let Ok(response) = &result
-                && (200..300).contains(&response.status)
-                && let Some(failure) = super::events::first_retryable_failure(&response.body)
+                && let Some(failure) = normalized_response_failure(response)
             {
-                if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                let retryable = failure.retryable();
+                let mut error = codex_event_failure_error(failure);
+                error.origin = match response.transport {
+                    ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+                    ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+                };
+                if retryable && transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
                     let delay =
-                        compute_backoff_delay(transport_failures, failure.retry_after.as_deref());
+                        compute_backoff_delay(transport_failures, error.retry_after.as_deref());
                     if delay.exceeds_budget {
-                        return Err(CodexError {
-                            status: failure.status,
-                            message: failure.message.clone(),
-                            detail: Some(failure.message),
-                            retry_after: failure.retry_after,
-                            usage_limit: None,
-                            origin: match response.transport {
-                                ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
-                                ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
-                            },
-                        });
+                        return Err(error);
                     }
                     log_buffered_retry(
                         ctx,
                         transport,
                         transport_failures + 1,
                         delay.wait_ms,
-                        failure.status,
+                        error.status,
                         "upstream_event",
-                        &failure.message,
+                        &error.message,
                     );
+                    intervening_failure = true;
                     transport_failures += 1;
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     sleep(delay.wait_ms).await;
                     continue;
                 }
-
-                log_buffered_retry_exhausted(
-                    ctx,
-                    transport,
-                    failure.status,
-                    "upstream_event",
-                    &failure.message,
-                );
-                return Err(CodexError {
-                    status: failure.status,
-                    message: failure.message.clone(),
-                    detail: Some(failure.message),
-                    retry_after: failure.retry_after,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::Http,
-                });
+                if retryable {
+                    log_buffered_retry_exhausted(
+                        ctx,
+                        transport,
+                        error.status,
+                        "upstream_event",
+                        &error.message,
+                    );
+                }
+                return Err(error);
             }
 
             match result {
-                Ok(response) if response.status == 401 => {
-                    let detail = String::from_utf8_lossy(&response.body).to_string();
-                    return Err(CodexError {
-                        status: 401,
-                        message: "Unauthorized".to_string(),
-                        detail: Some(detail),
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::Http,
-                    });
+                Ok(response) => {
+                    return Ok(response
+                        .with_intervening_failure(intervening_failure || auth_refresh_attempted));
                 }
-                Ok(response) if response.status == 403 => {
-                    let detail = String::from_utf8_lossy(&response.body).to_string();
-                    return Err(CodexError {
-                        status: 403,
-                        message: "Forbidden".to_string(),
-                        detail: Some(detail),
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::Http,
-                    });
-                }
-                Ok(response) if response.status == 429 => {
-                    let retry_after = response
-                        .headers
-                        .iter()
-                        .find(|(k, _)| k.to_lowercase() == "retry-after")
-                        .map(|(_, v)| v.clone());
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let delay =
-                            compute_backoff_delay(transport_failures, retry_after.as_deref());
-                        if delay.exceeds_budget {
-                            let detail = String::from_utf8_lossy(&response.body).to_string();
-                            return Err(CodexError {
-                                status: 429,
-                                message: "Rate limited".to_string(),
-                                detail: Some(detail),
-                                retry_after,
-                                usage_limit: None,
-                                origin: CodexErrorOrigin::Http,
-                            });
-                        }
-                        log_buffered_retry(
-                            ctx,
-                            transport,
-                            transport_failures + 1,
-                            delay.wait_ms,
-                            response.status,
-                            "upstream",
-                            "rate limited",
-                        );
-                        transport_failures += 1;
-                        sleep(delay.wait_ms).await;
-                        continue;
-                    }
-                    let detail = String::from_utf8_lossy(&response.body).to_string();
-                    log_buffered_retry_exhausted(
-                        ctx,
-                        transport,
-                        response.status,
-                        "upstream",
-                        "rate limited",
-                    );
-                    return Err(CodexError {
-                        status: 429,
-                        message: "Rate limited".to_string(),
-                        detail: Some(detail),
-                        retry_after,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::Http,
-                    });
-                }
-                Ok(response) if should_retry_codex_status(response.status) => {
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let retry_after = response
-                            .headers
-                            .iter()
-                            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
-                            .map(|(_, value)| value.as_str());
-                        let delay = compute_backoff_delay(transport_failures, retry_after);
-                        if delay.exceeds_budget {
-                            return Err(codex_status_error(response.into_response()));
-                        }
-                        log_buffered_retry(
-                            ctx,
-                            transport,
-                            transport_failures + 1,
-                            delay.wait_ms,
-                            response.status,
-                            "upstream",
-                            "retryable upstream status",
-                        );
-                        transport_failures += 1;
-                        sleep(delay.wait_ms).await;
-                        continue;
-                    }
-                    log_buffered_retry_exhausted(
-                        ctx,
-                        transport,
-                        response.status,
-                        "upstream",
-                        "retryable upstream status",
-                    );
-                    return Err(codex_status_error(response.into_response()));
-                }
-                Ok(response) if !(200..300).contains(&response.status) => {
-                    return Err(codex_status_error(response.into_response()));
-                }
-                Ok(response) => return Ok(response),
                 Err(err)
                     if should_retry_without_continuation(&err, active_continuation.as_ref()) =>
                 {
+                    intervening_failure = true;
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     continue;
                 }
                 Err(err) => {
-                    // Determine if retryable
                     let retryable = is_retryable_transport_error(&err);
                     if retryable && transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
                         let delay =
@@ -1981,6 +2027,7 @@ impl CodexHttpClient {
                             codex_error_origin_name(err.origin),
                             &err.message,
                         );
+                        intervening_failure = true;
                         transport_failures += 1;
                         sleep(delay.wait_ms).await;
                         continue;
@@ -2019,6 +2066,20 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        self.stream_codex_websocket_events_shared_for_owner(
+            Arc::new(body.clone()),
+            ctx,
+            continuation,
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_codex_websocket_events_shared_for_owner(
+        self: &Arc<Self>,
+        body: Arc<ResponsesRequest>,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -2028,20 +2089,14 @@ impl CodexHttpClient {
             origin: CodexErrorOrigin::Auth,
         })?;
 
-        let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
-        if should_reset_websocket_pool(continuation)
-            && let Some(owner) = websocket_pool_owner(continuation)
-        {
-            super::websocket::invalidate_codex_websocket_pool_turn_for_owner(owner, turn_id);
-        }
-
         let client = self.clone();
-        let body = body.clone();
         let ctx = ctx.clone();
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let (rx, socket_id_publisher) = super::websocket::CodexWebSocketEventStream::pending(rx);
-        tokio::spawn(async move {
+        let rx = rx.track_attempt(continuation.as_ref(), true);
+        let tx = socket_id_publisher.sender(tx);
+        tokio::spawn(crate::config::inherit_request_scope(async move {
             client
                 .coordinate_live_websocket_events(
                     body,
@@ -2052,7 +2107,7 @@ impl CodexHttpClient {
                     socket_id_publisher,
                 )
                 .await;
-        });
+        }));
 
         Ok(rx)
     }
@@ -2060,11 +2115,11 @@ impl CodexHttpClient {
     #[allow(clippy::too_many_arguments)]
     async fn coordinate_live_websocket_events(
         &self,
-        body: ResponsesRequest,
+        body: Arc<ResponsesRequest>,
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationReservation>,
         mut auth: StoredAuth,
-        tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
+        tx: super::websocket::EventSender,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) {
         let mut auth_refresh_attempted = false;
@@ -2076,11 +2131,12 @@ impl CodexHttpClient {
 
         'attempt: loop {
             socket_id_publisher.publish(None);
+            socket_id_publisher.publish_diagnostic_attempt(None);
             let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
             {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
                 Err(err) => {
-                    if tx.send(Err(err)).await.is_err() {
+                    if tx.send_bounded(Err(err)).await.is_err() {
                         abort_abandoned_live_continuation(
                             continuation.as_ref(),
                             &socket_id_publisher,
@@ -2089,22 +2145,13 @@ impl CodexHttpClient {
                     return;
                 }
             };
-            let ws_body = build_websocket_request(
-                &body,
-                continuation
-                    .as_ref()
-                    .map(super::continuation::ContinuationReservation::candidate),
-            );
-            let start = super::websocket::codex_websocket_event_stream(
+            let start = super::websocket::codex_websocket_responses_stream(
                 &self.websocket_client,
                 &self.websocket_proxy_config,
                 &self.base_url,
                 &ws_headers,
-                &ws_body,
+                &body,
                 &ctx,
-                ctx.traffic.clone(),
-                super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                 continuation.as_ref(),
             );
             let mut stream = tokio::select! {
@@ -2120,9 +2167,10 @@ impl CodexHttpClient {
                     Ok(stream) => stream,
                     Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
                         auth_refresh_attempted = true;
+                        socket_id_publisher.mark_intervening_failure();
                         invalidate_live_continuation_pool(continuation.as_ref());
                         let refresh = self.auth_manager.force_refresh(&auth.access);
-                        auth = match refresh.await {
+                        auth = match tokio::select! { biased; _ = tx.closed() => { abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher); return; }, result = refresh => result } {
                             Ok(auth) => {
                                 if tx.is_closed() {
                                     abort_abandoned_live_continuation(
@@ -2134,7 +2182,7 @@ impl CodexHttpClient {
                                 auth
                             },
                             Err(refresh_err) => {
-                                if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
+                                if tx.send_bounded(Err(auth_refresh_error(refresh_err))).await.is_err() {
                                     abort_abandoned_live_continuation(
                                         continuation.as_ref(),
                                         &socket_id_publisher,
@@ -2157,7 +2205,7 @@ impl CodexHttpClient {
                         continue 'attempt;
                     }
                     Err(err) => {
-                        if tx.send(Err(err)).await.is_err() {
+                        if tx.send_bounded(Err(err)).await.is_err() {
                             abort_abandoned_live_continuation(
                                 continuation.as_ref(),
                                 &socket_id_publisher,
@@ -2168,7 +2216,10 @@ impl CodexHttpClient {
                 }
             };
 
-            let mut pending_events = Vec::new();
+            let mut pending_events = super::events::PendingStructuralEvents::default();
+            if self.early_reasoning {
+                pending_events = pending_events.with_early_reasoning();
+            }
             loop {
                 let item = tokio::select! {
                     biased;
@@ -2198,9 +2249,16 @@ impl CodexHttpClient {
                     return;
                 }
                 let Some(item) = item else {
+                    if stream.delivery_aborted() {
+                        socket_id_publisher.abort_delivery();
+                    }
                     return;
                 };
+                if stream.had_intervening_failure() {
+                    socket_id_publisher.mark_intervening_failure();
+                }
                 socket_id_publisher.publish(stream.socket_id());
+                socket_id_publisher.publish_diagnostic_attempt(stream.diagnostic_attempt_id());
 
                 let unauthorized = match &item {
                     Err(err) => err.status == 401,
@@ -2208,9 +2266,11 @@ impl CodexHttpClient {
                 };
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
+                    socket_id_publisher.mark_intervening_failure();
                     invalidate_live_continuation_pool(continuation.as_ref());
                     let refresh = self.auth_manager.force_refresh(&auth.access);
-                    auth = match refresh.await {
+                    auth = match tokio::select! { biased; _ = tx.closed() => { abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher); return; }, result = refresh => result }
+                    {
                         Ok(auth) => {
                             if tx.is_closed() {
                                 if let Some(reservation) = continuation.as_ref() {
@@ -2228,7 +2288,11 @@ impl CodexHttpClient {
                             auth
                         }
                         Err(refresh_err) => {
-                            if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
+                            if tx
+                                .send_bounded(Err(auth_refresh_error(refresh_err)))
+                                .await
+                                .is_err()
+                            {
                                 if let Some(reservation) = continuation.as_ref() {
                                     super::websocket::invalidate_codex_websocket_pool_socket(
                                         reservation,
@@ -2265,55 +2329,30 @@ impl CodexHttpClient {
                 let terminal = item.as_ref().is_err()
                     || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
                 match item {
-                    Ok(payload) => match super::events::classify_stream_event(&payload) {
-                        super::events::CodexStreamEventKind::TerminalFailure => {
-                            if !forwarded_any {
-                                pending_events.clear();
+                    Ok(payload) => {
+                        let ready = match pending_events.stage(payload, &mut forwarded_any) {
+                            Ok(ready) => ready,
+                            Err(()) => {
+                                let _ = tx
+                                    .send_bounded(Err(presemantic_limit_error(
+                                        CodexErrorOrigin::WebSocket,
+                                    )))
+                                    .await;
+                                abort_abandoned_live_continuation(
+                                    continuation.as_ref(),
+                                    &socket_id_publisher,
+                                );
+                                return;
                             }
-                            if tx.send(Ok(payload)).await.is_err() {
+                        };
+                        for event in ready {
+                            if tx.send_bounded(Ok(event)).await.is_err() {
                                 return;
                             }
                         }
-                        super::events::CodexStreamEventKind::TerminalSuccess => {
-                            for pending in pending_events.drain(..) {
-                                if tx.send(Ok(pending)).await.is_err() {
-                                    return;
-                                }
-                            }
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
-                            }
-                        }
-                        super::events::CodexStreamEventKind::Semantic => {
-                            if !forwarded_any {
-                                forwarded_any = true;
-                                for pending in pending_events.drain(..) {
-                                    if tx.send(Ok(pending)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
-                            }
-                        }
-                        super::events::CodexStreamEventKind::Control => {
-                            if tx.send(Ok(payload)).await.is_err() {
-                                return;
-                            }
-                        }
-                        super::events::CodexStreamEventKind::Structural => {
-                            if forwarded_any {
-                                if tx.send(Ok(payload)).await.is_err() {
-                                    return;
-                                }
-                            } else {
-                                pending_events.push(payload);
-                            }
-                        }
-                    },
+                    }
                     Err(err) => {
-                        if tx.send(Err(err)).await.is_err() {
+                        if tx.send_bounded(Err(err)).await.is_err() {
                             if let Some(reservation) = continuation.as_ref() {
                                 super::websocket::invalidate_codex_websocket_pool_socket(
                                     reservation,
@@ -2329,6 +2368,7 @@ impl CodexHttpClient {
                     }
                 }
                 if terminal {
+                    stream.accept_terminal();
                     return;
                 }
             }
@@ -2362,14 +2402,16 @@ impl CodexHttpClient {
             write_codex_http_request_capture(traffic, url, &headers, body_json);
         }
 
-        // Build headers
         let mut req_builder = self.client.post(url);
         for (key, value) in headers.iter() {
             req_builder = req_builder.header(key.as_str(), value.as_bytes());
         }
 
-        // Apply header timeout
         let started_at = Instant::now();
+        performance::record(|m, _| {
+            m.attempts += 1;
+            m.full_request_clone_bytes += body_json.len() as u64;
+        });
         let send_fut = req_builder.body(body_json.to_string()).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
@@ -2408,6 +2450,9 @@ impl CodexHttpClient {
                 }
             })?;
 
+        performance::record(|m, elapsed| {
+            m.response_headers.get_or_insert(elapsed);
+        });
         Ok((resp, started_at))
     }
 
@@ -2591,10 +2636,18 @@ impl CodexHttpClient {
 async fn forward_codex_events(
     mut source: tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>,
     tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
-) {
-    while let Some(item) = source.recv().await {
-        if tx.send(item).await.is_err() {
-            return;
+) -> bool {
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = tx.closed() => return false,
+            item = source.recv() => item,
+        };
+        let Some(item) = item else {
+            return true;
+        };
+        if tx.send_bounded(item).await.is_err() {
+            return false;
         }
     }
 }
@@ -2628,7 +2681,24 @@ fn codex_usage_limit_error(limit: CodexUsageLimit, origin: CodexErrorOrigin) -> 
     }
 }
 
+fn presemantic_limit_error(origin: CodexErrorOrigin) -> CodexError {
+    CodexError {
+        status: 502,
+        message: "Codex pre-semantic structural event limit exceeded".to_string(),
+        detail: Some("codex_presemantic_limit".to_string()),
+        retry_after: None,
+        usage_limit: None,
+        origin: match origin {
+            CodexErrorOrigin::Http => CodexErrorOrigin::HttpProtocol,
+            _ => CodexErrorOrigin::WebSocketProtocol,
+        },
+    }
+}
+
 fn retryable_http_stream_error(error: &CodexError) -> bool {
+    if error.origin.is_protocol_rejection() {
+        return false;
+    }
     if error.usage_limit.is_some() {
         return false;
     }
@@ -2656,10 +2726,29 @@ fn log_http_stream_end(
     body_chunks: u64,
     event_count: u64,
     error: Option<&str>,
+    terminal_outcome: Option<&str>,
 ) {
     let mut fields = serde_json::Map::from_iter([
         ("reqId".to_string(), serde_json::json!(req_id)),
         ("transport".to_string(), serde_json::json!("http")),
+        (
+            "phase".to_string(),
+            serde_json::json!(if terminal_outcome.is_some() {
+                "upstream_terminal"
+            } else {
+                "upstream_stream"
+            }),
+        ),
+        (
+            "outcome".to_string(),
+            serde_json::json!(terminal_outcome.unwrap_or(
+                if message == "codex_http_stream_dropped" {
+                    "cancelled"
+                } else {
+                    "failed"
+                }
+            )),
+        ),
         ("bodyBytes".to_string(), serde_json::json!(body_bytes)),
         ("bodyChunks".to_string(), serde_json::json!(body_chunks)),
         ("eventCount".to_string(), serde_json::json!(event_count)),
@@ -2846,30 +2935,130 @@ fn auth_refresh_error(err: anyhow::Error) -> CodexError {
     }
 }
 
-fn codex_status_error(response: CodexResponse) -> CodexError {
+fn normalized_response_failure(
+    response: &CodexResponse,
+) -> Option<super::events::CodexEventFailure> {
+    // Preserve the typed event even when WebSocket has projected a non-2xx
+    // status; that projection must never replace Unknown/Permanent with 500 retry.
+    let mut failure =
+        if let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&response.body) {
+            if !(200..300).contains(&response.status)
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert("type".to_string(), serde_json::json!("error"));
+                object.insert("status".to_string(), serde_json::json!(response.status));
+            }
+            super::events::classify_event_failure(&payload)
+        } else {
+            super::events::first_event_failure(&response.body)
+        };
+    if failure.is_none() && !(200..300).contains(&response.status) {
+        failure = super::events::classify_event_failure(&serde_json::json!({
+            "type":"error", "status":response.status,
+            "message":codex_status_error_message(&response.body).unwrap_or_else(|| format!("Upstream Codex request failed with status {}",response.status))
+        }));
+    }
+    if let Some(failure) = failure.as_mut() {
+        failure.retry_after = response
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.clone())
+            .or_else(|| failure.retry_after.take());
+        failure.request_id = failure.request_id.take().or_else(|| {
+            response
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("x-request-id"))
+                .map(|(_, value)| value.clone())
+        });
+    }
+    failure
+}
+
+fn codex_status_failure(response: CodexResponse) -> CodexRequestFailure {
     let usage_limit =
         super::events::usage_limit_from_response(&response.body, &response.headers).map(Box::new);
-    let retry_after = response
-        .headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
-        .map(|(_, value)| value.clone());
-    let message = codex_status_error_message(&response.body).unwrap_or_else(|| {
-        format!(
-            "Upstream Codex request failed with status {}",
-            response.status
+    let classified = normalized_response_failure(&response);
+    let retryable = classified
+        .as_ref()
+        .is_some_and(super::events::CodexEventFailure::retryable)
+        && usage_limit.is_none();
+    let origin = match response.transport {
+        ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+        ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+    };
+    let mut error = if let Some(failure) = classified {
+        codex_event_failure_error(failure)
+    } else {
+        CodexError::new(
+            response.status,
+            codex_status_error_message(&response.body).unwrap_or_else(|| {
+                format!(
+                    "Upstream Codex request failed with status {}",
+                    response.status
+                )
+            }),
         )
-    });
-    CodexError {
-        status: response.status,
-        message: message.clone(),
-        detail: Some(message),
-        retry_after,
-        usage_limit,
-        origin: match response.transport {
-            ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
-            ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
-        },
+    };
+    error.origin = origin;
+    error.usage_limit = usage_limit;
+    CodexRequestFailure { error, retryable }
+}
+
+fn codex_status_error(response: CodexResponse) -> CodexError {
+    codex_status_failure(response).error
+}
+
+fn write_buffered_failure_diagnostics(
+    traffic: &TrafficCapture,
+    request_id: &str,
+    response: &CodexResponse,
+) {
+    let source = match response.transport {
+        ActualTransport::Http => "buffered_http",
+        ActualTransport::WebSocket => "buffered_websocket",
+    };
+    let payloads =
+        if let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&response.body) {
+            if response.status >= 400
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert("type".to_string(), serde_json::json!("error"));
+                object.insert("status".to_string(), serde_json::json!(response.status));
+                if let Some((_, value)) = response
+                    .headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("x-request-id"))
+                {
+                    object
+                        .entry("request_id".to_string())
+                        .or_insert_with(|| serde_json::json!(value));
+                }
+            }
+            vec![payload]
+        } else {
+            parse_sse_events(&response.body)
+                .into_iter()
+                .filter_map(|event| serde_json::from_str(&event.data).ok())
+                .collect()
+        };
+    let mut semantic_output_seen = false;
+    for payload in payloads {
+        if let Some(failure) = super::events::classify_event_failure(&payload) {
+            traffic.write_json(
+                "060-codex-event-error",
+                &failure.diagnostics(
+                    source,
+                    "event_failure",
+                    Some(request_id),
+                    payload.get("type").and_then(serde_json::Value::as_str),
+                    semantic_output_seen,
+                ),
+            );
+        }
+        semantic_output_seen |= super::events::classify_stream_event(&payload)
+            == super::events::CodexStreamEventKind::Semantic;
     }
 }
 
@@ -2877,12 +3066,17 @@ fn codex_status_error_message(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .or_else(|| value.get("message"))
-                .or_else(|| value.get("detail"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
+            [
+                value.pointer("/error/detail"),
+                value.get("detail"),
+                value.pointer("/error/message"),
+                value.get("message"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .find(|message| !message.trim().is_empty())
+            .map(super::events::sanitize_error_message)
         })
         .or_else(|| {
             parse_sse_events(body).into_iter().find_map(|event| {
@@ -2904,6 +3098,8 @@ fn codex_error_origin_name(origin: CodexErrorOrigin) -> &'static str {
         CodexErrorOrigin::Auth => "auth",
         CodexErrorOrigin::BufferedHttp => "buffered_http",
         CodexErrorOrigin::BufferedWebSocket => "buffered_websocket",
+        CodexErrorOrigin::HttpProtocol => "http_protocol",
+        CodexErrorOrigin::WebSocketProtocol => "websocket_protocol",
     }
 }
 
@@ -2953,6 +3149,12 @@ fn log_buffered_retry_exhausted(
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
+    if err.origin.is_protocol_rejection() {
+        return false;
+    }
+    if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_AMBIGUOUS_WRITE_DETAIL) {
+        return false;
+    }
     // Running out of patience for the response headers is not a transport
     // failure. The request reached Codex, which is holding the head while the
     // model reasons, so re-sending it starts that reasoning again from scratch
@@ -3074,7 +3276,7 @@ fn invalidate_live_continuation_pool(
 
 #[cfg(test)]
 fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
-    super::events::classify_stream_event(payload) == super::events::CodexStreamEventKind::Semantic
+    super::events::event_commits_output(payload)
 }
 
 pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
@@ -3092,21 +3294,10 @@ fn websocket_pool_owner(
     continuation: Option<&super::continuation::ContinuationReservation>,
 ) -> Option<&ConversationIdentity> {
     let continuation = continuation?;
-    if continuation.candidate().disabled_reason.as_deref() == Some("disabled") {
+    if !continuation.pool_enabled() {
         return None;
     }
     continuation.owner()
-}
-
-fn should_reset_websocket_pool(
-    continuation: Option<&super::continuation::ContinuationReservation>,
-) -> bool {
-    let Some(reason) =
-        continuation.and_then(|continuation| continuation.candidate().disabled_reason.as_deref())
-    else {
-        return false;
-    };
-    reason != "disabled"
 }
 
 #[cfg(test)]
@@ -3115,6 +3306,214 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn diagnostic_outcomes_distinguish_http_terminal_failure_from_completion() {
+        for (terminal, outcome) in [
+            (
+                serde_json::json!({"type":"response.completed","response":{"status":"completed"}}),
+                "completed",
+            ),
+            (
+                serde_json::json!({"type":"response.failed","response":{"status":"failed","error":{"code":"server_error"}}}),
+                "failed",
+            ),
+            (
+                serde_json::json!({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}),
+                "incomplete",
+            ),
+            (
+                serde_json::json!({"type":"response.done","response":{"status":"failed"}}),
+                "failed",
+            ),
+            (
+                serde_json::json!({"type":"response.completed","response":{"status":"cancelled"}}),
+                "cancelled",
+            ),
+            (
+                serde_json::json!({"type":"error","error":{"code":"server_error"}}),
+                "failed",
+            ),
+            (
+                serde_json::json!({"type":"response.completed","response":{"status":"completed","error":{"code":"server_error"}}}),
+                "failed",
+            ),
+            (serde_json::Value::Null, "failed"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let settings =
+                crate::config::CodexRequestSettings::for_env(std::collections::HashMap::from([
+                    ("CCP_CONFIG_DIR".into(), temp.path().display().to_string()),
+                    ("XDG_STATE_HOME".into(), temp.path().display().to_string()),
+                ]));
+            let path = settings.clone().sync_scope(crate::logging::log_file);
+            let is_terminal = !terminal.is_null();
+            settings.scope(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let expected_terminal = terminal.clone();
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    read_http_request(&mut stream).await;
+                    // Commit output first so a terminal error cannot be transparently retried.
+                    let mut body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"private-output\"}\n\n".to_string();
+                    if !terminal.is_null() { body.push_str(&format!("data: {terminal}\n\n")); }
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+                let client = Arc::new(authenticated_http_test_client(format!("http://{addr}/responses")));
+                let mut events = client.stream_codex_http_events(&buffered_test_request(), &http_test_context()).await.unwrap();
+                let mut received = Vec::new();
+                let mut read_error = false;
+                while let Some(event) = events.recv().await {
+                    match event { Ok(event) => received.push(event), Err(_) => read_error = true }
+                }
+                if is_terminal { assert_eq!(received.last(), Some(&expected_terminal)); }
+                assert_eq!(read_error, !is_terminal);
+                server.await.unwrap();
+            }).await;
+            assert!(crate::logging::flush_diagnostics(Duration::from_secs(2)));
+            let records: Vec<serde_json::Value> = std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let record = records
+                .iter()
+                .find(|r| {
+                    r["msg"]
+                        == if is_terminal {
+                            "codex_http_stream_completed"
+                        } else {
+                            "codex_http_stream_failed"
+                        }
+                })
+                .expect("stream-end diagnostics missing");
+            assert_eq!(record["fields"]["reqId"], "http-body-test");
+            assert_eq!(
+                record["fields"]["phase"],
+                if is_terminal {
+                    "upstream_terminal"
+                } else {
+                    "upstream_stream"
+                }
+            );
+            assert_eq!(record["fields"]["outcome"], outcome);
+            assert_eq!(record["fields"]["transport"], "http");
+            assert_eq!(
+                record["fields"]["eventCount"],
+                if is_terminal { 2 } else { 1 }
+            );
+            assert!(!record.to_string().contains("private-output"));
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_consumer_during_reused_turn_closes_socket_promptly() {
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let (request_sent_tx, request_sent_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (io, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(io).await.unwrap();
+            next_websocket_json(&mut websocket).await;
+            send_completed_websocket_response(&mut websocket, "first").await;
+            next_websocket_json(&mut websocket).await;
+            request_sent_tx.send(()).unwrap();
+            // Withhold the next response on the reused socket.
+            assert!(websocket.next().await.is_none_or(|frame| frame.is_err()));
+            closed_tx.send(()).unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(endpoint));
+        let owner = ConversationIdentity::Main("warm-turn-cancel".into());
+        let body = buffered_test_request();
+        let reservation =
+            super::super::continuation::reserve_owner_request(Some(&owner), &body, false, true);
+        let mut first = client
+            .stream_codex_websocket_events_for_owner(
+                &body,
+                &http_test_context(),
+                Some(&reservation),
+            )
+            .await
+            .unwrap();
+        while first.recv().await.is_some() {}
+        first.accept_terminal();
+        drop(first);
+        let reservation =
+            super::super::continuation::reserve_owner_request(Some(&owner), &body, false, true);
+        let second = client
+            .stream_codex_websocket_events_for_owner(
+                &body,
+                &http_test_context(),
+                Some(&reservation),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), request_sent_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), closed_rx)
+            .await
+            .expect("consumer cancellation must close the reused active socket promptly")
+            .unwrap();
+        assert!(!super::super::continuation::is_current_turn_for_owner(
+            &reservation
+        ));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_cancellation_closes_silent_upstream() {
+        let (source_tx, source) = tokio::sync::mpsc::channel(64);
+        let (tx, downstream) = tokio::sync::mpsc::channel(64);
+        let relay = tokio::spawn(forward_codex_events(source, tx));
+        drop(downstream);
+        tokio::task::yield_now().await;
+        assert!(
+            relay.is_finished(),
+            "relay must observe consumer close during upstream read"
+        );
+        assert!(source_tx.is_closed());
+        relay.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_continuous_full_queue_expires_without_fabricated_terminal() {
+        let (source_tx, source) = tokio::sync::mpsc::channel(64);
+        let (tx, mut downstream) = tokio::sync::mpsc::channel(64);
+        for _ in 0..64 {
+            tx.send(Ok(
+                serde_json::json!({"type":"response.output_text.delta","delta":"x"}),
+            ))
+            .await
+            .unwrap();
+        }
+        source_tx
+            .send(Ok(serde_json::json!({"type":"response.completed"})))
+            .await
+            .unwrap();
+        let relay = tokio::spawn(forward_codex_events(source, tx));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(299)).await;
+        assert!(!relay.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            relay.is_finished(),
+            "continuous downstream stall must dispose relay"
+        );
+        assert!(source_tx.is_closed());
+        while let Some(event) = downstream.recv().await {
+            assert_eq!(event.unwrap()["type"], "response.output_text.delta");
+        }
+        relay.await.unwrap();
+    }
 
     fn test_continuation(
         owner: Option<ConversationIdentity>,
@@ -3134,6 +3533,24 @@ mod tests {
             owner,
             origin_socket_id,
         )
+    }
+
+    #[test]
+    fn http_error_message_prefers_nonempty_detail_then_message() {
+        assert_eq!(
+            codex_status_error_message(
+                br#"{"detail":"specific detail","message":"generic message"}"#
+            )
+            .as_deref(),
+            Some("specific detail")
+        );
+        assert_eq!(
+            codex_status_error_message(
+                br#"{"error":{"message":"  "},"message":"synthetic message"}"#
+            )
+            .as_deref(),
+            Some("synthetic message")
+        );
     }
 
     #[test]
@@ -3253,6 +3670,55 @@ mod tests {
             )
             .collect();
         request
+    }
+
+    #[tokio::test]
+    async fn stream_handoffs_share_full_history_and_release_it_on_cancellation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (payload_tx, payload_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            payload_tx
+                .send(next_websocket_json(&mut websocket).await)
+                .unwrap();
+            release_rx.await.unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let request = Arc::new(buffered_request_with_texts(&["original", "last"]));
+        let weak = Arc::downgrade(&request);
+        let events = client
+            .stream_codex_websocket_events_shared_for_owner(
+                Arc::clone(&request),
+                &http_test_context(),
+                None,
+            )
+            .await
+            .unwrap();
+        let payload = payload_rx.await.unwrap();
+        assert_eq!(payload["input"][0]["content"][0]["text"], "original");
+        assert_eq!(payload["input"][1]["content"][0]["text"], "last");
+        assert_eq!(
+            Arc::strong_count(&request),
+            2,
+            "reader retains the same immutable history allocation"
+        );
+        drop(request);
+        assert!(weak.upgrade().is_some());
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled reader releases request history");
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
     }
 
     async fn next_websocket_json(
@@ -3532,6 +3998,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_structural_overflow_is_explicit_and_never_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            let mut body = String::new();
+            for index in 0..1025 {
+                body.push_str(&format!("data: {{\"type\":\"response.output_item.added\",\"output_index\":{index},\"item\":{{\"type\":\"message\"}}}}\n\n"));
+            }
+            body.push_str("data: {\"type\":\"response.completed\",\"response\":{}}\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let mut events = Arc::new(client)
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+            .unwrap();
+        let mut failure = None;
+        while let Some(event) = events.recv().await {
+            match event {
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+                Ok(value) => assert_ne!(
+                    value["type"], "response.completed",
+                    "overflow fabricated success"
+                ),
+            }
+        }
+        let error = failure.expect("bounded structural staging must fail explicitly");
+        assert_eq!(error.detail.as_deref(), Some("codex_presemantic_limit"));
+        assert!(!retryable_http_stream_error(&error));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn http_stream_forwards_event_before_terminal_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3557,6 +4070,7 @@ mod tests {
                 b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{}}}\n\n",
             )
             .await;
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
         });
 
         let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
@@ -3588,6 +4102,115 @@ mod tests {
             Some("response.completed")
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_live_terminal_waits_for_eof_and_rejects_all_trailing_data() {
+        for case in [
+            "clean",
+            "duplicate",
+            "late_text",
+            "malformed",
+            "truncated",
+            "coalesced_malformed",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_http_request(&mut socket).await;
+                socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").await.unwrap();
+                let prefix = [
+                    serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}),
+                    serde_json::json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"answer"}),
+                    serde_json::json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m","content":[{"type":"output_text","text":"answer"}]}}),
+                ].iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
+                write_http_chunk(&mut socket, prefix.as_bytes()).await;
+                let terminal = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"usage\":{}}}\n\n";
+                let terminal = if case == "coalesced_malformed" {
+                    format!("{terminal}data: not-json\n\n")
+                } else {
+                    terminal.to_string()
+                };
+                write_http_chunk(&mut socket, terminal.as_bytes()).await;
+                sent_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                let tail = match case {
+                    "duplicate" => {
+                        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                    }
+                    "late_text" => {
+                        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"late\"}\n\n"
+                    }
+                    "malformed" => "data: not-json\n\n",
+                    _ => "",
+                };
+                if !tail.is_empty() {
+                    write_http_chunk(&mut socket, tail.as_bytes()).await;
+                }
+                if case != "truncated" {
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                }
+            });
+            let client = Arc::new(http_test_client(
+                format!("http://{address}/responses"),
+                5_000,
+            ));
+            client.auth_manager().set_test_auth(http_test_auth());
+            let mut events = client
+                .stream_codex_http_events_for_owner(&buffered_test_request(), &http_test_context())
+                .await
+                .unwrap();
+            let mut translator =
+                crate::providers::codex::translate::live_stream::LiveStreamTranslator::new(
+                    "m", "model",
+                );
+            let mut wire = Vec::new();
+            for _ in 0..4 {
+                let payload = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(!super::super::events::event_is_terminal(&payload), "{case}");
+                wire.extend(translator.accept(&payload, None).unwrap());
+            }
+            sent_rx.await.unwrap();
+            if case != "coalesced_malformed" {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), events.recv())
+                        .await
+                        .is_err(),
+                    "terminal escaped before body EOF: {case}"
+                );
+            }
+            release_tx.send(()).unwrap();
+            let mut failure = None;
+            while let Some(event) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+            {
+                match event {
+                    Ok(payload) => wire.extend(translator.accept(&payload, None).unwrap()),
+                    Err(error) => {
+                        wire.extend(translator.error_chunk(&error.message, "api_error", None));
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            let wire = String::from_utf8(wire).unwrap();
+            assert!(wire.contains("answer"), "{case}");
+            assert_eq!(wire.contains("message_stop"), case == "clean", "{case}");
+            assert_eq!(failure.is_some(), case != "clean", "{case}");
+            assert!(
+                !events.had_intervening_failure(),
+                "committed text must not be replayed: {case}"
+            );
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -3964,13 +4587,11 @@ mod tests {
             .socket_id
             .expect("first socket must be reusable");
         super::super::update_continuation_from_upstream(
-            None,
+            &context,
             &first_candidate,
-            None,
             &first_request,
             &first_response.body,
             first_response.socket_id,
-            false,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -3995,13 +4616,11 @@ mod tests {
             .expect("full-context retry socket must be reusable");
         assert_ne!(second_socket_id, first_socket_id);
         super::super::update_continuation_from_upstream(
-            None,
+            &context,
             &second_candidate,
-            None,
             &second_request,
             &second_response.body,
             second_response.socket_id,
-            false,
         );
 
         let third_request = buffered_request_with_texts(&["one", "two", "three"]);
@@ -4097,13 +4716,11 @@ mod tests {
             .await
             .unwrap();
         super::super::update_continuation_from_upstream(
-            None,
+            &context,
             &first_candidate,
-            None,
             &first_request,
             &first_response.body,
             first_response.socket_id,
-            false,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -4212,13 +4829,11 @@ mod tests {
             .await
             .unwrap();
         super::super::update_continuation_from_upstream(
-            None,
+            &context,
             &first_candidate,
-            None,
             &first_request,
             &first_response.body,
             first_response.socket_id,
-            false,
         );
 
         let second_request = buffered_request_with_texts(&["one", "two"]);
@@ -4947,7 +5562,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 16 * 1024];
             assert!(stream.read(&mut request).await.unwrap() > 0);
-            let body = br#"{"error":{"message":"Model not found gpt-test"}}"#;
+            let body = br#"{"error":{"code":"model_not_found","param":"model","message":"Model not found gpt-test"},"request_id":"req_up","response":{"id":"resp_up"}}"#;
             let response = format!(
                 "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
@@ -4956,15 +5571,48 @@ mod tests {
             stream.write_all(body).await.unwrap();
         });
 
+        let capture_root = tempfile::TempDir::new().unwrap();
+        let writer = crate::logging::writer::pause_for_fixture();
+        let mut context = http_test_context();
+        context.traffic = Some(Arc::new(crate::traffic::test_capture(
+            capture_root.path().to_path_buf(),
+        )));
         let result = authenticated_http_test_client(format!("http://{addr}/responses"))
             .post_codex_with_transport(
                 &buffered_test_request(),
-                &http_test_context(),
+                &context,
                 None,
                 crate::config::CodexTransport::Http,
             )
             .await;
         server.await.unwrap();
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(
+            std::time::Duration::from_secs(2)
+        ));
+        let diagnostic_path = std::fs::read_dir(capture_root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("060-codex-event-error")
+            })
+            .expect("actual transport must retain provenance before public error mapping");
+        let diagnostic: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(diagnostic_path).unwrap()).unwrap();
+        assert_eq!(diagnostic["source"], "buffered_http");
+        assert_eq!(diagnostic["upstream_code"], "model_not_found");
+        assert_eq!(diagnostic["upstream_param"], "model");
+        assert_eq!(diagnostic["upstream_status"], 404);
+        assert_eq!(diagnostic["request_id"], "req_up");
+        assert_eq!(diagnostic["response_id"], "resp_up");
+        assert_eq!(diagnostic["local_request_id"], context.req_id);
+        assert_eq!(diagnostic["semantic_committed"], false);
+        assert!(diagnostic.get("message").is_none());
+
         let error = match result {
             Ok(_) => panic!("non-success HTTP status must not reach the SSE reducer"),
             Err(error) => error,
@@ -5420,19 +6068,6 @@ mod tests {
     }
 
     #[test]
-    fn websocket_pool_reset_clears_initial_stale_state() {
-        let owner = Some(ConversationIdentity::Main("session".into()));
-        let missing_state =
-            test_continuation(owner.clone(), None, None, None, Some("missing_state"));
-        let disabled = test_continuation(owner.clone(), None, None, None, Some("disabled"));
-        let prompt_changed = test_continuation(owner, None, None, None, Some("prompt_changed"));
-
-        assert!(should_reset_websocket_pool(Some(&missing_state)));
-        assert!(!should_reset_websocket_pool(Some(&disabled)));
-        assert!(should_reset_websocket_pool(Some(&prompt_changed)));
-    }
-
-    #[test]
     fn build_codex_headers_error_on_empty_access() {
         let auth = StoredAuth {
             access: "".into(),
@@ -5561,7 +6196,7 @@ mod tests {
             "output_index": 0,
             "item": {"type": "message", "id": "msg_1"}
         })));
-        assert!(!event_closes_live_retry_window(&serde_json::json!({
+        assert!(event_closes_live_retry_window(&serde_json::json!({
             "type": "response.output_item.added",
             "output_index": 0,
             "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}

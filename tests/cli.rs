@@ -3,7 +3,7 @@ use predicates::str::contains;
 use std::env;
 #[cfg(unix)]
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     process::{Child, ExitStatus, Stdio},
     sync::mpsc,
@@ -32,6 +32,8 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("codex:"));
+    assert!(out.contains("gpt-6.1-terra"));
+    assert!(out.contains("gpt-6.1-terra-fast"));
     assert!(out.contains("kimi:"));
     assert!(out.contains("opencode:"));
     assert!(out.contains("cursor:"));
@@ -126,28 +128,28 @@ impl Drop for ChildGuard {
 }
 
 #[cfg(unix)]
-fn wait_for_service(
-    child: &mut ChildGuard,
-    port: u16,
-) -> Result<TcpStream, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => return Ok(stream),
-            Err(error) if Instant::now() < deadline => {
-                if let Some(status) = child.0.try_wait()? {
-                    let mut stderr = String::new();
-                    if let Some(mut pipe) = child.0.stderr.take() {
-                        pipe.read_to_string(&mut stderr)?;
-                    }
-                    return Err(format!("service exited with {status}: {stderr}").into());
-                }
-                let _ = error;
-                thread::sleep(Duration::from_millis(20));
+fn wait_for_service(child: &mut ChildGuard) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let stderr = child.0.stderr.take().ok_or("missing service stderr")?;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let _ = thread::spawn(move || {
+        let mut ready_tx = Some(ready_tx);
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if record["msg"] == "server listening"
+                && let Some(port) = record["fields"]["port"]
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                && let Some(sender) = ready_tx.take()
+            {
+                let _ = sender.send(port);
             }
-            Err(error) => return Err(error.into()),
         }
-    }
+    });
+    let port = ready_rx.recv_timeout(Duration::from_secs(15))?;
+    Ok(TcpStream::connect(("127.0.0.1", port))?)
 }
 
 #[cfg(unix)]
@@ -198,9 +200,10 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
         auth_dir.join("auth.json"),
         r#"{"access":"test","refresh":"test","expires":4102444800000,"scope":"openid","userId":"test"}"#,
     )?;
-    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
-        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .args(["serve", "--no-monitor", "--port", "0"])
+        .env("CCP_BIND_ADDRESS", "127.0.0.1")
+        .env("CCP_LOG_STDERR", "1")
         .env("CCP_CONFIG_DIR", config.path())
         .env("CCP_KIMI_BASE_URL", upstream_url)
         .env("NO_PROXY", "127.0.0.1,localhost")
@@ -210,7 +213,7 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
         .stderr(Stdio::piped())
         .spawn()?;
     let mut child = ChildGuard(child);
-    let mut downstream = wait_for_service(&mut child, port)?;
+    let mut downstream = wait_for_service(&mut child)?;
     let body = br#"{"model":"kimi-for-coding","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
     write!(
         downstream,

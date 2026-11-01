@@ -1,7 +1,8 @@
 [package]
 name = "claude-code-proxy"
 version = "0.1.48"
-description = "Anthropic-compatible proxy for Claude Code provider backends"
+description = "Anthropic-compatible proxy for Claude Code, focused on Codex"
+repository = "https://github.com/comiam/claude-code2codex-proxy"
 edition = "2024"
 authors = ["Claude Code Proxy contributors"]
 license = "MIT"
@@ -17,6 +18,7 @@ axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs"] }
 tower = { version = "0.5", features = ["util"] }
 http = "1"
+http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 futures-core = "0.3"

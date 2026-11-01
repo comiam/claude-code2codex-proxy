@@ -3,6 +3,8 @@ title: Grok
 description: Configure grok.com authentication, Grok models, reasoning, function tools, hosted web and X search, citations, and provider overrides.
 ---
 
+> This fork supports compatibility only with Codex. Grok is available without guarantees and at your own risk.
+
 Grok uses the Responses endpoint at `https://cli-chat-proxy.grok.com/v1/responses`.
 
 ## Account and authentication
@@ -58,7 +60,7 @@ model and selected route. Without an override, a classifier resolved to Codex
 uses `gpt-6-luna`; an explicit Grok model stays on Grok. The monitor also shows
 the selected provider and model.
 
-See [Configuration](/reference/configuration/) for log settings. Routing a
+See [Configuration](../reference/configuration.md) for log settings. Routing a
 classifier successfully does not establish that different models make
 equivalent security decisions.
 
@@ -114,7 +116,7 @@ Traffic captures redact Anthropic image data and upstream image data URLs.
 - `CCP_GROK_HOSTED_SEARCH` enables hosted search replacement and forcing.
 - `CCP_GROK_SEARCH_BLOCKS` selects `text` or `native` hosted-search reporting.
 
-See [Configuration](/reference/configuration/) for defaults.
+See [Configuration](../reference/configuration.md) for defaults.
 
 ## Limitations and troubleshooting
 

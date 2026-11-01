@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod auth;
+mod bounded_json;
+pub(crate) use bounded_json::bounded_json_size;
 pub mod config;
 pub mod logging;
 pub mod monitor;
@@ -8,6 +10,7 @@ pub mod paths;
 pub mod project;
 pub mod provider;
 pub mod providers;
+pub mod proxy_speed;
 pub mod registry;
 pub mod request_identity;
 pub mod retry;

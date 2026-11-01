@@ -3,23 +3,20 @@ title: Getting started
 description: Install claude-code-proxy, authenticate with Codex, start the server, and open one working Claude Code session.
 ---
 
-This path gets one Codex-backed Claude Code session working. See [Choosing a provider](/providers/choosing-a-provider/) for Kimi, Grok, OpenCode Go, and Cursor Agent.
+This path gets one Codex-backed Claude Code session working. This fork supports compatibility only with Codex; other providers are available without guarantees and at your own risk. See [Choosing a provider](providers/choosing-a-provider.md).
 
 ## 1. Install
 
-On macOS or Linux with Homebrew:
+On macOS or Linux, install a stable Rust toolchain and build the fork:
 
 ```sh
-brew install raine/claude-code-proxy/claude-code-proxy
+git clone https://github.com/comiam/claude-code2codex-proxy.git
+cd claude-code2codex-proxy
+cargo install --locked --path . --root "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Or use the release installer:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh | bash
-```
-
-Windows archives and binaries for every supported platform are on the [GitHub releases page](https://github.com/raine/claude-code-proxy/releases).
+For Windows, follow the [PowerShell guide](../../../windows.md).
 
 ## 2. Sign in to Codex
 
@@ -39,7 +36,7 @@ Keep this process running:
 claude-code-proxy serve
 ```
 
-It listens on `127.0.0.1:18765`. In an interactive terminal it opens the monitor TUI.
+It listens on `127.0.0.1:18765`. In an interactive terminal it opens the monitor TUI. The listener has no client authentication: keep it local or protect access externally, since clients can consume your account quota and send data through your account.
 
 ## 4. Start Claude Code
 
@@ -48,8 +45,9 @@ Open another terminal and run:
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-6-sol[1m] \
+ANTHROPIC_MODEL=gpt-6.1-sol[1m] \
 ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] \
+ENABLE_TOOL_SEARCH=false \
 CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
@@ -58,6 +56,6 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
 
 Send a prompt. The request appears in the monitor and the response streams into Claude Code.
 
-The `[1m]` suffix is a Claude Code compaction hint. The proxy removes it before the upstream request. The explicit 272,000 token auto-compact window keeps the local threshold within the ChatGPT context limit used by these models.
+The `[1m]` suffix is a Claude Code compaction hint, not a guarantee of a one-million-token context. The proxy removes it before the upstream request. Adjust the example 272,000-token compaction window to the actual model and account limit. Disabling ToolSearch does not disable normal configured MCP tools.
 
-For persistent settings, provider switching, and model discovery, continue to [Configure Claude Code](/using/configure-claude-code/) and [Models and routing](/using/models-and-routing/).
+For persistent settings, provider switching, and model discovery, continue to [Configure Claude Code](using/configure-claude-code.md) and [Models and routing](using/models-and-routing.md).

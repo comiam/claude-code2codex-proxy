@@ -3,14 +3,7 @@ title: For coding agents
 description: Give coding agents machine-readable docs, model discovery, the minimal environment contract, authoritative references, diagnostics, and safe data-handling rules.
 ---
 
-This site publishes machine-readable documentation for coding agents alongside the human pages.
-
-## Machine-readable docs
-
-- [`/llms.txt`](/llms.txt) is the compact index and is linked in the site header.
-- [`/llms-full.txt`](/llms-full.txt) contains the assembled documentation body for retrieval when the index is not enough.
-
-Start with `llms.txt`, follow only the pages relevant to the task, and prefer canonical reference pages over copied command tables in prompts or project notes.
+Documentation is maintained as Markdown in this repository. Start with the [documentation index](../index.md) and follow the pages relevant to the task. Compatibility is supported only for Codex; other providers are available without guarantees and at your own risk.
 
 ## Discover models at runtime
 
@@ -29,11 +22,14 @@ Use the compact CLI output for a provider overview. Use `--full` when a Cursor m
 To launch Claude Code through a running local proxy, set:
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:18765
-ANTHROPIC_AUTH_TOKEN=unused
-ANTHROPIC_MODEL=<routable-model-id>
-ANTHROPIC_SMALL_FAST_MODEL=<routable-model-id>
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=gpt-6.1-sol \
+ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna \
+ENABLE_TOOL_SEARCH=false \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  claude
 ```
 
 `ANTHROPIC_*` and `CLAUDE_CODE_*` configure the Claude Code client. `CCP_*`, `PORT`, and `config.json` configure the proxy process. Keep those layers separate when editing settings or debugging a launch.
@@ -42,12 +38,12 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 
 Use these pages for exact operational details:
 
-- [Command reference](/reference/command-reference/) for CLI syntax and exit behavior
-- [Configuration](/reference/configuration/) for keys, environment variables, precedence, and defaults
-- [Files and storage](/reference/files-and-storage/) for credential, log, error, and traffic paths
-- [HTTP API](/reference/http-api/) for local route contracts
-- [Compatibility and limitations](/reference/compatibility-and-limitations/) for translation boundaries
-- [Changelog](/reference/changelog/) for released behavior
+- [Command reference](../reference/command-reference.md) for CLI syntax and exit behavior
+- [Configuration](../reference/configuration.md) for keys, environment variables, precedence, and defaults
+- [Files and storage](../reference/files-and-storage.md) for credential, log, error, and traffic paths
+- [HTTP API](../reference/http-api.md) for local route contracts
+- [Compatibility and limitations](../reference/compatibility-and-limitations.md) for translation boundaries
+- [Changelog](../reference/changelog.md) for changes
 
 For a source checkout, implementation and tests are the final authority when documentation and behavior disagree. Relevant surfaces include `src/main.rs`, `src/config.rs`, `src/registry.rs`, `src/server.rs`, `src/paths.rs`, `src/providers/`, and integration tests under `tests/`.
 
@@ -55,7 +51,7 @@ For a source checkout, implementation and tests are the final authority when doc
 
 1. Check liveness with `curl http://127.0.0.1:18765/healthz`.
 2. Check the selected model with `claude-code-proxy models`.
-3. Check stored provider credentials with `<provider> auth status`. For OpenCode Go, inspect whether its API-key environment variable or config key is configured without printing the secret.
+3. Check the ChatGPT login with `claude-code-proxy codex auth status`.
 4. Read the monitor request detail and structured `proxy.log`.
 5. Read the redacted payload under `errors/` for a failed response.
 6. Enable verbose logging or traffic capture only for a focused reproduction.
@@ -64,9 +60,7 @@ A source checkout includes `./scripts/debug-proxy`, which starts an isolated pro
 
 ## Handle sensitive data safely
 
-<div class="security-callout">
-<strong>Prompts and traffic captures are sensitive.</strong> Traffic captures preserve inbound prompts, tool definitions, tool inputs, tool outputs, translated requests, and stream events. Redacted headers do not make that content safe to publish.
-</div>
+**Prompts and traffic captures are sensitive.** Traffic captures preserve inbound prompts, tool definitions, tool inputs, tool outputs, translated requests, and stream events. Redacted headers do not make that content safe to publish.
 
 - Never print, commit, upload, or paste provider credentials, refresh tokens, session cookies, or account identifiers.
 - Treat Claude prompts, source excerpts, tool output, file paths, and traffic captures as user data.

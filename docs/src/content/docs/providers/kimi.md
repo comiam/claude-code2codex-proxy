@@ -3,6 +3,8 @@ title: Kimi
 description: Configure Kimi Code authentication, model aliases, reasoning effort, tools, images, video, token refresh, and provider settings.
 ---
 
+> This fork supports compatibility only with Codex. Kimi is available without guarantees and at your own risk.
+
 Kimi uses the OpenAI-style chat completions endpoint at `https://api.kimi.com/coding/v1/chat/completions`.
 
 ## Account and authentication
@@ -39,14 +41,14 @@ Claude Code's `/effort` setting maps to Kimi `reasoning_effort` at `low`, `mediu
 
 ## OpenAI-compatible APIs
 
-When the OpenAI routes are enabled, Kimi models work with both `POST /v1/chat/completions` and `POST /v1/responses`. You can use text, supported images, reasoning effort, function tools, tool results, token limits, streaming, and usage reporting. See [HTTP API](/reference/http-api/) for the accepted request fields.
+When the OpenAI routes are enabled, Kimi models work with both `POST /v1/chat/completions` and `POST /v1/responses`. You can use text, supported images, reasoning effort, function tools, tool results, token limits, streaming, and usage reporting. See [HTTP API](../reference/http-api.md) for the accepted request fields.
 
 ## Configuration
 
-`CCP_KIMI_BASE_URL`, `CCP_KIMI_OAUTH_HOST`, and `CCP_KIMI_USER_AGENT` provide explicit endpoint and client overrides. `CCP_USER_AGENT` is the fallback user-agent override. These settings are intended for compatibility and controlled debugging. See [Configuration](/reference/configuration/) for defaults and file keys.
+`CCP_KIMI_BASE_URL`, `CCP_KIMI_OAUTH_HOST`, and `CCP_KIMI_USER_AGENT` provide explicit endpoint and client overrides. `CCP_USER_AGENT` is the fallback user-agent override. These settings are intended for compatibility and controlled debugging. See [Configuration](../reference/configuration.md) for defaults and file keys.
 
 ## Limitations and troubleshooting
 
 Account access and rate limits come from Kimi. HTTP 429 is returned to Claude Code with `retry-after`. If login succeeds but requests return 401, inspect token expiry with `kimi auth status`, then log in again. Preserve the Kimi device ID alongside the credential when copying a configuration directory.
 
-The proxy estimates count-tokens locally rather than asking Kimi. See [Compatibility and limitations](/reference/compatibility-and-limitations/) for shared boundaries.
+The proxy estimates count-tokens locally rather than asking Kimi. See [Compatibility and limitations](../reference/compatibility-and-limitations.md) for shared boundaries.

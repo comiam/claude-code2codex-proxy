@@ -1,253 +1,6 @@
-use std::collections::BTreeMap;
-
-use crate::anthropic::sse::encode_sse_event;
+use super::live_stream::LiveStreamTranslator;
+use super::reducer::{UpstreamStreamError, translate_upstream_bytes_with_policy};
 use crate::traffic::TrafficCapture;
-
-use super::reducer::{
-    ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic, reduce_upstream_bytes,
-};
-use super::web_search_compat::build_web_search_compat_blocks;
-
-#[allow(dead_code)]
-enum OpenBlock {
-    Thinking,
-    Text,
-    Tool { id: String, name: String },
-}
-
-struct MessageMetadata<'a> {
-    id: &'a str,
-    model: &'a str,
-    estimated_input_tokens: u64,
-}
-
-fn emit(
-    out: &mut Vec<u8>,
-    traffic: Option<&TrafficCapture>,
-    event: &str,
-    data: &serde_json::Value,
-) {
-    if let Some(traffic) = traffic {
-        traffic.write_json_event(
-            "050-downstream-event",
-            &serde_json::json!({
-                "event": event,
-                "data": data,
-            }),
-        );
-    }
-    out.extend_from_slice(&encode_sse_event(Some(event), &data.to_string()));
-}
-
-fn ensure_message_start(
-    out: &mut Vec<u8>,
-    traffic: Option<&TrafficCapture>,
-    message_started: &mut bool,
-    message: &MessageMetadata<'_>,
-) {
-    if !*message_started {
-        *message_started = true;
-        let data = serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": message.id,
-                "type": "message",
-                "role": "assistant",
-                "model": message.model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {
-                    "input_tokens": message.estimated_input_tokens,
-                    "output_tokens": 0,
-                }
-            }
-        });
-        emit(out, traffic, "message_start", &data);
-    }
-}
-
-fn emit_content_event(
-    out: &mut Vec<u8>,
-    traffic: Option<&TrafficCapture>,
-    message_started: &mut bool,
-    open_blocks: &mut BTreeMap<usize, OpenBlock>,
-    message: &MessageMetadata<'_>,
-    event: &ReducerEvent,
-) -> bool {
-    match event {
-        ReducerEvent::ThinkingStart { index } => {
-            ensure_message_start(out, traffic, message_started, message);
-            open_blocks.insert(*index, OpenBlock::Thinking);
-            emit(
-                out,
-                traffic,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                }),
-            );
-            true
-        }
-        ReducerEvent::ThinkingDelta { index, text } => {
-            emit(
-                out,
-                traffic,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "thinking_delta", "thinking": text}
-                }),
-            );
-            true
-        }
-        ReducerEvent::ThinkingSignature { index, signature } => {
-            emit(
-                out,
-                traffic,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "signature_delta", "signature": signature}
-                }),
-            );
-            true
-        }
-        ReducerEvent::ThinkingStop { index } => {
-            open_blocks.remove(index);
-            emit(
-                out,
-                traffic,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
-            true
-        }
-        ReducerEvent::TextStart { index } => {
-            ensure_message_start(out, traffic, message_started, message);
-            open_blocks.insert(*index, OpenBlock::Text);
-            emit(
-                out,
-                traffic,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {"type": "text", "text": ""}
-                }),
-            );
-            true
-        }
-        ReducerEvent::TextDelta { index, text } => {
-            emit(
-                out,
-                traffic,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": text}
-                }),
-            );
-            true
-        }
-        ReducerEvent::TextStop { index } => {
-            open_blocks.remove(index);
-            emit(
-                out,
-                traffic,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
-            true
-        }
-        ReducerEvent::ToolStart { index, id, name } => {
-            ensure_message_start(out, traffic, message_started, message);
-            open_blocks.insert(
-                *index,
-                OpenBlock::Tool {
-                    id: id.clone(),
-                    name: name.clone(),
-                },
-            );
-            emit(
-                out,
-                traffic,
-                "content_block_start",
-                &serde_json::json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": id,
-                        "name": name,
-                        "input": {}
-                    }
-                }),
-            );
-            true
-        }
-        ReducerEvent::ToolDelta {
-            index,
-            partial_json,
-        } => {
-            emit(
-                out,
-                traffic,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": partial_json
-                    }
-                }),
-            );
-            true
-        }
-        ReducerEvent::ToolStop { index } => {
-            open_blocks.remove(index);
-            emit(
-                out,
-                traffic,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
-            true
-        }
-        _ => false,
-    }
-}
-
-fn is_content_event(event: &ReducerEvent) -> bool {
-    matches!(
-        event,
-        ReducerEvent::ThinkingStart { .. }
-            | ReducerEvent::ThinkingDelta { .. }
-            | ReducerEvent::ThinkingSignature { .. }
-            | ReducerEvent::ThinkingStop { .. }
-            | ReducerEvent::TextStart { .. }
-            | ReducerEvent::TextDelta { .. }
-            | ReducerEvent::TextStop { .. }
-            | ReducerEvent::ToolStart { .. }
-            | ReducerEvent::ToolDelta { .. }
-            | ReducerEvent::ToolStop { .. }
-    )
-}
 
 pub fn translate_stream_bytes(
     upstream: &[u8],
@@ -256,7 +9,6 @@ pub fn translate_stream_bytes(
 ) -> Result<Vec<u8>, anyhow::Error> {
     translate_stream_bytes_with_traffic(upstream, message_id, model, 0, None)
 }
-
 pub fn translate_stream_bytes_with_traffic(
     upstream: &[u8],
     message_id: &str,
@@ -264,199 +16,19 @@ pub fn translate_stream_bytes_with_traffic(
     estimated_input_tokens: u64,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
-        Ok(events) => events,
-        Err(err) => {
-            write_reducer_error_capture(traffic, &err);
-            return Err(anyhow::anyhow!(
-                "upstream stream error: {} ({:?})",
-                err.message,
-                err.kind
-            ));
-        }
-    };
-
-    let mut out = Vec::new();
-    let mut message_started = false;
-    let mut open_blocks: BTreeMap<usize, OpenBlock> = BTreeMap::new();
-    let mut web_search_events: Vec<ReducerEvent> = Vec::new();
-    let mut deferred_content_events: Vec<ReducerEvent> = Vec::new();
-    let message = MessageMetadata {
-        id: message_id,
-        model,
-        estimated_input_tokens,
-    };
-
-    for event in &events {
-        if matches!(event, ReducerEvent::WebSearch { .. }) {
-            web_search_events.push(event.clone());
-            continue;
-        }
-        if !web_search_events.is_empty() && is_content_event(event) {
-            deferred_content_events.push(event.clone());
-            continue;
-        }
-
-        if emit_content_event(
-            &mut out,
-            traffic,
-            &mut message_started,
-            &mut open_blocks,
-            &message,
-            event,
-        ) {
-            continue;
-        }
-
-        match event {
-            ReducerEvent::ToolProgress { .. } | ReducerEvent::Progress => {}
-            ReducerEvent::Finish {
-                stop_reason,
-                usage,
-                web_search_requests,
-                ..
-            } => {
-                // Emit web search compat blocks
-                if !web_search_events.is_empty() {
-                    let text_from_deferred: String = deferred_content_events
-                        .iter()
-                        .filter_map(|e| match e {
-                            ReducerEvent::TextDelta { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    let compat_blocks =
-                        build_web_search_compat_blocks(&web_search_events, &text_from_deferred);
-                    for block in &compat_blocks {
-                        use super::web_search_compat::WebSearchCompatContent;
-                        match &block.content {
-                            WebSearchCompatContent::ServerToolUse { id, name, input } => {
-                                ensure_message_start(
-                                    &mut out,
-                                    traffic,
-                                    &mut message_started,
-                                    &message,
-                                );
-                                emit(
-                                    &mut out,
-                                    traffic,
-                                    "content_block_start",
-                                    &serde_json::json!({
-                                        "type": "content_block_start",
-                                        "index": block.index,
-                                        "content_block": {
-                                            "type": "server_tool_use",
-                                            "id": id,
-                                            "name": name,
-                                            "input": {}
-                                        }
-                                    }),
-                                );
-                                emit(
-                                    &mut out,
-                                    traffic,
-                                    "content_block_delta",
-                                    &serde_json::json!({
-                                        "type": "content_block_delta",
-                                        "index": block.index,
-                                        "delta": {
-                                            "type": "input_json_delta",
-                                            "partial_json": serde_json::to_string(input).unwrap_or_default()
-                                        }
-                                    }),
-                                );
-                                emit(
-                                    &mut out,
-                                    traffic,
-                                    "content_block_stop",
-                                    &serde_json::json!({
-                                        "type": "content_block_stop",
-                                        "index": block.index,
-                                    }),
-                                );
-                            }
-                            WebSearchCompatContent::WebSearchToolResult {
-                                tool_use_id,
-                                content: results,
-                            } => {
-                                let result_content: Vec<serde_json::Value> = results
-                                    .iter()
-                                    .map(|r| {
-                                        serde_json::json!({
-                                            "type": "web_search_result",
-                                            "title": r.title,
-                                            "url": r.url,
-                                        })
-                                    })
-                                    .collect();
-                                emit(
-                                    &mut out,
-                                    traffic,
-                                    "content_block_start",
-                                    &serde_json::json!({
-                                        "type": "content_block_start",
-                                        "index": block.index,
-                                        "content_block": {
-                                            "type": "web_search_tool_result",
-                                            "tool_use_id": tool_use_id,
-                                            "content": result_content,
-                                        }
-                                    }),
-                                );
-                                emit(
-                                    &mut out,
-                                    traffic,
-                                    "content_block_stop",
-                                    &serde_json::json!({
-                                        "type": "content_block_stop",
-                                        "index": block.index,
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Emit deferred content
-                for deferred in &deferred_content_events {
-                    emit_content_event(
-                        &mut out,
-                        traffic,
-                        &mut message_started,
-                        &mut open_blocks,
-                        &message,
-                        deferred,
-                    );
-                }
-
-                ensure_message_start(&mut out, traffic, &mut message_started, &message);
-
-                let mapped = map_codex_usage_to_anthropic(usage, Some(*web_search_requests));
-                emit(
-                    &mut out,
-                    traffic,
-                    "message_delta",
-                    &serde_json::json!({
-                        "type": "message_delta",
-                        "delta": {
-                            "stop_reason": stop_reason,
-                            "stop_sequence": null
-                        },
-                        "usage": mapped,
-                    }),
-                );
-                emit(
-                    &mut out,
-                    traffic,
-                    "message_stop",
-                    &serde_json::json!({"type": "message_stop"}),
-                );
-            }
-            _ => {}
-        }
-    }
-
-    Ok(out)
+    let (events, _) =
+        translate_upstream_bytes_with_policy(upstream, super::IncompleteResponsePolicy::Error)
+            .inspect_err(|error| {
+                write_reducer_error_capture(traffic, error);
+            })?;
+    Ok(
+        LiveStreamTranslator::with_estimated_input_tokens(
+            message_id,
+            model,
+            estimated_input_tokens,
+        )
+        .render_events(&events, traffic),
+    )
 }
 
 fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamStreamError) {
@@ -467,7 +39,6 @@ fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamS
         "060-codex-stream-reducer-error",
         &serde_json::json!({
             "kind": format!("{:?}", err.kind),
-            "message": err.message,
             "retryAfterSeconds": err.retry_after_seconds,
             "diagnostics": err.diagnostics,
         }),
@@ -489,6 +60,21 @@ mod tests {
             "data: {}\n\n",
             serde_json::to_string(&serde_json::Value::Object(obj)).unwrap()
         )
+    }
+
+    #[test]
+    fn quota_usage_matches_live_and_buffered_streams() {
+        let quota = serde_json::json!({"type":"codex.rate_limits","plan_type":"pro","rate_limits":{"primary":{"used_percent":42},"secondary":{"window_minutes":60}}});
+        let terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":12,"output_tokens":9,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":3}}}});
+        let upstream = format!("data: {quota}\n\ndata: {terminal}\n\n");
+        let buffered = translate_stream_bytes(upstream.as_bytes(), "msg", "model").unwrap();
+        let mut live = LiveStreamTranslator::new("msg", "model");
+        let mut streamed = live.accept(&quota, None).unwrap();
+        streamed.extend(live.accept(&terminal, None).unwrap());
+        assert_eq!(streamed, buffered);
+        let text = String::from_utf8(streamed).unwrap();
+        assert!(text.contains("codex_rate_limits"));
+        assert!(text.contains("reasoning_tokens"));
     }
 
     #[test]
@@ -592,11 +178,9 @@ mod tests {
         );
         let result = translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
         let out = String::from_utf8(result).unwrap();
-        assert!(out.contains("server_tool_use"), "missing server_tool_use");
-        assert!(
-            out.contains("web_search_tool_result"),
-            "missing web_search_tool_result"
-        );
+        assert!(out.contains("result"));
+        assert!(out.contains(r#""type":"server_tool_use""#));
+        assert!(out.contains("web_search_tool_result"));
     }
 
     #[test]
@@ -733,7 +317,7 @@ mod tests {
                 "response.output_item.done",
                 serde_json::json!({
                     "output_index":0,
-                    "item":{"type":"reasoning","id":"rs_1"}
+                    "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
                 })
             ),
             sse_event(

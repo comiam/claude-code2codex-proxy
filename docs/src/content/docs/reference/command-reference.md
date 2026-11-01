@@ -94,7 +94,4 @@ cargo test --all
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 just check
-just docs
 ```
-
-`just docs` installs the locked documentation dependencies and starts the Astro development server on an available local port.

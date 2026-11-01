@@ -3,15 +3,9 @@ title: How it works
 description: Follow authentication, routing, protocol translation, streaming, session state, and diagnostics through claude-code-proxy.
 ---
 
-claude-code-proxy exposes Anthropic Messages and optional OpenAI-compatible routes. Every route selects a provider from the request model and translates through that provider's native protocol.
+claude-code-proxy exposes Anthropic Messages and optional OpenAI-compatible routes. Requests route by model ID and are translated to the provider's protocol. This fork supports compatibility only with Codex; other providers are available without guarantees and at your own risk.
 
-<div class="route-rail" aria-label="claude-code-proxy request architecture">
-  <div class="route-node"><strong>API client</strong><span>Anthropic Messages<br/>OpenAI Chat or Responses</span></div>
-  <div class="route-arrow" aria-hidden="true">→</div>
-  <div class="route-node"><strong>Proxy pipeline</strong><span>route model<br/>refresh auth<br/>translate events</span></div>
-  <div class="route-arrow" aria-hidden="true">→</div>
-  <div class="route-node provider-stack"><code>Codex Responses</code><code>Kimi Chat Completions</code><code>Grok Responses</code><code>OpenCode Chat / Messages / Responses</code><code>Cursor Connect</code></div>
-</div>
+API client → local proxy → Codex Responses
 
 ## Anthropic requests
 
@@ -31,7 +25,7 @@ Codex Responses requests go directly to the native Codex API. The proxy translat
 
 ## Authentication boundary
 
-Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Credentials live in the platform credential store described in [Files and storage](/reference/files-and-storage/). OpenCode Go instead uses the configured subscription API key. Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
+Each provider login belongs to claude-code-proxy. The proxy does not read native Codex, Grok, or Cursor Agent credentials. Credentials live in the platform credential store described in [Files and storage](reference/files-and-storage.md). OpenCode Go instead uses the configured subscription API key. Incoming `ANTHROPIC_AUTH_TOKEN` values are accepted for client compatibility and are not used as upstream credentials.
 
 ## Routing boundary
 
@@ -39,10 +33,10 @@ Routing happens per request, not per server process or API surface. Codex IDs, K
 
 ## Session state
 
-Claude Code sends `x-claude-code-session-id`. The proxy uses it for monitor grouping and provider features that need continuity. Cursor conversation IDs, optional Codex `previous_response_id`, and optional Codex server compaction state live in memory. A proxy restart clears that state and portable Claude Code history remains the fallback.
+Claude Code sends `x-claude-code-session-id` for monitor grouping and provider features that need continuity. Continuation state lives in memory and a proxy restart clears it; portable Claude Code history remains the fallback.
 
 ## Count tokens
 
 `POST /v1/messages/count_tokens` stays local and does not make an upstream request. Codex uses `o200k_base` for text plus estimates for images, encrypted reasoning, and protocol framing. Other providers use their own local estimators. The result supports Claude Code's compaction decisions but is not a provider billing count.
 
-See [HTTP API](/reference/http-api/) for route contracts and [Compatibility and limitations](/reference/compatibility-and-limitations/) for translation boundaries.
+See [HTTP API](reference/http-api.md) for route contracts and [Compatibility and limitations](reference/compatibility-and-limitations.md) for translation boundaries.

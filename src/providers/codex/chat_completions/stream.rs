@@ -249,6 +249,9 @@ impl StreamState {
         let Some(traffic) = self.ctx.traffic.as_deref() else {
             return;
         };
+        if self.raw_truncated > 0 {
+            traffic.omit();
+        }
         if !self.raw.is_empty() {
             traffic.write_bytes("032-upstream-response-body.sse", &self.raw);
         }

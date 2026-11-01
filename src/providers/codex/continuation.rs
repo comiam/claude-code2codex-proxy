@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::request_identity::ConversationIdentity;
 
@@ -8,8 +8,6 @@ use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
-const MAX_OWNER_TRANSCRIPT_BYTES: u64 = 2_000_000;
-const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
 
 #[derive(Clone)]
 struct ContinuationState {
@@ -25,6 +23,7 @@ struct OwnerState {
     current_turn: u64,
     continuation: Option<ContinuationState>,
     updated_at: u64,
+    lease: Weak<()>,
 }
 
 #[derive(Default)]
@@ -64,6 +63,10 @@ pub(crate) struct ContinuationReservation {
     candidate: ContinuationCandidate,
     owner: Option<ConversationIdentity>,
     origin_socket_id: Option<u64>,
+    pool_enabled: bool,
+    record_transcript: bool,
+    model: Option<String>,
+    lease: Option<Arc<()>>,
 }
 
 impl ContinuationReservation {
@@ -72,7 +75,12 @@ impl ContinuationReservation {
         owner: Option<ConversationIdentity>,
         origin_socket_id: Option<u64>,
     ) -> Self {
+        let enabled = candidate.turn_id.is_some();
         Self {
+            pool_enabled: enabled,
+            record_transcript: enabled,
+            model: None,
+            lease: None,
             candidate,
             owner,
             origin_socket_id,
@@ -100,6 +108,23 @@ impl ContinuationReservation {
         )
     }
 
+    pub(crate) fn without_transcript_recording(mut self) -> Self {
+        self.record_transcript = false;
+        self
+    }
+
+    pub(crate) fn records_transcript(&self) -> bool {
+        self.record_transcript
+    }
+
+    pub(crate) fn pool_enabled(&self) -> bool {
+        self.pool_enabled
+    }
+
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     pub(crate) fn candidate(&self) -> &ContinuationCandidate {
         &self.candidate
     }
@@ -125,7 +150,10 @@ impl ContinuationReservation {
         candidate.previous_response_id = None;
         candidate.input_delta = None;
         candidate.disabled_reason = Some("full_context_retry".to_string());
-        Self::new(candidate, self.owner.clone(), None)
+        let mut retry = self.clone();
+        retry.candidate = candidate;
+        retry.origin_socket_id = None;
+        retry
     }
 }
 
@@ -146,12 +174,40 @@ pub fn continuation_candidate(
     continuation_candidate_inner(owner.as_ref(), body, enabled, "missing_session").into_candidate()
 }
 
+#[cfg(test)]
 pub(crate) fn continuation_candidate_for_owner(
     owner: Option<&ConversationIdentity>,
     body: &ResponsesRequest,
     enabled: bool,
 ) -> ContinuationReservation {
-    continuation_candidate_inner(owner, body, enabled, "missing_identity")
+    reserve_owner_request(owner, body, enabled, enabled)
+}
+
+pub(crate) fn reserve_owner_request(
+    owner: Option<&ConversationIdentity>,
+    body: &ResponsesRequest,
+    previous_enabled: bool,
+    reuse_enabled: bool,
+) -> ContinuationReservation {
+    let mut reservation =
+        continuation_candidate_inner(owner, body, reuse_enabled, "missing_identity");
+    reservation.pool_enabled = reuse_enabled && owner.is_some();
+    reservation.record_transcript = previous_enabled && reuse_enabled;
+    reservation.model = Some(body.model.clone());
+    if !reservation.record_transcript {
+        reservation.candidate.previous_response_id = None;
+        reservation.candidate.input_delta = None;
+        reservation.origin_socket_id = None;
+        reservation.candidate.disabled_reason = Some(
+            if reuse_enabled {
+                "previous_response_disabled"
+            } else {
+                "websocket_reuse_disabled"
+            }
+            .into(),
+        );
+    }
+    reservation
 }
 
 fn continuation_candidate_inner(
@@ -190,6 +246,7 @@ fn continuation_candidate_inner(
 
     let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
     let now = now_ms();
+    let lease = Arc::new(());
     let (state, superseded_turn) = {
         let mut guard = REGISTRY.lock().unwrap();
         let registry = guard.get_or_insert_with(ContinuationRegistry::default);
@@ -207,13 +264,17 @@ fn continuation_candidate_inner(
                 current_turn: turn_id,
                 continuation: None,
                 updated_at: now,
+                lease: Arc::downgrade(&lease),
             },
         );
         evict_oldest(registry);
         (state, superseded_turn)
     };
 
-    continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now)
+    let mut reservation =
+        continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now);
+    reservation.lease = Some(lease);
+    reservation
 }
 
 fn continuation_candidate_from_state(
@@ -331,6 +392,9 @@ pub(crate) fn record_continuation_for_owner(
     socket_id: Option<u64>,
     output_items: &[ResponsesInputItem],
 ) {
+    if !reservation.record_transcript {
+        return;
+    }
     let (owner, turn_id) = match (reservation.owner(), reservation.turn_id()) {
         (Some(owner), Some(turn_id)) => (owner, turn_id),
         _ => return,
@@ -347,21 +411,25 @@ pub(crate) fn record_continuation_for_owner(
     };
     let mut transcript: Vec<ResponsesInputItem> = request_body.input.clone();
     transcript.extend_from_slice(output_items);
+    let signature = prompt_signature(request_body);
+    let metadata_bytes = signature.len().saturating_add(response_id.len()) as u64;
+    let owner_budget = crate::config::codex_cache_policy().owner_bytes;
 
-    let transcript_json = serde_json::to_string(&transcript).unwrap_or_default();
-    let transcript_bytes = transcript_json.len() as u64;
-
-    if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
-        abort_continuation_inner(Some(owner), Some(turn_id));
+    let Ok(Some(transcript_bytes)) = super::translate::request::bounded_json_size(
+        &transcript,
+        owner_budget.saturating_sub(metadata_bytes) as usize,
+    ) else {
+        discard_transcript_for_turn(owner, turn_id);
         return;
-    }
+    };
 
     let state = ContinuationState {
         response_id,
         socket_id,
-        prompt_signature: prompt_signature(request_body),
+        prompt_signature: signature,
         transcript,
-        transcript_bytes,
+        // Serialized transcript plus retained signature and response ID.
+        transcript_bytes: transcript_bytes as u64 + metadata_bytes,
         updated_at: now_ms(),
     };
 
@@ -375,12 +443,13 @@ pub(crate) fn record_continuation_for_owner(
     if owner_state.current_turn != turn_id {
         return;
     }
+    owner_state.updated_at = state.updated_at;
     if let Some(existing) = owner_state.continuation.replace(state) {
         registry.total_transcript_bytes = registry
             .total_transcript_bytes
             .saturating_sub(existing.transcript_bytes);
     }
-    registry.total_transcript_bytes += transcript_bytes;
+    registry.total_transcript_bytes += transcript_bytes as u64 + metadata_bytes;
     evict_oldest(registry);
 }
 
@@ -576,31 +645,13 @@ fn input_items_equivalent(a: &ResponsesInputItem, b: &ResponsesInputItem) -> boo
                         (Ok(a_value), Ok(b_value)) if a_value == b_value
                     ))
         }
-        _ => {
-            serde_json::to_value(a).unwrap_or_default()
-                == serde_json::to_value(b).unwrap_or_default()
-        }
+        _ => a == b,
     }
 }
 
 fn prompt_signature(body: &ResponsesRequest) -> String {
-    let value = serde_json::to_value(body).unwrap_or_default();
-    let obj = match value.as_object() {
-        Some(o) => o,
-        None => return String::new(),
-    };
-    let mut entries: Vec<(&String, &serde_json::Value)> =
-        obj.iter().filter(|(k, _)| *k != "input").collect();
-    entries.sort_by_key(|(a, _)| *a);
-    let mut sig = String::from("{");
-    for (i, (key, val)) in entries.iter().enumerate() {
-        if i > 0 {
-            sig.push(',');
-        }
-        sig.push_str(&format!("\"{}\":{}", key, stable_json(val)));
-    }
-    sig.push('}');
-    sig
+    let value = serde_json::to_value(body.non_input()).expect("non-input request serializes");
+    stable_json(&value)
 }
 
 fn stable_json(value: &serde_json::Value) -> String {
@@ -632,24 +683,69 @@ fn stable_json(value: &serde_json::Value) -> String {
 }
 
 fn evict_oldest(registry: &mut ContinuationRegistry) {
-    while registry.owners.len() > MAX_STATES
-        || registry.total_transcript_bytes > MAX_TOTAL_TRANSCRIPT_BYTES
-    {
+    // Byte pressure removes optional transcripts, never ownership/publication
+    // fences. A checked-out socket may still belong to one of these turns.
+    while registry.total_transcript_bytes > crate::config::codex_cache_policy().total_bytes {
         let owner = registry
             .owners
             .iter()
+            .filter(|(_, state)| state.continuation.is_some())
             .min_by_key(|(_, state)| state.updated_at)
             .map(|(owner, _)| owner.clone());
         let Some(owner) = owner else {
             break;
         };
-        if let Some(state) = registry.owners.remove(&owner)
-            && let Some(continuation) = state.continuation
+        if let Some(continuation) = registry
+            .owners
+            .get_mut(&owner)
+            .and_then(|state| state.continuation.take())
         {
             registry.total_transcript_bytes = registry
                 .total_transcript_bytes
                 .saturating_sub(continuation.transcript_bytes);
         }
+    }
+    // Metadata maintenance skips active reservations. Byte eviction above is
+    // independent of metadata/leases and never clears their turn fence.
+    evict_inactive_owners(registry, now_ms(), MAX_STATES);
+}
+
+fn evict_inactive_owners(registry: &mut ContinuationRegistry, now: u64, max_states: usize) {
+    let total = &mut registry.total_transcript_bytes;
+    registry.owners.retain(|_, state| {
+        let keep =
+            state.lease.strong_count() != 0 || now.saturating_sub(state.updated_at) <= TTL_MS;
+        if !keep && let Some(history) = &state.continuation {
+            *total -= history.transcript_bytes;
+        }
+        keep
+    });
+    while registry.owners.len() > max_states {
+        let oldest = registry
+            .owners
+            .iter()
+            .filter(|(_, state)| state.lease.strong_count() == 0)
+            .min_by_key(|(_, state)| state.updated_at)
+            .map(|(owner, _)| owner.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        if let Some(state) = registry.owners.remove(&oldest)
+            && let Some(history) = state.continuation
+        {
+            registry.total_transcript_bytes -= history.transcript_bytes;
+        }
+    }
+}
+
+fn discard_transcript_for_turn(owner: &ConversationIdentity, turn_id: u64) {
+    let mut guard = REGISTRY.lock().unwrap();
+    if let Some(registry) = guard.as_mut()
+        && let Some(state) = registry.owners.get_mut(owner)
+        && state.current_turn == turn_id
+        && let Some(continuation) = state.continuation.take()
+    {
+        registry.total_transcript_bytes -= continuation.transcript_bytes;
     }
 }
 
@@ -715,6 +811,202 @@ mod tests {
     }
 
     #[test]
+    fn compact_recording_opt_out_keeps_parent_and_owner() {
+        let _registry_guard = lock_registry();
+        for owner in [
+            main_owner("compact-main"),
+            agent_owner("compact-main", "agent"),
+        ] {
+            let initial = request_with_input(vec![input("old history")], None);
+            start_and_record(&owner, &initial, "resp_old");
+            let compact = request_with_input(vec![input("old history"), input("compact")], None);
+            let reservation = reserve_owner_request(Some(&owner), &compact, true, true);
+            let lease = reservation.lease.clone().unwrap();
+            let turn_id = reservation.turn_id();
+            let reservation = reservation.without_transcript_recording();
+
+            assert_eq!(
+                reservation.candidate().previous_response_id.as_deref(),
+                Some("resp_old")
+            );
+            assert_eq!(
+                reservation.candidate().input_delta,
+                Some(vec![input("compact")])
+            );
+            assert_eq!(reservation.candidate().input_delta_count, 1);
+            assert_eq!(reservation.origin_socket_id(), Some(1));
+            assert_eq!(reservation.owner(), Some(&owner));
+            assert!(reservation.pool_enabled());
+            assert_eq!(reservation.model(), Some("gpt-5.5"));
+            assert!(Arc::ptr_eq(reservation.lease.as_ref().unwrap(), &lease));
+            assert_eq!(reservation.turn_id(), turn_id);
+            record_continuation_for_owner(
+                &reservation,
+                &compact,
+                Some("resp_compact"),
+                Some(1),
+                &[input("summary")],
+            );
+            assert!(is_current_turn_for_owner(&reservation));
+            assert!(
+                !has_continuation_for_owner_for_tests(&owner),
+                "compact must not retain the old transcript or summary for continuation"
+            );
+            assert_eq!(
+                REGISTRY
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .total_transcript_bytes,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn total_budget_evicts_transcripts_without_losing_current_owner_turn() {
+        let _registry_guard = lock_registry();
+        let request = request_with_input(vec![input("small")], None);
+        let oldest = main_owner("budget-0");
+        let oldest_turn = continuation_candidate_for_owner(Some(&oldest), &request, true);
+        record_continuation_for_owner(&oldest_turn, &request, Some("resp"), Some(1), &[]);
+        for index in 1..3 {
+            start_and_record(&main_owner(&format!("budget-{index}")), &request, "resp");
+        }
+        // Test eviction with accounted weights, without allocating a 128 MiB cache.
+        let budget = crate::config::codex_cache_policy().total_bytes;
+        {
+            let mut guard = REGISTRY.lock().unwrap();
+            let registry = guard.as_mut().unwrap();
+            registry.total_transcript_bytes = 0;
+            let oldest_updated_at = now_ms();
+            for index in 0..3 {
+                let owner_state = registry
+                    .owners
+                    .get_mut(&main_owner(&format!("budget-{index}")))
+                    .unwrap();
+                // Eviction orders owners; distinct outer timestamps avoid
+                // same-millisecond ties in the HashMap iteration order.
+                owner_state.updated_at = oldest_updated_at + index;
+                let state = owner_state.continuation.as_mut().unwrap();
+                state.transcript_bytes = budget / 2 + 1;
+                state.updated_at = owner_state.updated_at;
+                registry.total_transcript_bytes += state.transcript_bytes;
+            }
+            evict_oldest(registry);
+        }
+        assert!(!has_continuation_for_owner_for_tests(&oldest));
+        assert!(
+            is_current_turn_for_owner(&oldest_turn),
+            "history eviction must preserve the publication fence"
+        );
+        assert!(
+            REGISTRY
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .total_transcript_bytes
+                <= budget
+        );
+        let next = continuation_candidate_for_owner(Some(&oldest), &request, true);
+        assert!(next.candidate().previous_response_id.is_none());
+        assert!(next.candidate().input_delta.is_none());
+        assert_eq!(request.input, vec![input("small")]);
+    }
+
+    #[test]
+    fn owner_budget_rejection_preserves_turn_for_healthy_socket_publication() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("large-owner");
+        let request = request_with_input(
+            vec![input(&"x".repeat(
+                crate::config::codex_cache_policy().owner_bytes as usize,
+            ))],
+            None,
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        record_continuation_for_owner(&reservation, &request, Some("resp"), Some(1), &[]);
+        assert!(!has_continuation_for_owner_for_tests(&owner));
+        assert!(is_current_turn_for_owner(&reservation));
+    }
+
+    #[test]
+    fn cloned_reservation_preserves_metadata_fence_until_final_drop() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("active-owner");
+        let request = request_with_input(vec![input("small")], None);
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let clone = reservation.clone();
+        drop(reservation);
+        {
+            let mut guard = REGISTRY.lock().unwrap();
+            let registry = guard.as_mut().unwrap();
+            registry.owners.get_mut(&owner).unwrap().updated_at = 0;
+            evict_oldest(registry);
+        }
+        assert!(is_current_turn_for_owner(&clone));
+        drop(clone);
+        let mut guard = REGISTRY.lock().unwrap();
+        evict_oldest(guard.as_mut().unwrap());
+        assert!(!guard.as_ref().unwrap().owners.contains_key(&owner));
+    }
+
+    #[test]
+    fn metadata_count_pressure_preserves_active_reservations_and_uses_inactive_lru() {
+        let _registry_guard = lock_registry();
+        let request = request_with_input(vec![input("small")], None);
+        let active_owner = main_owner("active");
+        let active = continuation_candidate_for_owner(Some(&active_owner), &request, true);
+        for owner in [main_owner("inactive-old"), main_owner("inactive-new")] {
+            start_and_record(&owner, &request, "resp");
+        }
+        let mut guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_mut().unwrap();
+        let now = now_ms();
+        registry
+            .owners
+            .get_mut(&main_owner("inactive-old"))
+            .unwrap()
+            .updated_at = now - 2;
+        registry
+            .owners
+            .get_mut(&main_owner("inactive-new"))
+            .unwrap()
+            .updated_at = now - 1;
+        evict_inactive_owners(registry, now, 2);
+        assert!(registry.owners.contains_key(&active_owner));
+        assert!(!registry.owners.contains_key(&main_owner("inactive-old")));
+        assert!(registry.owners.contains_key(&main_owner("inactive-new")));
+        evict_inactive_owners(registry, now, 0);
+        assert_eq!(
+            registry.owners.len(),
+            1,
+            "active reservations can exceed metadata capacity"
+        );
+        assert_eq!(registry.total_transcript_bytes, 0);
+        drop(guard);
+        assert!(is_current_turn_for_owner(&active));
+    }
+
+    #[test]
+    fn retained_signature_counts_toward_owner_budget() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("large-signature");
+        let request = request_with_input(
+            vec![input("small")],
+            Some(
+                json!({"instructions": "x".repeat(crate::config::codex_cache_policy().owner_bytes as usize)}),
+            ),
+        );
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        record_continuation_for_owner(&reservation, &request, Some("resp"), Some(1), &[]);
+        assert!(!has_continuation_for_owner_for_tests(&owner));
+        assert!(is_current_turn_for_owner(&reservation));
+    }
+
+    #[test]
     #[allow(deprecated)]
     fn disabled_and_missing_identity_requests_are_stateless() {
         let _registry_guard = lock_registry();
@@ -727,7 +1019,7 @@ mod tests {
         assert_eq!(disabled.candidate().input_delta_count, request.input.len());
         assert_eq!(
             disabled.candidate().disabled_reason.as_deref(),
-            Some("disabled")
+            Some("websocket_reuse_disabled")
         );
 
         let missing = continuation_candidate_for_owner(None, &request, true);
@@ -948,6 +1240,47 @@ mod tests {
         assert_eq!(if_current_turn(None, Some(1), || runs += 1), None);
         assert!(!with_current_turn(None, Some(1), || runs += 1));
         assert_eq!(runs, 0);
+    }
+
+    #[test]
+    fn session_service_tier_changes_use_existing_prompt_compatibility_guard() {
+        let _registry_guard = lock_registry();
+        for enabled in [false, true] {
+            let owner = main_owner(if enabled {
+                "speed-enabled"
+            } else {
+                "speed-disabled"
+            });
+            let initial =
+                request_with_input(vec![input("one")], Some(json!({"service_tier":"fast"})));
+            start_and_record(&owner, &initial, "resp_fast");
+            let same = request_with_input(
+                vec![input("one"), input("two")],
+                Some(json!({"service_tier":"fast"})),
+            );
+            let reservation = continuation_candidate_for_owner(Some(&owner), &same, enabled);
+            assert_eq!(
+                reservation.candidate().previous_response_id.as_deref(),
+                enabled.then_some("resp_fast")
+            );
+            if enabled {
+                assert_eq!(reservation.candidate().input_delta_count, 1);
+                record_continuation_for_owner(&reservation, &same, Some("resp_same"), Some(1), &[]);
+            }
+            let changed = request_with_input(
+                vec![input("one"), input("two"), input("three")],
+                Some(json!({"service_tier":"ultrafast"})),
+            );
+            let reservation = continuation_candidate_for_owner(Some(&owner), &changed, enabled);
+            assert!(reservation.candidate().previous_response_id.is_none());
+            assert!(reservation.candidate().input_delta.is_none());
+            if enabled {
+                assert_eq!(
+                    reservation.candidate().disabled_reason.as_deref(),
+                    Some("prompt_changed")
+                );
+            }
+        }
     }
 
     #[test]

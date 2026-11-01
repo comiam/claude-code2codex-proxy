@@ -5,7 +5,7 @@ description: Canonical claude-code-proxy configuration keys, environment variabl
 
 Proxy settings come from environment variables or `config.json`. Precedence is **environment variable, config file, built-in default**. The `serve --port` option takes precedence over all port settings.
 
-These settings configure the proxy process. Claude Code client settings such as `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, and `CLAUDE_CODE_*` are documented separately in [Configure Claude Code](/using/configure-claude-code/).
+These settings configure the proxy process. Claude Code client settings such as `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, and `CLAUDE_CODE_*` are documented separately in [Configure Claude Code](../using/configure-claude-code.md).
 
 ## Example `config.json`
 
@@ -25,7 +25,7 @@ These settings configure the proxy process. Claude Code client settings such as 
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "auto",
     "headerTimeoutMs": 300000,
-    "previousResponseId": false,
+    "previousResponseId": true,
     "serverCompaction": false,
     "responsesApi": false,
     "fullLane": false,
@@ -111,16 +111,28 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_BASE_URL` | `codex.baseUrl` | ChatGPT Codex Responses URL | Changes the Codex endpoint. |
 | `CCP_CODEX_TRANSPORT` | `codex.transport` | `auto` | Selects `websocket`, `http`, or `auto`. `auto` falls back to HTTP SSE only when WebSocket setup fails before a request is sent. |
 | `CCP_CODEX_HEADER_TIMEOUT_MS` | `codex.headerTimeoutMs` | `300000` | Sets how long an HTTP-transport request waits for the Codex response headers. Values below `1000` are ignored. |
-| `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |
-| `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Enables or disables native compaction for standard boolean words. |
+| `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `true` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |
+| `CCP_CODEX_WEBSOCKET_REUSE` | `codex.websocketReuse` | `true` | Reuses compatible owner sockets even when previous-response IDs are disabled. Explicit false disables pooling and delta continuation. |
+| `CCP_CODEX_WEBSOCKET_IDLE_CAP` | `codex.websocketIdleCap` | `64` | Maximum retained idle, unleased sockets; positive integer up to `4096`. |
+| `CCP_CODEX_WEBSOCKET_IDLE_TTL_MS` | `codex.websocketIdleTtlMs` | `300000` | True idle expiry since socket reinsertion; positive integer up to `86400000`. |
+| `CCP_CODEX_WEBSOCKET_MAX_AGE_MS` | `codex.websocketMaxAgeMs` | `1800000` | Absolute socket lifetime independent of reuse; positive integer up to `86400000`. |
+| `CCP_CODEX_CONTINUATION_OWNER_BYTES` | `codex.continuationOwnerBytes` | `8388608` | Per-owner retained continuation bytes; positive integer up to `134217728`, capped at the total limit. |
+| `CCP_CODEX_CONTINUATION_TOTAL_BYTES` | `codex.continuationTotalBytes` | `134217728` | Total retained continuation bytes; positive integer up to `536870912`. |
+| `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Deprecated compatibility setting, ignored for Claude Messages. True emits one startup warning; compact always uses one text generation. |
 | `CCP_CODEX_RESPONSES_API` | `codex.responsesApi` | `false` | Enables `/v1/responses` and `/v1/chat/completions` for every registered provider. Accepts `1`, `true`, or `yes`. |
-| `CCP_CODEX_FULL_LANE` | `codex.fullLane` | `false` | Enables parallel tool calls on the six [supported full-lane models](/providers/codex/#responses-lanes-and-parallel-tools). Luna and catalog-only models keep their default lane. Accepts `1`, `true`, or `yes`. |
+| `CCP_CODEX_FULL_LANE` | `codex.fullLane` | `false` | Enables parallel tool calls on the six [supported full-lane models](../providers/codex.md#responses-lanes-and-parallel-tools). Luna and catalog-only models keep their default lane. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_API` | `codex.imagesApi` | `false` | Enables `/v1/images/generations` and `/v1/images/edits` for `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_BASE_URL` | `codex.imagesBaseUrl` | `https://chatgpt.com/backend-api/codex` | Sets the trusted Codex Images API root; production use is restricted to HTTPS `chatgpt.com/backend-api/codex`. |
 | `CCP_CODEX_ORIGINATOR` | `codex.originator` | `claude-code-proxy` | Changes the Codex `originator` header. |
 | `CCP_CODEX_USER_AGENT` | `codex.userAgent` | `claude-code-proxy/<version>` | Changes the Codex user-agent. |
 
 `CLAUDE_CODE_PROXY_CODEX_BASE_URL` remains an accepted fallback for the Codex base URL. `CCP_CODEX_BASE_URL` takes precedence.
+
+Socket reuse is fixed when the client is created. Cache limits are resolved once at process startup and require a restart to change. Invalid numeric environment values fall through to a valid file value, then the default. Model, effort, tier, and logging settings continue to refresh between requests.
+
+For a larger idle pool, set `websocketIdleCap` to `128` and `websocketIdleTtlMs` to `600000`; the default thirty-minute absolute age still applies. Continuation defaults are 8 MiB per owner (`8388608`) and 128 MiB total (`134217728`). Explicit `previousResponseId:false` retains independent socket reuse with full input; explicit `websocketReuse:false` disables both.
+
+Continuation accounting includes serialized logical input/output, the retained prompt signature, and response ID. Claude Messages compaction retains no separate native history or summary registry; the client supplies its saved text summary on subsequent turns. Evicting a continuation transcript disables delta eligibility and preserves a compatible healthy socket; the next request carries its complete logical history. Cache eviction preserves active leases and turn fences. Inactive owner metadata is retained for at most thirty minutes and up to 10,000 owners; active reservations may temporarily exceed this metadata count without imposing a generation queue. These limits exclude allocator overhead, socket/TLS buffers, active requests, and other queues, and do not bound process RSS.
 
 ## Kimi
 

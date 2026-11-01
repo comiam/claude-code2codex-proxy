@@ -522,6 +522,21 @@ impl NativeResponseObserver {
                 .get("output_tokens")
                 .and_then(Value::as_u64)
                 .or(self.output_tokens);
+            if let Some(monitor) = self.ctx.monitor.as_ref()
+                && let Some(tokens) = usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+            {
+                monitor.typed_progress(
+                    &self.ctx.req_id,
+                    0,
+                    0,
+                    crate::monitor::UsageObservation {
+                        cached_input_tokens: Some(tokens),
+                        ..Default::default()
+                    },
+                );
+            }
         }
     }
 
@@ -547,6 +562,9 @@ impl NativeResponseObserver {
         let Some(traffic) = self.ctx.traffic.as_deref() else {
             return;
         };
+        if self.raw_truncated > 0 || self.pending_truncated || self.captured_events_truncated > 0 {
+            traffic.omit();
+        }
         if !self.raw.is_empty() {
             traffic.write_bytes(
                 if self.is_sse {
@@ -639,6 +657,51 @@ mod tests {
     }
 
     #[test]
+    fn cached_input_is_observed_for_native_json_and_sse_without_duplicate_totals() {
+        for is_sse in [false, true] {
+            let monitor = crate::monitor::MonitorHandle::default();
+            let mut ctx = observer_context();
+            monitor.request_started(
+                &ctx.req_id,
+                None,
+                None,
+                crate::monitor::EndpointKind::Responses,
+            );
+            ctx.monitor = Some(monitor.clone());
+            let mut observer =
+                NativeResponseObserver::new(ctx, is_sse, NativeResponseOutcome::default());
+            let response = json!({"status":"completed", "usage": {
+                "input_tokens":790845, "output_tokens":10,
+                "input_tokens_details":{"cached_tokens":782848}
+            }});
+            let bytes = if is_sse {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed", "response": response})
+                )
+                .into_bytes()
+            } else {
+                serde_json::to_vec(&response).unwrap()
+            };
+            observer.observe(&bytes);
+            observer.finish("complete");
+            observer.finish("complete");
+            let value = serde_json::to_value(crate::monitor::snapshot::MonitorSnapshot::from(
+                monitor.snapshot(),
+            ))
+            .unwrap();
+            assert_eq!(
+                value["active"][0]["usage"]["cached_input_tokens"], 782848,
+                "is_sse={is_sse}"
+            );
+            assert_eq!(
+                value["sessions"][0]["cached_input_tokens"], 782848,
+                "is_sse={is_sse}"
+            );
+        }
+    }
+
+    #[test]
     fn completed_json_with_null_error_stays_successful() {
         let outcome = NativeResponseOutcome::default();
         let mut observer = NativeResponseObserver::new(observer_context(), false, outcome.clone());
@@ -674,6 +737,7 @@ mod tests {
 
     #[test]
     fn event_capture_obeys_count_limit() {
+        let writer = crate::logging::writer::pause_for_fixture();
         let temp = tempfile::TempDir::new().unwrap();
         let outcome = NativeResponseOutcome::default();
         let mut context = observer_context();
@@ -687,7 +751,26 @@ mod tests {
 
         assert_eq!(observer.captured_events.len(), MAX_STREAM_CAPTURE_EVENTS);
         assert_eq!(observer.captured_events_truncated, 10);
-        observer.finished = true;
+        observer.finish("complete");
+        drop(observer);
+        drop(writer);
+        assert!(crate::logging::flush_diagnostics(Duration::from_secs(2)));
+        let marker = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("capture-completion.json")
+            })
+            .unwrap();
+        let marker: Value = serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+        assert_eq!(
+            marker["complete"], false,
+            "truncated event capture must be incomplete"
+        );
+        assert_eq!(marker["dropped"], 1);
     }
 
     #[test]
@@ -709,6 +792,21 @@ mod tests {
         let resolved = shape_native_request(&mut fast, false).unwrap();
         assert_eq!(resolved.model, "gpt-5.4");
         assert_eq!(fast["service_tier"], "priority");
+    }
+
+    #[test]
+    fn native_request_resolves_gpt_6_1_terra_on_lite() {
+        for (model, tier) in [
+            ("gpt-6.1-terra", None),
+            ("gpt-6.1-terra-fast", Some("priority")),
+        ] {
+            let mut body = request(json!({"model":model,"input":[]}));
+            let resolved = shape_native_request(&mut body, false).unwrap();
+            assert_eq!(resolved.model, "gpt-6.1-terra");
+            assert!(resolved.use_responses_lite);
+            assert_eq!(body["model"], "gpt-6.1-terra");
+            assert_eq!(body.get("service_tier").and_then(Value::as_str), tier);
+        }
     }
 
     #[test]

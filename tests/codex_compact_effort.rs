@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 
 use claude_code_proxy::MessagesRequest;
 use claude_code_proxy::providers::codex::translate::request::{
-    TranslateOptions, translate_request,
+    TranslateOptions, translate_openai_compatible_request, translate_request,
 };
 use serde_json::{Value, json};
 
@@ -184,4 +184,145 @@ fn global_low_is_preserved_under_higher_compact_cap() {
         json!({"effort": "low", "summary": "auto"})
     );
     assert_eq!(wire["include"], json!(["reasoning.encrypted_content"]));
+}
+
+#[test]
+fn compact_text_preserves_history_focus_model_tier_and_effort_in_both_lanes() {
+    let _guard = env_lock();
+    let config = tempfile::TempDir::new().unwrap();
+    let mut env = isolated_environment(config.path());
+    env.push(EnvGuard::set("CCP_CODEX_EFFORT", "high"));
+    for lite in [false, true] {
+        for compact in [false, true] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.6-sol",
+                "system": if compact { "You are a helpful AI assistant tasked with summarizing conversations. Focus on database migration." } else { "You are Claude Code. Focus on database migration." },
+                "tools": [{"name":"Read","input_schema":{"type":"object"}}],
+                "tool_choice": {"type":"tool","name":"Read"},
+                "messages": [
+                    {"role":"assistant","content":[{"type":"tool_use","id":"call-old","name":"Read","input":{"path":"old.rs"}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-old","content":"historical result"}]}
+                ]
+            })).unwrap();
+            // The OpenAI-compatible translator retains ordinary tool registration,
+            // even when prompt text happens to match the Claude compact detector.
+            let openai_wire = serde_json::to_value(
+                translate_openai_compatible_request(&req, "gpt-5.6-sol".into(), None).unwrap(),
+            )
+            .unwrap();
+            assert!(openai_wire["tools"].is_array());
+            assert_eq!(openai_wire["tool_choice"]["name"], "Read");
+            let wire = serde_json::to_value(translate_request(&req, TranslateOptions {
+                session_id: None, service_tier: Some(claude_code_proxy::providers::codex::translate::request::ServiceTier::Priority),
+                model: "gpt-5.6-sol".into(), use_responses_lite: lite,
+            }).unwrap()).unwrap();
+            assert_eq!(wire["model"], "gpt-5.6-sol");
+            assert_eq!(wire["service_tier"], "priority");
+            assert_eq!(
+                wire["reasoning"]["effort"],
+                if compact { "low" } else { "high" }
+            );
+            let text = wire.to_string();
+            assert!(text.contains("historical result"));
+            assert!(text.contains("call-old"));
+            assert!(text.contains("Focus on database migration."));
+            if compact {
+                assert!(wire.get("tools").is_none());
+                assert!(!text.contains("additional_tools"));
+                assert!(wire.get("tool_choice").is_none());
+            } else {
+                assert_eq!(wire["tool_choice"]["name"], "Read");
+                assert!(if lite {
+                    text.contains("additional_tools")
+                } else {
+                    wire["tools"].is_array()
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn quoted_compact_prompts_preserve_ordinary_tools_choice_and_effort() {
+    let _guard = env_lock();
+    let config = tempfile::TempDir::new().unwrap();
+    let mut env = isolated_environment(config.path());
+    env.push(EnvGuard::set("CCP_CODEX_EFFORT", "high"));
+    let prompt = concat!(
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+        "Your task is to create a detailed summary of the conversation so far."
+    );
+    let cases = [
+        (
+            json!("You are Claude Code."),
+            json!(format!(
+                "Explain this compact prompt: \"{prompt}\" Then inspect src/main.rs with Read."
+            )),
+        ),
+        (
+            json!("You are Claude Code."),
+            json!(format!(
+                "```text\n{prompt}\n```\nThen inspect src/main.rs with Read."
+            )),
+        ),
+        (
+            json!("You are Claude Code."),
+            json!([
+                {"type":"text","text":"Explain this quoted prompt, then inspect src/main.rs with Read:"},
+                {"type":"text","text":prompt}
+            ]),
+        ),
+        (
+            json!(
+                "You are Claude Code. Example prompt to discuss, not execute: \"You are a helpful AI assistant tasked with summarizing conversations.\""
+            ),
+            json!("Inspect src/main.rs with Read."),
+        ),
+        (
+            json!([
+                {"type":"text","text":"You are Claude Code. The following is an example to discuss:"},
+                {"type":"text","text":"You are a helpful AI assistant tasked with summarizing conversations."}
+            ]),
+            json!("Inspect src/main.rs with Read."),
+        ),
+    ];
+    for (system, content) in cases {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.6-sol", "system":system,
+            "messages":[{"role":"user", "content":content}],
+            "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"tool","name":"Read"}
+        }))
+        .unwrap();
+        for lite in [false, true] {
+            let wire = serde_json::to_value(
+                translate_request(
+                    &request,
+                    TranslateOptions {
+                        model: "gpt-5.6-sol".into(),
+                        session_id: None,
+                        service_tier: None,
+                        use_responses_lite: lite,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(wire["tool_choice"]["name"], "Read", "{wire}");
+            assert_eq!(wire["reasoning"]["effort"], "high", "{wire}");
+            if lite {
+                assert!(
+                    wire["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["type"] == "additional_tools"
+                            && item["tools"][0]["name"] == "Read"),
+                    "{wire}"
+                );
+            } else {
+                assert_eq!(wire["tools"][0]["name"], "Read", "{wire}");
+            }
+        }
+    }
 }

@@ -3,6 +3,16 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Select a temporary Codex service tier per session with `/proxy-speed`.
+- See thinking as Codex reasoning starts and receive search answers, source links,
+  and tool results through streaming responses.
+- Resume long sessions using portable compaction summaries and reuse compatible
+  Codex connections and continuation state.
+- See cached input tokens in the monitor.
+- Reject thinking-only Messages completions and malformed or truncated HTTP streams.
+
 ## v0.1.48 (2026-11-01)
 
 - Codex users can select GPT-6.1 Terra with `gpt-6.1-terra` or its
